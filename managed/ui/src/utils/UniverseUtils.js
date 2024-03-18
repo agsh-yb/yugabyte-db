@@ -1,6 +1,5 @@
 // Copyright (c) YugaByte, Inc.
 import _ from 'lodash';
-
 import {
   isNonEmptyArray,
   isNonEmptyObject,
@@ -225,6 +224,16 @@ export const isYbcInstalledInUniverse = (universeDetails) => {
   return universeDetails?.ybcInstalled;
 };
 
+export const isAsymmetricCluster = (cluster) =>
+  isNonEmptyObject(cluster.userIntent.specificGFlags?.perAZ) ||
+  (isNonEmptyObject(cluster.userIntent.userIntentOverrides?.azOverrides) &&
+    hasAsymmetricOverrides(cluster.userIntent.userIntentOverrides.azOverrides));
+
+const hasAsymmetricOverrides = (azOverrides) =>
+  Object.values(azOverrides).some(
+    (azOverride) => Object.keys(azOverride).length > 1 || azOverride.proxyConfig === undefined
+  );
+
 /**
  * Returns an array of unique regions in the universe
  */
@@ -432,7 +441,7 @@ export const verifyAttributes = (GFlagInput, searchTerm, JWKSKeyset, isOIDCSuppo
   if (isKeywordExist) {
     const keywordIndex = GFlagInput.indexOf(searchTerm);
     const keywordConf = GFlagInput?.substring(keywordIndex + 1 + keywordLength, GFlagInput.length);
-    const attributes = keywordConf?.split(CONST_VALUES.SPACE_SEPARATOR);
+    const attributes = keywordConf?.match(/(?:[^\s"|""]+|""[^"|""]*"|")+/g);
 
     for (let index = 0; index < attributes?.length; index++) {
       const [attributeKey, ...attributeValues] = attributes[index]?.split(CONST_VALUES.EQUALS);

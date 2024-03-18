@@ -27,6 +27,7 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.test.Helpers.contentAsString;
 
 import com.amazonaws.services.ec2.model.Image;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -42,6 +43,7 @@ import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.TestUtils;
+import com.yugabyte.yw.common.certmgmt.CertificateHelperTest;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.forms.BackupRequestParams;
 import com.yugabyte.yw.models.AccessKey;
@@ -65,6 +67,7 @@ import com.yugabyte.yw.models.helpers.provider.AWSCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.GCPCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.KubernetesInfo;
 import com.yugabyte.yw.models.helpers.provider.region.KubernetesRegionInfo;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -76,7 +79,6 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.Test;
-import org.mockito.Mockito;
 import play.libs.Json;
 import play.mvc.Result;
 
@@ -168,7 +170,6 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     provider =
         Provider.create(
             defaultCustomer.getUuid(), Common.CloudType.aws, "test", new ProviderDetails());
-    when(mockAWSCloudImpl.getPrivateKeyAlgoOrBadRequest(any())).thenReturn("AHAHA");
     AccessKey.create(
         provider.getUuid(), AccessKey.getDefaultKeyCode(provider), new AccessKey.KeyInfo());
     Region region = Region.create(provider, "us-west-1", "us-west-1", "yb-image1");
@@ -210,8 +211,7 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
 
   private void setUpCredsValidation(boolean valid) {
     CloudAPI mockCloudAPI = mock(CloudAPI.class);
-    Mockito.doNothing().when(mockCloudAPI).validateInstanceTemplate(any(), any());
-    when(mockCloudAPI.isValidCreds(any(), any())).thenReturn(valid);
+    when(mockCloudAPI.isValidCreds(any())).thenReturn(valid);
     when(mockCloudAPIFactory.get(any())).thenReturn(mockCloudAPI);
   }
 
@@ -413,7 +413,9 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
   }
 
   @Test
-  public void testModifyGCPProviderCredentials() throws InterruptedException {
+  public void testModifyGCPProviderCredentials()
+      throws InterruptedException, JsonProcessingException {
+    ObjectMapper mapper = Json.mapper();
     Provider gcpProvider =
         Provider.create(
             defaultCustomer.getUuid(), Common.CloudType.gcp, "test", new ProviderDetails());
@@ -422,19 +424,23 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     GCPCloudInfo gcp = new GCPCloudInfo();
     gcpProvider.getDetails().getCloudInfo().setGcp(gcp);
     gcp.setGceProject("gce_proj");
-    gcp.setGceApplicationCredentials(Json.newObject().put("GCE_EMAIL", "test@yugabyte.com"));
+    JsonNode gceAppicationCredentials = Json.newObject().put("GCE_EMAIL", "test@yugabyte.com");
+    gcp.setGceApplicationCredentials(mapper.writeValueAsString(gceAppicationCredentials));
     gcpProvider.save();
-    ((ObjectNode) gcpProvider.getDetails().getCloudInfo().getGcp().getGceApplicationCredentials())
-        .put("client_id", "Client ID");
+    ((ObjectNode) gceAppicationCredentials).put("client_id", "Client ID");
+    gcpProvider
+        .getDetails()
+        .getCloudInfo()
+        .getGcp()
+        .setGceApplicationCredentials(mapper.writeValueAsString(gceAppicationCredentials));
     UUID taskUUID = doEditProvider(gcpProvider, false);
     TaskInfo taskInfo = waitForTask(taskUUID);
     gcpProvider = Provider.getOrBadRequest(gcpProvider.getUuid());
-    assertEquals(
-        "Client ID",
-        ((ObjectNode)
-                gcpProvider.getDetails().getCloudInfo().getGcp().getGceApplicationCredentials())
-            .get("client_id")
-            .textValue());
+    JsonNode creds =
+        mapper.readTree(
+            gcpProvider.getDetails().getCloudInfo().getGcp().getGceApplicationCredentials());
+
+    assertEquals("Client ID", creds.get("client_id").asText());
   }
 
   @Test
@@ -449,7 +455,7 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     provider.setUsabilityState(Provider.UsabilityState.ERROR);
     provider.save();
     provider.setName("new name");
-    when(mockAWSCloudImpl.getPrivateKeyAlgoOrBadRequest(any())).thenReturn("RSA");
+    provider.setAllAccessKeys(createTempAccesskeys());
     Image image = new Image();
     image.setArchitecture("x86_64");
     image.setRootDeviceType("ebs");
@@ -479,7 +485,7 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     assertNotNull(provider.getLastValidationErrors());
     assertEquals(
         Json.parse("[\"AMI details extraction failed: Not found\"]"),
-        provider.getLastValidationErrors().get("error").get("data.REGION.us-west-1.IMAGE"));
+        provider.getLastValidationErrors().get("error").get("REGION.us-west-1.IMAGE"));
     assertEquals(Provider.UsabilityState.READY, provider.getUsabilityState());
     assertEquals("new name", provider.getName());
   }
@@ -798,9 +804,11 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     ImageBundle ib = new ImageBundle();
     ib.setName("ib-2");
     ib.setProvider(p);
+    ib.setUseAsDefault(true);
     ib.setDetails(details);
 
     List<ImageBundle> ibs = p.getImageBundles();
+    ibs.get(0).setUseAsDefault(false);
     ibs.add(ib);
     p.setImageBundles(ibs);
     UUID taskUUID = doEditProvider(p, false);
@@ -809,6 +817,15 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
 
     p = Provider.getOrBadRequest(p.getUuid());
     assertEquals(2, p.getImageBundles().size());
+    p.getImageBundles()
+        .forEach(
+            bundle -> {
+              if (bundle.getName().equals("ib-1")) {
+                assertEquals(false, bundle.getUseAsDefault());
+              } else {
+                assertEquals(true, bundle.getUseAsDefault());
+              }
+            });
   }
 
   @Test
@@ -827,7 +844,7 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
         });
     params.setUniverseUUID(universe.getUniverseUUID());
     providerEditRestrictionManager.onTaskCreated(backupTaskUUID, createBackup, params);
-    TaskInfo backupTaskInfo = new TaskInfo(TaskType.BackupUniverse);
+    TaskInfo backupTaskInfo = new TaskInfo(TaskType.BackupUniverse, null);
     backupTaskInfo.setTaskState(TaskInfo.State.Running);
     backupTaskInfo.setTaskUUID(backupTaskUUID);
     backupTaskInfo.setDetails(Json.newObject());
@@ -860,7 +877,7 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
         });
     params.setUniverseUUID(universe.getUniverseUUID());
     providerEditRestrictionManager.onTaskCreated(backupTaskUUID, createBackup, params);
-    TaskInfo backupTaskInfo = new TaskInfo(TaskType.BackupUniverse);
+    TaskInfo backupTaskInfo = new TaskInfo(TaskType.BackupUniverse, null);
     backupTaskInfo.setTaskState(TaskInfo.State.Running);
     backupTaskInfo.setTaskUUID(backupTaskUUID);
     backupTaskInfo.setDetails(Json.newObject());
@@ -1198,5 +1215,14 @@ public class CloudProviderEditTest extends CommissionerBaseTest {
     bodyJson.put("vnetName", "vnetName");
 
     return bodyJson;
+  }
+
+  private List<AccessKey> createTempAccesskeys() {
+    AccessKey.KeyInfo keyInfo = new AccessKey.KeyInfo();
+    keyInfo.sshPrivateKeyContent = CertificateHelperTest.getServerKeyContent();
+    AccessKey accessKeyTemp = AccessKey.create(provider.getUuid(), "access-key-temp", keyInfo);
+    List<AccessKey> accessKeys = new ArrayList<>();
+    accessKeys.add(accessKeyTemp);
+    return accessKeys;
   }
 }

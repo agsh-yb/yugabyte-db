@@ -69,6 +69,7 @@ import org.apache.commons.lang3.tuple.ImmutablePair;
  */
 @Deprecated
 @Slf4j
+// TODO This should be removed soon as the task type has no mapping.
 public class UpgradeUniverse extends UniverseDefinitionTaskBase {
   // Variable to mark if the loadbalancer state was changed.
   boolean loadbalancerOff = false;
@@ -312,7 +313,9 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
       checkUniverseVersion();
       // Update the universe DB with the update to be performed and set the 'updateInProgress' flag
       // to prevent other updates from happening.
-      Universe universe = lockUniverseForUpdate(taskParams().expectedUniverseVersion);
+      Universe universe =
+          lockAndFreezeUniverseForUpdate(
+              taskParams().expectedUniverseVersion, null /* Txn callback */);
       Cluster primaryCluster = universe.getUniverseDetails().getPrimaryCluster();
       UserIntent primIntent = primaryCluster.userIntent;
 
@@ -494,7 +497,7 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
 
     UpdateNodeDetails updateNodeTask = createTask(UpdateNodeDetails.class);
     updateNodeTask.initialize(updateNodeDetailsParams);
-    updateNodeTask.setUserTaskUUID(userTaskUUID);
+    updateNodeTask.setUserTaskUUID(getUserTaskUUID());
     subTaskGroup.addSubTask(updateNodeTask);
     getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
@@ -991,17 +994,26 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
       createSetFlagInMemoryTasks(
               nodes,
               processType,
-              true,
-              processType == ServerType.MASTER
-                  ? taskParams().masterGFlags
-                  : taskParams().tserverGFlags)
+              (node, params) -> {
+                params.force = true;
+                params.gflags =
+                    processType == ServerType.MASTER
+                        ? taskParams().masterGFlags
+                        : taskParams().tserverGFlags;
+              })
           .setSubTaskGroupType(subGroupType);
     } else if (taskParams().taskType == UpgradeTaskType.ToggleTls) {
       Map<String, String> gflags = new HashMap<>();
       gflags.put(
           "allow_insecure_connections",
           upgradeIteration == UpgradeIteration.Round1 ? "true" : "false");
-      createSetFlagInMemoryTasks(nodes, processType, true, gflags)
+      createSetFlagInMemoryTasks(
+              nodes,
+              processType,
+              (node, params) -> {
+                params.force = true;
+                params.gflags = gflags;
+              })
           .setSubTaskGroupType(subGroupType);
     }
 
@@ -1220,10 +1232,12 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
     params.enableYCQL = userIntent.enableYCQL;
     params.enableYCQLAuth = userIntent.enableYCQLAuth;
     params.enableYSQLAuth = userIntent.enableYSQLAuth;
+    params.auditLogConfig = userIntent.auditLogConfig;
 
     // The software package to install for this cluster.
     params.ybSoftwareVersion = userIntent.ybSoftwareVersion;
     params.setYbcSoftwareVersion(taskParams().getYbcSoftwareVersion());
+    params.ybcGflags = userIntent.ybcFlags;
     // Set the InstanceType
     params.instanceType = node.cloudInfo.instance_type;
     params.enableNodeToNodeEncrypt = userIntent.enableNodeToNodeEncrypt;
@@ -1271,7 +1285,7 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
     // Create the Ansible task to get the server info.
     AnsibleConfigureServers task = createTask(AnsibleConfigureServers.class);
     task.initialize(params);
-    task.setUserTaskUUID(userTaskUUID);
+    task.setUserTaskUUID(getUserTaskUUID());
 
     return task;
   }

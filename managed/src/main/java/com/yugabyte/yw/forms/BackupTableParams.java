@@ -22,7 +22,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.ToString;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.yb.CommonTypes.TableType;
 import play.data.validation.Constraints;
 
@@ -212,6 +212,11 @@ public class BackupTableParams extends TableManagerParams {
   }
 
   @JsonIgnore
+  /**
+   * Use for backup parent task params
+   *
+   * @param backupRequestParams
+   */
   public BackupTableParams(BackupRequestParams backupRequestParams) {
     this.customerUuid = backupRequestParams.customerUUID;
     // Todo: Should it always be set to true?
@@ -236,6 +241,11 @@ public class BackupTableParams extends TableManagerParams {
   }
 
   @JsonIgnore
+  /**
+   * Use for backup subtask params
+   *
+   * @param backupRequestParams
+   */
   public BackupTableParams(BackupRequestParams backupRequestParams, String keySpace) {
     this(backupRequestParams);
     this.setKeyspace(keySpace);
@@ -246,6 +256,11 @@ public class BackupTableParams extends TableManagerParams {
   }
 
   @JsonIgnore
+  /**
+   * Use for backup subtask params
+   *
+   * @param tableParams
+   */
   public BackupTableParams(BackupTableParams tableParams) {
     this.customerUuid = tableParams.customerUuid;
     this.backupUuid = tableParams.backupUuid;
@@ -275,9 +290,17 @@ public class BackupTableParams extends TableManagerParams {
     this.setTableName(tableParams.getTableName());
     this.tableUUID = tableParams.tableUUID;
     this.backupParamsIdentifier = tableParams.backupParamsIdentifier;
+    this.tableByTableBackup = tableParams.tableByTableBackup;
   }
 
   @JsonIgnore
+  /**
+   * Use for backup subtask params
+   *
+   * @param tableParams
+   * @param tableUUID
+   * @param tableName
+   */
   public BackupTableParams(BackupTableParams tableParams, UUID tableUUID, String tableName) {
     this(tableParams);
     this.tableUUIDList = Arrays.asList(tableUUID);

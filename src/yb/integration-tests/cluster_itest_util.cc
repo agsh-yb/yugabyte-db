@@ -79,6 +79,7 @@
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 
+#include "yb/tserver/backup.proxy.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tablet_server_test_util.h"
@@ -542,7 +543,8 @@ Result<TabletServerMap> CreateTabletServerMap(
                           &peer->tserver_proxy,
                           &peer->tserver_admin_proxy,
                           &peer->consensus_proxy,
-                          &peer->generic_proxy);
+                          &peer->generic_proxy,
+                          &peer->backup_proxy);
 
     const auto& key = peer->instance_id.permanent_uuid();
     CHECK(result.emplace(key, std::move(peer)).second) << "duplicate key: " << key;
@@ -1245,6 +1247,23 @@ GetTabletsOnTsAccordingToMaster(ExternalMiniCluster* cluster,
     }
   }
   return replicas;
+}
+
+Status WaitForReplicasRunningOnAllTsAccordingToMaster(
+    ExternalMiniCluster* cluster, const client::YBTableName& table_name, const MonoDelta& timeout) {
+  return WaitFor([&]() -> Result<bool> {
+    master::GetTableLocationsResponsePB table_locations;
+    RETURN_NOT_OK(GetTableLocations(
+        cluster, table_name, timeout, RequireTabletsRunning::kTrue, &table_locations));
+    for (auto& tablet_locs : table_locations.tablet_locations()) {
+      for (auto& replica : tablet_locs.replicas()) {
+        if (replica.state() != tablet::RUNNING) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }, timeout, "Wait for replicas to be running on all tservers");
 }
 
 Status GetTabletLocations(ExternalMiniCluster* cluster,

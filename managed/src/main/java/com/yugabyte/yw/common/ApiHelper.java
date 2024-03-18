@@ -2,8 +2,8 @@
 
 package com.yugabyte.yw.common;
 
-import akka.stream.javadsl.Source;
-import akka.util.ByteString;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
@@ -17,6 +17,8 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pekko.stream.javadsl.Source;
+import org.apache.pekko.util.ByteString;
 import play.libs.Json;
 import play.libs.ws.WSClient;
 import play.libs.ws.WSRequest;
@@ -201,7 +203,11 @@ public class ApiHelper {
     headers.forEach(request::addHeader);
     CompletionStage<String> post =
         request.post(Source.from(partsList)).thenApply(WSResponse::getBody);
-    return handleJSONPromise(post);
+    try {
+      return handleJSONPromise(post);
+    } catch (RuntimeException e) {
+      return new PlatformServiceException(INTERNAL_SERVER_ERROR, e.getMessage()).getContentJson();
+    }
   }
 
   public CompletionStage<WSResponse> getSimpleRequest(String url, Map<String, String> headers) {

@@ -113,9 +113,10 @@ public class RegionController extends AuthenticatedController {
    */
   @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.18.2.0")
   @ApiOperation(
-      value =
-          "Deprecated since YBA version 2.18.2.0, "
+      notes =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.18.2.0.</b></p>"
               + "Use /api/v1/customers/{cUUID}/provider/{pUUID}/provider_regions instead",
+      value = "Create Region - deprecated",
       response = Region.class,
       nickname = "createRegion")
   @ApiImplicitParams(
@@ -153,7 +154,8 @@ public class RegionController extends AuthenticatedController {
    * @return JSON response of newly created region
    */
   @ApiOperation(
-      value = "WARNING: This is a preview API that could change. Create a new region",
+      notes = "WARNING: This is a preview API that could change.",
+      value = "Create a new region",
       response = Region.class,
       nickname = "createProviderRegion")
   @ApiImplicitParams(
@@ -164,6 +166,12 @@ public class RegionController extends AuthenticatedController {
           dataType = "com.yugabyte.yw.models.Region",
           required = true))
   @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.18.2.0")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.CREATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result createRegionNew(UUID customerUUID, UUID providerUUID, Http.Request request) {
     Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);
     Region region = formFactory.getFormDataOrBadRequest(request.body().asJson(), Region.class);
@@ -189,9 +197,10 @@ public class RegionController extends AuthenticatedController {
    */
   @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.18.2.0")
   @ApiOperation(
-      value =
-          "Deprecated since YBA version 2.18.2.0, "
+      notes =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.18.2.0.</b></p>"
               + "Use /api/v1/customers/{cUUID}/provider/{pUUID}/provider_regions instead",
+      value = "Edit regions - deprecated",
       response = Object.class,
       nickname = "editRegion")
   @ApiImplicitParams(
@@ -228,7 +237,8 @@ public class RegionController extends AuthenticatedController {
    * @return JSON response on whether or not the operation was successful.
    */
   @ApiOperation(
-      value = "WARNING: This is a preview API that could change. Modify a region",
+      notes = "WARNING: This is a preview API that could change.",
+      value = "Modify a region",
       response = Region.class,
       nickname = "editProviderRegion")
   @ApiImplicitParams(
@@ -239,6 +249,12 @@ public class RegionController extends AuthenticatedController {
           dataType = "com.yugabyte.yw.models.Region",
           required = true))
   @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.18.2.0")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.UPDATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result editRegionNew(
       UUID customerUUID, UUID providerUUID, UUID regionUUID, Http.Request request) {
     Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);

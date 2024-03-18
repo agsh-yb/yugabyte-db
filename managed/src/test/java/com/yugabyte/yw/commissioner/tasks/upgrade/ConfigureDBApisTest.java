@@ -4,8 +4,10 @@ package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
+import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.forms.ConfigureDBApiParams;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
@@ -29,9 +31,11 @@ public class ConfigureDBApisTest extends UpgradeTaskTest {
   public void setUp() {
     super.setUp();
     configureDBApis.setUserTaskUUID(UUID.randomUUID());
-
+    setCheckNodesAreSafeToTakeDown(mockClient);
     setUnderReplicatedTabletsMock();
     setFollowerLagMock();
+    setLeaderlessTabletsMock();
+    when(mockClient.getLeaderMasterHostAndPort()).thenReturn(HostAndPort.fromHost("10.0.0.1"));
   }
 
   private static final List<TaskType> ENABLE_DB_API_TASK_SEQUENCE =
@@ -60,7 +64,7 @@ public class ConfigureDBApisTest extends UpgradeTaskTest {
     params.ycqlPassword = "foo";
     TaskInfo taskInfo = submitTask(params, TaskType.ConfigureDBApis, commissioner);
     assertEquals(Success, taskInfo.getTaskState());
-    int index = 0;
+    int index = 1;
     for (TaskInfo taskInfo1 : taskInfo.getSubTasks()) {
       if (index < ENABLE_DB_API_TASK_SEQUENCE.size()
           && taskInfo1.getTaskType().equals(ENABLE_DB_API_TASK_SEQUENCE.get(index))) {
@@ -82,7 +86,7 @@ public class ConfigureDBApisTest extends UpgradeTaskTest {
     params.ycqlPassword = "foo";
     TaskInfo taskInfo = submitTask(params, TaskType.ConfigureDBApis, commissioner);
     assertEquals(Success, taskInfo.getTaskState());
-    int index = 0;
+    int index = 1;
     for (TaskInfo taskInfo1 : taskInfo.getSubTasks()) {
       if (index < DISABLE_DB_API_TASK_SEQUENCE.size()
           && taskInfo1.getTaskType().equals(DISABLE_DB_API_TASK_SEQUENCE.get(index))) {

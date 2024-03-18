@@ -33,6 +33,7 @@ import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Schedule;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.common.YbaApi;
 import com.yugabyte.yw.models.helpers.ColumnDetails;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.TaskType;
@@ -92,6 +93,7 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "YbaApi Internal.",
       value = "Create a YugabyteDB table",
       response = YBPTask.class,
       nickname = "createTable")
@@ -103,6 +105,7 @@ public class TablesController extends AuthenticatedController {
         dataType = "com.yugabyte.yw.forms.TableDefinitionTaskParams",
         paramType = "body")
   })
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -121,10 +124,12 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "YbaApi Internal.",
       value = "Alter a YugabyteDB table",
       nickname = "alterTable",
       response = Object.class,
       responseContainer = "Map")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -135,7 +140,12 @@ public class TablesController extends AuthenticatedController {
     return TODO(request);
   }
 
-  @ApiOperation(value = "Drop a YugabyteDB table", nickname = "dropTable", response = YBPTask.class)
+  @ApiOperation(
+      notes = "YbaApi Internal.",
+      value = "Drop a YugabyteDB table",
+      nickname = "dropTable",
+      response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -151,10 +161,12 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "UI_ONLY",
+      notes = "YbaApi Internal. UI_ONLY",
       response = Object.class,
       responseContainer = "Map",
+      value = "Get Column Types",
       hidden = true)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @AuthzPath
   public Result getColumnTypes() {
     ColumnDetails.YQLDataType[] dataTypes = ColumnDetails.YQLDataType.values();
@@ -174,21 +186,23 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "YbaApi Internal. Get a list of all defined column types.",
       value = "List column types",
-      notes = "Get a list of all defined column types.",
       response = ColumnDetails.YQLDataType.class,
       responseContainer = "List")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.8.0.0")
   @AuthzPath
   public Result getYQLDataTypes() {
     return PlatformResults.withData(ColumnDetails.YQLDataType.values());
   }
 
   @ApiOperation(
-      value = "List all tables",
+      notes = "YbaApi Internal. Get a list of all tables in the specified universe",
       nickname = "getAllTables",
-      notes = "Get a list of all tables in the specified universe",
+      value = "List all tables",
       response = TableInfoForm.TableInfoResp.class,
       responseContainer = "List")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.8.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -199,24 +213,27 @@ public class TablesController extends AuthenticatedController {
       UUID customerUUID,
       UUID universeUUID,
       boolean includeParentTableInfo,
-      boolean excludeColocatedTables,
-      boolean includeColocatedParentTables) {
+      @Deprecated boolean excludeColocatedTables,
+      boolean includeColocatedParentTables,
+      boolean xClusterSupportedOnly) {
     List<TableInfoForm.TableInfoResp> resp =
         tableHandler.listTables(
             customerUUID,
             universeUUID,
             includeParentTableInfo,
             excludeColocatedTables,
-            includeColocatedParentTables);
+            includeColocatedParentTables,
+            xClusterSupportedOnly);
     return PlatformResults.withData(resp);
   }
 
   @ApiOperation(
-      value = "List all namespaces",
+      notes = "YbaApi Internal. Get a list of all namespaces in the specified universe.",
       nickname = "getAllNamespaces",
-      notes = "Get a list of all namespaces in the specified universe",
+      value = "List all namespaces",
       response = TableInfoForm.NamespaceInfoResp.class,
       responseContainer = "List")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.16.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -233,30 +250,38 @@ public class TablesController extends AuthenticatedController {
   /**
    * This API will describe a single table.
    *
-   * @param customerUUID UUID of the customer owning the table.
-   * @param universeUUID UUID of the universe in which the table resides.
-   * @param tableUUID UUID of the table to describe.
-   * @return json-serialized description of the table.
+   * @param customerUUID UUID of the customer owning the table
+   * @param universeUUID UUID of the universe in which the table resides
+   * @param tableUUID UUID or ID of the table to describe
+   * @return json-serialized description of the table
    */
   @ApiOperation(
+      notes = "YbaApi Internal.",
       value = "Describe a table",
       nickname = "describeTable",
       response = TableDefinitionTaskParams.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
             @PermissionAttribute(resourceType = ResourceType.UNIVERSE, action = Action.READ),
         resourceLocation = @Resource(path = Util.UNIVERSES, sourceType = SourceType.ENDPOINT))
   })
-  public Result describe(UUID customerUUID, UUID universeUUID, UUID tableUUID) {
-    return PlatformResults.withData(tableHandler.describe(customerUUID, universeUUID, tableUUID));
+  public Result describe(UUID customerUUID, UUID universeUUID, String tableUUID) {
+    UUID tableUuid =
+        tableUUID.contains("-") ? UUID.fromString(tableUUID) : getUUIDRepresentation(tableUUID);
+    return PlatformResults.withData(tableHandler.describe(customerUUID, universeUUID, tableUuid));
   }
 
   @ApiOperation(
-      value = "Create a multi-table backup",
-      tags = {"Backups", "Table management"},
+      notes =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.0.</b></p>"
+              + "Use BackupsController.",
+      value = "Create a multi-table backup - deprecated",
+      tags = {"Backups"},
       nickname = "createMultiTableBackup",
       response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0.0")
   @ApiResponses(
       @ApiResponse(
           code = 200,
@@ -273,9 +298,12 @@ public class TablesController extends AuthenticatedController {
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
-            @PermissionAttribute(resourceType = ResourceType.UNIVERSE, action = Action.UPDATE),
+            @PermissionAttribute(
+                resourceType = ResourceType.UNIVERSE,
+                action = Action.BACKUP_RESTORE),
         resourceLocation = @Resource(path = Util.UNIVERSES, sourceType = SourceType.ENDPOINT))
   })
+  @Deprecated
   public Result createMultiTableBackup(UUID customerUUID, UUID universeUUID, Http.Request request) {
     // Validate customer UUID
     Customer customer = Customer.getOrBadRequest(customerUUID);
@@ -348,7 +376,11 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "Create a single-table backup",
+      notes =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.0.</b></p>"
+              + "Use BackupsController.",
+      value = "Create a single-table backup - deprecated",
+      tags = {"Backups"},
       nickname = "createSingleTableBackup",
       response = YBPTask.class)
   @ApiImplicitParams({
@@ -359,6 +391,7 @@ public class TablesController extends AuthenticatedController {
         dataType = "com.yugabyte.yw.forms.BackupTableParams",
         paramType = "body")
   })
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -367,6 +400,7 @@ public class TablesController extends AuthenticatedController {
                 action = Action.BACKUP_RESTORE),
         resourceLocation = @Resource(path = Util.UNIVERSES, sourceType = SourceType.ENDPOINT))
   })
+  @Deprecated
   // Remove this too.
   public Result createBackup(
       UUID customerUUID, UUID universeUUID, UUID tableUUID, Http.Request request) {
@@ -458,10 +492,12 @@ public class TablesController extends AuthenticatedController {
    * @param tableUUID UUID of the table to describe.
    */
   @ApiOperation(
+      notes =
+          "YbaApi Internal. Bulk import data into the specified table. This is currently AWS-only.",
       value = "Bulk import data",
       nickname = "bulkImportData",
-      notes = "Bulk import data into the specified table. This is currently AWS-only.",
       response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.2.0.0")
   @ApiImplicitParams({
     @ApiImplicitParam(
         name = "Bulk import",
@@ -633,11 +669,12 @@ public class TablesController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "List all tablespaces",
+      notes = "YbaApi Internal. Get a list of all tablespaces of a given universe.",
       nickname = "getAllTableSpaces",
-      notes = "Get a list of all tablespaces of a given universe",
+      value = "List all tablespaces",
       response = TableSpaceInfo.class,
       responseContainer = "List")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.14.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -666,9 +703,11 @@ public class TablesController extends AuthenticatedController {
    * @param universeUUID UUID of the universe in which the tablespaces will be created.
    */
   @ApiOperation(
+      notes = "YbaApi Internal.",
       value = "Create tableSpaces",
       nickname = "createTableSpaces",
       response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.14.0.0")
   @ApiImplicitParams({
     @ApiImplicitParam(
         name = "CreateTableSpacesRequest",

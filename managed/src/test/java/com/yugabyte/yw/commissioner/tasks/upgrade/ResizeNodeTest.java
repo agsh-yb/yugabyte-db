@@ -25,7 +25,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
 import com.yugabyte.yw.commissioner.Common;
-import com.yugabyte.yw.commissioner.tasks.UniverseModifyBaseTest;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
 import com.yugabyte.yw.common.ApiUtils;
@@ -58,6 +57,7 @@ import java.util.stream.Collectors;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
 import junitparams.converters.Nullable;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.time.DateUtils;
 import org.junit.Before;
 import org.junit.Rule;
@@ -70,6 +70,7 @@ import org.yb.client.ListMastersResponse;
 import play.libs.Json;
 
 @RunWith(JUnitParamsRunner.class)
+@Slf4j
 public class ResizeNodeTest extends UpgradeTaskTest {
 
   @Rule public MockitoRule rule = MockitoJUnit.rule();
@@ -89,18 +90,20 @@ public class ResizeNodeTest extends UpgradeTaskTest {
   // Tasks for RF1 configuration do not create sub-tasks for
   // leader blacklisting. So create two PLACEHOLDER indexes
   // as well as two separate base task sequences
-  private static final int PLACEHOLDER_INDEX = 4;
-  private static final int PLACEHOLDER_INDEX_RF1 = 2;
+  private static final int PLACEHOLDER_INDEX = 5;
+  private static final int PLACEHOLDER_INDEX_RF1 = 3;
 
   private static final List<TaskType> TASK_SEQUENCE =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.CheckUnderReplicatedTablets,
+          TaskType.CheckNodesAreSafeToTakeDown,
           TaskType.ModifyBlackList,
           TaskType.WaitForLeaderBlacklistCompletion,
           TaskType.WaitForEncryptionKeyInMemory,
           TaskType.ModifyBlackList,
-          TaskType.SetNodeState);
+          TaskType.SetNodeState,
+          TaskType.WaitStartingFromTime);
 
   private static final List<TaskType> PROCESS_START_SEQ =
       ImmutableList.of(
@@ -115,6 +118,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
   @Before
   public void setUp() {
     super.setUp();
+    RuntimeConfigEntry.upsertGlobal("yb.checks.change_master_config.enabled", "false");
     resizeNode.setUserTaskUUID(UUID.randomUUID());
     defaultUniverse =
         Universe.saveDetails(
@@ -137,6 +141,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
       ListMastersResponse listMastersResponse = mock(ListMastersResponse.class);
       when(listMastersResponse.getMasters()).thenReturn(Collections.emptyList());
       when(mockClient.listMasters()).thenReturn(listMastersResponse);
+      setCheckNodesAreSafeToTakeDown(mockClient);
     } catch (Exception ignored) {
     }
 
@@ -146,10 +151,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
 
     setUnderReplicatedTabletsMock();
     setFollowerLagMock();
-
-    UniverseModifyBaseTest.mockGetMasterRegistrationResponses(
-        mockClient,
-        ImmutableList.of("10.0.0.1", "10.0.0.2", "10.0.0.3", "1.1.1.1", "1.1.1.2", "1.1.1.3"));
+    RuntimeConfigEntry.upsertGlobal("yb.checks.leaderless_tablets.enabled", "false");
   }
 
   @Override
@@ -491,6 +493,16 @@ public class ResizeNodeTest extends UpgradeTaskTest {
   }
 
   @Test
+  public void testChangeOnlyGFlagsIsOk() {
+    ResizeNodeParams taskParams = createResizeParams();
+    taskParams.clusters = defaultUniverse.getUniverseDetails().clusters;
+    taskParams.clusters.get(0).userIntent.specificGFlags =
+        SpecificGFlags.construct(Map.of("master-gflag", "1"), Map.of("tserver-gflag", "2"));
+    TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
+  }
+
+  @Test
   public void testChangingNumVolumesFails() {
     ResizeNodeParams taskParams = createResizeParams();
     taskParams.clusters = defaultUniverse.getUniverseDetails().clusters;
@@ -550,6 +562,29 @@ public class ResizeNodeTest extends UpgradeTaskTest {
       assertEquals(type, tasks.get(0).getTaskType());
     }
     return position;
+  }
+
+  @Test
+  public void testChangingOnlyCgroup() {
+    ResizeNodeParams taskParams = createResizeParamsForCloud();
+    taskParams.clusters = defaultUniverse.getUniverseDetails().clusters;
+    taskParams.getPrimaryCluster().userIntent.setCgroupSize(NEW_CGROUP_SIZE);
+    TaskInfo taskInfo = submitTask(taskParams);
+
+    List<TaskInfo> subTasks = taskInfo.getSubTasks();
+    subTasks.stream()
+        .filter(s -> s.getTaskType() == TaskType.ChangeInstanceType)
+        .forEach(
+            t ->
+                assertEquals(
+                    String.valueOf(NEW_CGROUP_SIZE), t.getDetails().get("cgroupSize").asText()));
+    assertTasksSequence(subTasks, false, true);
+    assertEquals(Success, taskInfo.getTaskState());
+    assertUniverseData(false, false, false, false);
+    Universe universe = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+    UniverseDefinitionTaskParams.UserIntent userIntent =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent;
+    assertEquals(NEW_CGROUP_SIZE, (int) userIntent.getCgroupSize());
   }
 
   @Test
@@ -1171,8 +1206,8 @@ public class ResizeNodeTest extends UpgradeTaskTest {
 
     assertEquals(1, updateMounts.size());
     assertEquals(nodeName.get(), updateMounts.get(0).getDetails().get("nodeName").textValue());
-    assertEquals(1L, (long) updateMounts.get(0).getPosition());
-    assertTasksSequence(2, subTasks, true, true, true, false);
+    assertEquals(2, updateMounts.get(0).getPosition().intValue());
+    assertTasksSequence(3, subTasks, true, true, true, false);
     assertEquals(Success, taskInfo.getTaskState());
     assertUniverseData(true, true);
   }
@@ -1216,7 +1251,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
     }
     taskTypes.add(TaskType.PersistResizeNode);
     taskTypes.add(TaskType.UniverseUpdateSucceeded);
-    assertTasksSequence(2, subTasksByPosition, taskTypes, paramsForTask, false);
+    assertTasksSequence(3, subTasksByPosition, taskTypes, paramsForTask, false);
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     for (NodeDetails nodeDetails : defaultUniverse.getUniverseDetails().nodeDetailsSet) {
       if (nodeDetails.getAzUuid().equals(az2.getUuid())) {
@@ -1266,6 +1301,17 @@ public class ResizeNodeTest extends UpgradeTaskTest {
         defaultUniverse.getUniverseDetails().getPrimaryCluster().userIntent.deviceInfo;
     deviceInfo.throughput = NEW_DISK_THROUGHPUT;
     assertEquals(Json.toJson(deviceInfo), deviceParams);
+    Universe.getOrBadRequest(defaultUniverse.getUniverseUUID())
+        .getUniverseDetails()
+        .nodeDetailsSet
+        .forEach(
+            node -> {
+              if (node.getAzUuid().equals(az2.getUuid())) {
+                assertNotNull(node.lastVolumeUpdateTime);
+              } else {
+                assertNull(node.lastVolumeUpdateTime);
+              }
+            });
   }
 
   @Test
@@ -1316,7 +1362,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
     }
     taskTypes.add(TaskType.PersistResizeNode);
     taskTypes.add(TaskType.UniverseUpdateSucceeded);
-    assertTasksSequence(2, subTasksByPosition, taskTypes, paramsForTask, false);
+    assertTasksSequence(3, subTasksByPosition, taskTypes, paramsForTask, false);
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     for (NodeDetails nodeDetails : defaultUniverse.getUniverseDetails().nodeDetailsSet) {
       assertEquals(DEFAULT_INSTANCE_TYPE, nodeDetails.cloudInfo.instance_type);
@@ -1447,6 +1493,9 @@ public class ResizeNodeTest extends UpgradeTaskTest {
     List<TaskType> expectedTaskTypes = new ArrayList<>();
     Map<Integer, Map<String, Object>> expectedParams = new HashMap<>();
     if (startPosition == 0) {
+      if (changeInstance || updateMasterGflags || updateTserverGflags) {
+        expectedTaskTypes.add(TaskType.CheckNodesAreSafeToTakeDown);
+      }
       expectedTaskTypes.add(TaskType.FreezeUniverse);
     }
     expectedTaskTypes.add(TaskType.ModifyBlackList); // removing all tservers from BL
@@ -1622,6 +1671,7 @@ public class ResizeNodeTest extends UpgradeTaskTest {
   }
 
   private TaskInfo submitTask(ResizeNodeParams requestParams) {
+    RuntimeConfigEntry.upsertGlobal("yb.checks.change_master_config.enabled", "false");
     return submitTask(requestParams, TaskType.ResizeNode, commissioner, -1);
   }
 

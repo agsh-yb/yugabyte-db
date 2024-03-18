@@ -9,9 +9,11 @@
 
 import { FC } from 'react';
 import clsx from 'clsx';
+import { find } from 'lodash';
 import { makeStyles } from '@material-ui/core';
+import { RbacBindings } from '../users/components/UserUtils';
 import { Role } from '../roles';
-import { Resource } from '../permission';
+import { Action, ActionType, Resource, ResourceType } from '../permission';
 
 const useStyles = makeStyles((theme) => ({
   roleType: {
@@ -56,6 +58,7 @@ export const getRbacEnabledVal = () => {
 
 export const clearRbacCreds = () => {
   localStorage.removeItem(rbac_identifier);
+  delete (window as any).rbac_permissions;
 };
 
 export const resourceOrderByRelevance = [
@@ -66,3 +69,22 @@ export const resourceOrderByRelevance = [
 ];
 
 export const RBAC_USER_MNG_ROUTE = '/admin/rbac?tab=users';
+
+export const permissionOrderByRelevance = [
+  Action.CREATE,
+  Action.READ,
+  Action.UPDATE,
+  Action.BACKUP_RESTORE,
+  Action.PAUSE_RESUME,
+  Action.UPDATE_PROFILE,
+  Action.UPDATE_ROLE_BINDINGS,
+  Action.SUPER_ADMIN_ACTIONS,
+  Action.DELETE
+];
+
+export const userhavePermInRoleBindings = (resourceType: ResourceType, action: ActionType) => {
+  const userRoleBindings: RbacBindings[] = (window as any).user_role_bindings;
+  return userRoleBindings.some((roleBinding) => {
+    return find(roleBinding.role.permissionDetails.permissionList, { action, resourceType }) !== undefined;
+  });
+};

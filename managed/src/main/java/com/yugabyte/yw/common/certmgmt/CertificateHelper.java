@@ -7,6 +7,7 @@ import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.cronutils.utils.StringUtils;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import com.typesafe.config.Config;
 import com.yugabyte.yw.common.AppConfigHelper;
@@ -18,6 +19,8 @@ import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.forms.CertificateParams;
 import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.FileData;
+import com.yugabyte.yw.models.HealthCheck;
+import com.yugabyte.yw.models.Universe;
 import io.ebean.annotation.EnumValue;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -33,6 +36,7 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -52,6 +56,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
@@ -105,6 +110,11 @@ public class CertificateHelper {
   private static final String CERT_CLIENT_NODE_SUBDIR = "/yugabyte-client-tls-config";
 
   private final RuntimeConfGetter runtimeConfGetter;
+
+  // We are only interested in n2n certs as that is the only case where master/tserver communication
+  // breaks. In other scenarios we will be able to rotate expired certs.
+  private static final List<String> certsListForValidityCheck =
+      ImmutableList.of("Node To Node Cert Expiry Days");
 
   @Inject
   public CertificateHelper(RuntimeConfGetter runtimeConfGetter) {
@@ -794,8 +804,9 @@ public class CertificateHelper {
     }
   }
 
-  public static KeyPair getKeyPairObject() throws NoSuchAlgorithmException {
-    KeyPairGenerator keypairGen = KeyPairGenerator.getInstance("RSA");
+  public static KeyPair getKeyPairObject()
+      throws NoSuchAlgorithmException, NoSuchProviderException {
+    KeyPairGenerator keypairGen = KeyPairGenerator.getInstance("RSA", "BC");
     keypairGen.initialize(2048);
     return keypairGen.generateKeyPair();
   }
@@ -1027,5 +1038,36 @@ public class CertificateHelper {
       throw new PlatformServiceException(BAD_REQUEST, "Certificate and key don't match.");
     }
     return true;
+  }
+
+  public static boolean checkNode2NodeCertsExpiry(Universe universe) {
+    HealthCheck lastHealthCheck = HealthCheck.getLatest(universe.getUniverseUUID());
+    if (lastHealthCheck != null) {
+      HealthCheck.Details details = lastHealthCheck.getDetailsJson();
+      List<HealthCheck.Details.NodeData> dataNodes = details.getData();
+
+      dataNodes =
+          dataNodes.stream()
+              .filter(
+                  node ->
+                      certsListForValidityCheck.stream()
+                          .anyMatch(key -> node.getMessage().toString().contains(key)))
+              .filter(HealthCheck.Details.NodeData::getHasError)
+              .filter(node -> node.getDetails().toString().contains("certificate expired"))
+              .collect(Collectors.toList());
+
+      return dataNodes.size() > 0;
+    }
+
+    return false;
+  }
+
+  public static Boolean isValidRsaKey(String privateKeyString) {
+    try {
+      return getPrivateKey(privateKeyString).getAlgorithm().equals("RSA");
+    } catch (RuntimeException e) {
+      log.error("Private key Algorithm extraction failed: ", e);
+      return false;
+    }
   }
 }

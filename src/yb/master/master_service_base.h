@@ -34,8 +34,10 @@ class FlushManager;
 class YsqlBackendsManager;
 class PermissionsManager;
 class EncryptionManager;
+class TabletHealthManager;
 struct LeaderEpoch;
 class XClusterManager;
+class MasterAutoFlagsManager;
 
 // Tells HandleIn/HandleOnLeader to either acquire the lock briefly to check leadership (kFalse)
 // or to hold it throughout the handler invocation (kTrue).
@@ -114,11 +116,14 @@ class MasterServiceBase {
 
   CatalogManager* handler(CatalogManager*);
   FlushManager* handler(FlushManager*);
+  TabletHealthManager* handler(TabletHealthManager*);
   YsqlBackendsManager* handler(YsqlBackendsManager*);
   PermissionsManager* handler(PermissionsManager*);
   EncryptionManager* handler(EncryptionManager*);
   XClusterManager* handler(XClusterManager*);
   TestAsyncRpcManager* handler(TestAsyncRpcManager*);
+  MasterAutoFlagsManager* handler(MasterAutoFlagsManager*);
+  CloneStateManager* handler(CloneStateManager*);
 
   Master* server_;
 

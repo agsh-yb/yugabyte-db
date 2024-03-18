@@ -16,7 +16,7 @@ type: docs
 
 ## Use application patterns
 
-Running applications in multiple data centers with data split across them is not a trivial task. When designing global applications, choose a suitable design pattern for your application from a suite of battle-tested design paradigms, including [Global database](../build-global-apps/global-database), [Multi-master](../build-global-apps/active-active-multi-master), [Standby cluster](../build-global-apps/active-active-single-master), [Duplicate indexes](../build-global-apps/duplicate-indexes), and more. You can also combine these patterns as per your needs.
+Running applications in multiple data centers with data split across them is not a trivial task. When designing global applications, choose a suitable design pattern for your application from a suite of battle-tested design paradigms, including [Global database](../build-global-apps/global-database), [Multi-master](../build-global-apps/active-active-multi-master), [Standby cluster](../build-global-apps/active-active-single-master), [Duplicate indexes](../build-global-apps/duplicate-indexes), [Follower reads](../build-global-apps/follower-reads), and more. You can also combine these patterns as per your needs.
 
 {{<tip>}}
 For more details, see [Build global applications](../build-global-apps).
@@ -34,7 +34,7 @@ For more details, see [colocation](../../architecture/docdb-sharding/colocated-t
 
 When a query uses an index to look up rows faster, the columns that are not present in the index are fetched from the original table. This results in additional round trips to the main table leading to increased latency.
 
-Use [covering indexes](../../explore/indexes-constraints/covering-index-ysql/) to store all the required columns needed for your queries in the index. Indexing converts a standard Index-Scan to an [Index-Only-Scan](https://dev.to/yugabyte/boosts-secondary-index-queries-with-index-only-scan-5e7j).
+Use [covering indexes](../../explore/ysql-language-features/indexes-constraints/covering-index-ysql/) to store all the required columns needed for your queries in the index. Indexing converts a standard Index-Scan to an [Index-Only-Scan](https://dev.to/yugabyte/boosts-secondary-index-queries-with-index-only-scan-5e7j).
 
 {{<tip>}}
 For more details, see [Avoid trips to the table with covering indexes](https://www.yugabyte.com/blog/multi-region-database-deployment-best-practices/#avoid-trips-to-the-table-with-covering-indexes).
@@ -45,7 +45,7 @@ For more details, see [Avoid trips to the table with covering indexes](https://w
 A partial index is an index that is built on a subset of a table and includes only rows that satisfy the condition specified in the `WHERE` clause. This speeds up any writes to the table and reduces the size of the index, thereby improving speed for read queries that use the index.
 
 {{<tip>}}
-For more details, see [Partial indexes](../../explore/indexes-constraints/partial-index-ysql/).
+For more details, see [Partial indexes](../../explore/ysql-language-features/indexes-constraints/partial-index-ysql/).
 {{</tip>}}
 
 ## Distinct keys with unique indexes
@@ -55,7 +55,7 @@ If you need values in some of the columns to be unique, you can specify your ind
 When a unique index is applied to two or more columns, the combined values in these columns can't be duplicated in multiple rows. Note that because a NULL value is treated as a distinct value, you can have multiple NULL values in a column with a unique index.
 
 {{<tip>}}
-For more details, see [Unique indexes](../../explore/indexes-constraints/unique-index-ysql/).
+For more details, see [Unique indexes](../../explore/ysql-language-features/indexes-constraints/unique-index-ysql/).
 {{</tip>}}
 
 ## Faster sequences with server-level caching
@@ -96,6 +96,16 @@ Use [table partitioning](../../explore/ysql-language-features/advanced-features/
 For more details, see [Partition data by time](../common-patterns/timeseries/partitioning-by-time/).
 {{</tip>}}
 
+## Use the right data types for partition keys
+
+In general, integer, arbitrary precision number, character string (not very long ones), and timestamp types are safe choices for comparisons.
+
+Avoid the following:
+
+- Floating point number data types - because they are stored as binary float format that cannot represent most of the decimal values precisely, values that are supposedly the same may not be treated as a match because of possible multiple internal representations.
+
+- Date, time, and similar timestamp component types if they may be compared with values from a different timezone or different day of the year, or when either value comes from a country or region that observes or ever observed daylight savings time.
+
 ## Use multi row inserts wherever possible
 
 If you're inserting multiple rows, it's faster to batch them together whenever possible. You can start with 128 rows per batch
@@ -128,24 +138,24 @@ CREATE TABLE products
   (
      name     TEXT PRIMARY KEY,
      quantity BIGINT DEFAULT 0
-  );  
+  );
 ---
-INSERT INTO products(name, quantity) 
-VALUES 
-  ('apples', 1), 
-  ('oranges', 5) ON CONFLICT(name) DO UPDATE 
-SET 
+INSERT INTO products(name, quantity)
+VALUES
+  ('apples', 1),
+  ('oranges', 5) ON CONFLICT(name) DO UPDATE
+SET
   quantity = products.quantity + excluded.quantity;
 ---
-INSERT INTO products(name, quantity) 
-VALUES 
-  ('apples', 1), 
-  ('oranges', 5) ON CONFLICT(name) DO UPDATE 
-SET 
+INSERT INTO products(name, quantity)
+VALUES
+  ('apples', 1),
+  ('oranges', 5) ON CONFLICT(name) DO UPDATE
+SET
   quantity = products.quantity + excluded.quantity;
 ---
 SELECT * FROM products;
-  name   | quantity 
+  name   | quantity
 ---------+----------
  apples  |        2
  oranges |       10
@@ -174,7 +184,7 @@ For more information, see [Connection pooling](../../drivers-orms/smart-drivers/
 
 ## Use YSQL Connection Manager
 
-YugabyteDB includes a built-in connection pooler, YSQL Connection Manager, which provides the same connection pooling advantages as other external pooling solutions, but without many of their limitations. As the manager is bundled with the product, it is convenient to manage, monitor, and configure the server connections.
+YugabyteDB includes a built-in connection pooler, YSQL Connection Manager {{<badge/tp>}}, which provides the same connection pooling advantages as other external pooling solutions, but without many of their limitations. As the manager is bundled with the product, it is convenient to manage, monitor, and configure the server connections.
 
 {{<tip>}}
 For more information, refer to the following:
@@ -242,7 +252,11 @@ For consistent latency or performance, it is recommended to size columns in the 
 
 ## TRUNCATE tables instead of DELETE
 
-[TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/) deletes the database files that store the table and is much faster than [DELETE](../../api/ysql/the-sql-language/statements/dml_delete/) which inserts a _delete marker_ for each row in transactions that are later removed from storage during compaction runs.
+[TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/) deletes the database files that store the table data and is much faster than [DELETE](../../api/ysql/the-sql-language/statements/dml_delete/), which inserts a _delete marker_ for each row in transactions that are later removed from storage during compaction runs.
+
+{{<warning>}}
+Currently, TRUNCATE is not transactional. Also, similar to PostgreSQL, TRUNCATE is not MVCC-safe. For more details, see [TRUNCATE](../../api/ysql/the-sql-language/statements/ddl_truncate/).
+{{</warning>}}
 
 ## Number of tables and indexes
 

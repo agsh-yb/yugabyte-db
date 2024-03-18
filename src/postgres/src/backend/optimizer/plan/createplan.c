@@ -43,6 +43,7 @@
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "optimizer/var.h"
+#include "optimizer/ybcplan.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
 #include "partitioning/partprune.h"
@@ -138,17 +139,13 @@ static Scan *create_indexscan_plan(PlannerInfo *root, IndexPath *best_path,
 static BitmapHeapScan *create_bitmap_scan_plan(PlannerInfo *root,
 						BitmapHeapPath *best_path,
 						List *tlist, List *scan_clauses);
+static YbBitmapTableScan *create_yb_bitmap_scan_plan(PlannerInfo *root,
+						YbBitmapTablePath *best_path,
+						List *tlist, List *scan_clauses);
 static Plan *create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 					  List **qual, List **indexqual, List **indexECs);
 static void bitmap_subplan_mark_shared(Plan *plan);
 static List *flatten_partitioned_rels(List *partitioned_rels);
-static void extract_pushdown_clauses(List *restrictinfo_list,
-						 IndexOptInfo *indexinfo,
-						 List **local_quals,
-						 List **rel_remote_quals,
-						 List **rel_colrefs,
-						 List **idx_remote_quals,
-						 List **idx_colrefs);
 static TidScan *create_tidscan_plan(PlannerInfo *root, TidPath *best_path,
 					List *tlist, List *scan_clauses);
 static SubqueryScan *create_subqueryscan_plan(PlannerInfo *root,
@@ -190,7 +187,10 @@ static YbSeqScan *make_yb_seqscan(List *qptlist,
 				List *local_quals,
 				List *yb_pushdown_quals,
 				List *yb_pushdown_colrefs,
-				Index scanrelid);
+				Index scanrelid,
+				double yb_estimated_num_nexts,
+				double yb_estimated_num_seeks,
+				int yb_estimated_docdb_result_width);
 static SampleScan *make_samplescan(List *qptlist, List *qpqual, Index scanrelid,
 				TableSampleClause *tsc);
 static IndexScan *make_indexscan(List *qptlist, List *qpqual,
@@ -200,19 +200,25 @@ static IndexScan *make_indexscan(List *qptlist, List *qpqual,
 			   List *indexqual, List *indexqualorig,
 			   List *indexorderby, List *indexorderbyorig,
 			   List *indexorderbyops, List *indextlist,
-			   ScanDirection indexscandir, double estimated_num_nexts,
-			   double estimated_num_seeks, YbIndexPathInfo yb_path_info);
+			   ScanDirection indexscandir, double yb_estimated_num_nexts,
+			   double yb_estimated_num_seeks, int yb_estimated_docdb_result_width,
+			   YbIndexPathInfo yb_path_info);
 static IndexOnlyScan *make_indexonlyscan(List *qptlist, List *qpqual,
 				   List *yb_pushdown_colrefs, List *yb_pushdown_quals,
 				   Index scanrelid, Oid indexid,
 				   List *indexqual, List *indexorderby,
 				   List *indextlist,
-				   ScanDirection indexscandir, double estimated_num_nexts,
-				   double estimated_num_seeks);
+				   ScanDirection indexscandir, double yb_estimated_num_nexts,
+				   double yb_estimated_num_seeks, int yb_estimated_docdb_result_width);
 static BitmapIndexScan *make_bitmap_indexscan(Index scanrelid, Oid indexid,
 					  List *indexqual,
 					  List *indexqualorig);
 static BitmapHeapScan *make_bitmap_heapscan(List *qptlist,
+					 List *qpqual,
+					 Plan *lefttree,
+					 List *bitmapqualorig,
+					 Index scanrelid);
+static YbBitmapTableScan *make_yb_bitmap_tablescan(List *qptlist,
 					 List *qpqual,
 					 Plan *lefttree,
 					 List *bitmapqualorig,
@@ -254,7 +260,7 @@ static YbBatchedNestLoop *make_YbBatchedNestLoop(List *tlist,
 			  List *joinclauses, List *otherclauses, List *nestParams,
 			  Plan *lefttree, Plan *righttree,
 			  JoinType jointype, bool inner_unique,
-			  size_t num_hashClauseInfos,
+			  double first_batch_factor, size_t num_hashClauseInfos,
 			  YbBNLHashClauseInfo *hashClauseInfos);
 static HashJoin *make_hashjoin(List *tlist,
 			  List *joinclauses, List *otherclauses,
@@ -328,6 +334,7 @@ static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 						 GatherMergePath *best_path);
 
 extern int yb_bnl_batch_size;
+bool yb_bnl_optimize_first_batch;
 
 /*
  * create_plan
@@ -411,6 +418,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_YbBitmapTableScan:
 		case T_TidScan:
 		case T_SubqueryScan:
 		case T_FunctionScan:
@@ -686,6 +694,13 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 													scan_clauses);
 			break;
 
+		case T_YbBitmapTableScan:
+			plan = (Plan *) create_yb_bitmap_scan_plan(root,
+													   (YbBitmapTablePath *) best_path,
+													   tlist,
+													   scan_clauses);
+			break;
+
 		case T_TidScan:
 			plan = (Plan *) create_tidscan_plan(root,
 												(TidPath *) best_path,
@@ -897,19 +912,20 @@ yb_zip_batched_exprs(PlannerInfo *root, List *b_exprs, bool should_sort)
 		RowExpr *leftop = makeNode(RowExpr);
 		RowExpr *rightop = makeNode(RowExpr);
 
-		Oid opresulttype = -1;
-		bool opretset = false;
-		Oid opcolloid = -1;
-		Oid inputcollid = -1;
+		List *inputcollids = NIL;
+		List *opnos = NIL;
+		List *opfamilies = NIL;
 
 		for (int i = 0; i < len; i++)
 		{
 			Expr *b_expr = (Expr *) exprcols[i];
 			OpExpr *opexpr = (OpExpr *) b_expr;
-			opresulttype = opexpr->opresulttype;
-			opretset = opexpr->opretset;
-			opcolloid = opexpr->opcollid;
-			inputcollid = opexpr->inputcollid;
+			inputcollids =
+				lappend_oid(inputcollids, opexpr->inputcollid);
+			opnos = lappend_oid(opnos, opexpr->opno);
+			OpBtreeInterpretation *btreeinterp =
+				linitial(get_op_btree_interpretation(opexpr->opno));
+			opfamilies = lappend_oid(opfamilies, btreeinterp->opfamily_id);
 
 			Expr *left_expr = (Expr *) get_leftop(b_expr);
 			leftop->args = lappend(leftop->args, left_expr);
@@ -931,9 +947,13 @@ yb_zip_batched_exprs(PlannerInfo *root, List *b_exprs, bool should_sort)
 
 		YbBatchedExpr *right_batched_expr = makeNode(YbBatchedExpr);
 		right_batched_expr->orig_expr = (Expr*) rightop;
-		Expr *zipped = (Expr*) make_opclause(RECORD_EQ_OP, opresulttype, opretset,
-									(Expr*) leftop, (Expr*) right_batched_expr,
-									opcolloid, inputcollid);
+		RowCompareExpr *zipped = makeNode(RowCompareExpr);
+		zipped->largs = leftop->args;
+		zipped->rargs = (Node *) right_batched_expr;
+		zipped->rctype = ROWCOMPARE_EQ;
+		zipped->opfamilies = opfamilies;
+		zipped->opnos = opnos;
+		zipped->inputcollids = inputcollids;
 		zipped_exprs = lappend(zipped_exprs, zipped);
 	}
 
@@ -1019,6 +1039,12 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	 */
 	if (rel->is_yb_relation)
 		return false;
+
+	/*
+	 * YbBitmapTablePath should only be selected for YB relations, which are
+	 * handled above
+	 */
+	Assert(!IsA(path, YbBitmapTablePath));
 
 	/*
 	 * Also, don't do it to a CustomPath; the premise that we're extracting
@@ -2888,7 +2914,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		 */
 		index_path = (IndexPath *) projection_path->subpath;
 
-		Bitmapset *primary_key_attrs = YBGetTablePrimaryKeyBms(relation);
+		Bitmapset *primary_key_attrs = bms_copy(YBGetTablePrimaryKeyBms(relation));
 
 		/*
 		 * Iterate through projection_path tlist, identify true user write columns from unspecified
@@ -3471,7 +3497,10 @@ create_seqscan_plan(PlannerInfo *root, Path *best_path,
 	if (best_path->parent->is_yb_relation)
 		scan_plan = (SeqScan *) make_yb_seqscan(tlist, local_quals,
 												remote_quals, colrefs,
-												scan_relid);
+												scan_relid,
+												best_path->yb_estimated_num_nexts,
+												best_path->yb_estimated_num_seeks,
+												best_path->yb_estimated_docdb_result_width);
 	else
 		scan_plan = make_seqscan(tlist, local_quals, scan_relid);
 
@@ -3529,7 +3558,7 @@ create_samplescan_plan(PlannerInfo *root, Path *best_path,
 static inline bool
 YbIsHashCodeFunc(FuncExpr *func)
 {
-	return func && func->funcid == YB_HASH_CODE_OID;
+	return func->funcid == YB_HASH_CODE_OID;
 }
 
 /*
@@ -3538,7 +3567,7 @@ YbIsHashCodeFunc(FuncExpr *func)
  * After the change attribute numbers will be taken from index which is used
  * for the yb_hash_code pushdown.
  */
-static bool
+static void
 YbFixHashCodeFuncArgs(FuncExpr *hash_code_func, const IndexOptInfo *index)
 {
 	Assert(YbIsHashCodeFunc(hash_code_func));
@@ -3546,14 +3575,24 @@ YbFixHashCodeFuncArgs(FuncExpr *hash_code_func, const IndexOptInfo *index)
 	int indexcol = 0;
 	foreach(l, hash_code_func->args)
 	{
-		Node *arg_node = (Node *)lfirst(l);
-		Var *arg_var = (Var *)(IsA(arg_node, Var) ? arg_node : NULL);
-		if (!arg_var ||
-		    indexcol >= index->nkeycolumns ||
-		    index->rel->relid != arg_var->varno ||
-		    index->indexkeys[indexcol] != arg_var->varattno ||
-		    index->opcintype[indexcol] != arg_var->vartype)
-				return false;
+		Var *arg_var = (Var *) lfirst(l);
+		/*
+		 * Sanity check. Planner should have already verified that function
+		 * arguments match the index.
+		 * Should it rather be an assertion?
+		 */
+		if (!IsA(arg_var, Var) ||
+			indexcol >= index->nkeycolumns ||
+			index->rel->relid != arg_var->varno ||
+			index->indexkeys[indexcol] != arg_var->varattno ||
+			index->opcintype[indexcol] != arg_var->vartype)
+				ereport(ERROR,
+						(errmsg("bad call of yb_hash_code"),
+						 errdetail("Function yb_hash_code is chosen as an index condition, "
+								   "but its arguments do not match hash keys of the index"),
+						 errcode(ERRCODE_INTERNAL_ERROR),
+						 hash_code_func->location != -1 ?
+							errposition(hash_code_func->location) : 0));
 		/*
 		 * Note: In spite of the fact that YSQL will use secodary index for handling
 		 * the yb_hash_code pushdown the arg_var->varno field should not be changed
@@ -3562,61 +3601,55 @@ YbFixHashCodeFuncArgs(FuncExpr *hash_code_func, const IndexOptInfo *index)
 		 * function itself not its arguments will not be converted into index
 		 * columns.
 		 */
-		arg_var->varattno = indexcol + 1;
-		++indexcol;
+		arg_var->varattno = ++indexcol;
 	}
-	return true;
 }
 
 static bool
-YbFixHashCodeFuncArgsWalker(Node *node, IndexOptInfo *index)
+YbFixHashCodeFuncArgsWalker(Node *node, IndexOptInfo* indexinfo)
 {
-	FuncExpr *func = (FuncExpr *)(IsA(node, FuncExpr) ? node : NULL);
-
-	if (YbIsHashCodeFunc(func) && !YbFixHashCodeFuncArgs(func, index))
-		elog(ERROR, "bad call of yb_hash_code");
-
-	return expression_tree_walker(
-		node, &YbFixHashCodeFuncArgsWalker, index);
-}
-
-static bool
-YbHasHashCodeFuncWalker(Node *node, bool *hash_code_func_found)
-{
-	if (*hash_code_func_found)
-		return true;
-
-	FuncExpr *func = (FuncExpr *)(IsA(node, FuncExpr) ? node : NULL);
-
-	if (YbIsHashCodeFunc(func))
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr))
 	{
-		*hash_code_func_found = true;
-		return true;
+		FuncExpr *func = (FuncExpr *) node;
+		if (YbIsHashCodeFunc(func))
+		{
+			YbFixHashCodeFuncArgs(func, indexinfo);
+			return false;
+		}
 	}
-
 	return expression_tree_walker(
-		node, &YbHasHashCodeFuncWalker, hash_code_func_found);
+		node, &YbFixHashCodeFuncArgsWalker, (void *) indexinfo);
+}
+
+static bool
+YbHasHashCodeFuncWalker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && YbIsHashCodeFunc((FuncExpr *) node))
+		return true;
+	return expression_tree_walker(node, YbHasHashCodeFuncWalker, context);
 }
 
 /*
  * In case indexquals has at least one yb_hash_code qual function makes
  * a copy of indexquals and alters yb_hash_code function args attrributes.
- * In other cases functions returns NULL.
+ * In other cases functions returns NIL.
  */
 static List*
 YbBuildIndexqualForRecheck(List *indexquals, IndexOptInfo* indexinfo)
 {
-	bool has_hash_code_func = false;
-	expression_tree_walker(
-		(Node *)indexquals, &YbHasHashCodeFuncWalker, &has_hash_code_func);
-	if (has_hash_code_func)
+	if (expression_tree_walker(
+		(Node *) indexquals, YbHasHashCodeFuncWalker, NULL))
 	{
 		List *result = copyObject(indexquals);
 		expression_tree_walker(
-			(Node *)result, &YbFixHashCodeFuncArgsWalker, indexinfo);
+			(Node *) result, YbFixHashCodeFuncArgsWalker, indexinfo);
 		return result;
 	}
-	return NULL;
+	return NIL;
 }
 
 /*
@@ -3825,8 +3858,9 @@ create_indexscan_plan(PlannerInfo *root,
 												fixed_indexorderbys,
 												best_path->indexinfo->indextlist,
 												best_path->indexscandir,
-												best_path->estimated_num_nexts,
-												best_path->estimated_num_seeks);
+												best_path->yb_estimated_num_nexts,
+												best_path->yb_estimated_num_seeks,
+												best_path->yb_estimated_docdb_result_width);
 		index_only_scan_plan->yb_indexqual_for_recheck =
 			YbBuildIndexqualForRecheck(fixed_indexquals, best_path->indexinfo);
 		index_only_scan_plan->yb_distinct_prefixlen =
@@ -3852,8 +3886,9 @@ create_indexscan_plan(PlannerInfo *root,
 										 indexorderbyops,
 										 best_path->indexinfo->indextlist,
 										 best_path->indexscandir,
-										 best_path->estimated_num_nexts,
-										 best_path->estimated_num_seeks,
+										 best_path->yb_estimated_num_nexts,
+										 best_path->yb_estimated_num_seeks,
+										 best_path->yb_estimated_docdb_result_width,
 										 best_path->yb_index_path_info);
 		index_scan_plan->yb_distinct_prefixlen =
 			best_path->yb_index_path_info.yb_distinct_prefixlen;
@@ -3974,6 +4009,118 @@ create_bitmap_scan_plan(PlannerInfo *root,
 									 bitmapqualplan,
 									 bitmapqualorig,
 									 baserelid);
+
+	copy_generic_path_info(&scan_plan->scan.plan, &best_path->path);
+
+	return scan_plan;
+}
+
+/*
+ * create_yb_bitmap_scan_plan
+ *	  Returns a bitmap scan plan for the base relation scanned by 'best_path'
+ *	  with restriction clauses 'scan_clauses' and targetlist 'tlist'.
+ */
+static YbBitmapTableScan *
+create_yb_bitmap_scan_plan(PlannerInfo *root,
+						YbBitmapTablePath *best_path,
+						List *tlist,
+						List *scan_clauses)
+{
+	Index		baserelid = best_path->path.parent->relid;
+	Plan	   *bitmapqualplan;
+	List	   *bitmapqualorig;
+	List	   *indexquals;
+	List	   *indexECs;
+	List	   *qpqual;
+	ListCell   *l;
+	YbBitmapTableScan *scan_plan;
+
+	/* it should be a base rel... */
+	Assert(baserelid > 0);
+	Assert(best_path->path.parent->rtekind == RTE_RELATION);
+
+	/* Process the bitmapqual tree into a Plan tree and qual lists */
+	bitmapqualplan = create_bitmap_subplan(root, best_path->bitmapqual,
+										   &bitmapqualorig, &indexquals,
+										   &indexECs);
+
+	/*
+	 * The qpqual list must contain all restrictions not automatically handled
+	 * by the index, other than pseudoconstant clauses which will be handled
+	 * by a separate gating plan node.  All the predicates in the indexquals
+	 * will be checked (either by the index itself, or by
+	 * nodeYbBitmapTablescan.c), but if there are any "special" operators
+	 * involved then they must be added to qpqual.  The upshot is that qpqual
+	 * must contain scan_clauses minus whatever appears in indexquals.
+	 *
+	 * This loop is similar to the comparable code in create_indexscan_plan(),
+	 * but with some differences because it has to compare the scan clauses to
+	 * stripped (no RestrictInfos) indexquals.  See comments there for more
+	 * info.
+	 *
+	 * In normal cases simple equal() checks will be enough to spot duplicate
+	 * clauses, so we try that first.  We next see if the scan clause is
+	 * redundant with any top-level indexqual by virtue of being generated
+	 * from the same EC.  After that, try predicate_implied_by().
+	 *
+	 * Unlike create_indexscan_plan(), the predicate_implied_by() test here is
+	 * useful for getting rid of qpquals that are implied by index predicates,
+	 * because the predicate conditions are included in the "indexquals"
+	 * returned by create_bitmap_subplan().  Bitmap scans have to do it that
+	 * way because predicate conditions need to be rechecked if the scan
+	 * becomes lossy, so they have to be included in bitmapqualorig.
+	 */
+	qpqual = NIL;
+	foreach(l, scan_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+		Node	   *clause = (Node *) rinfo->clause;
+
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
+		if (list_member(indexquals, clause))
+			continue;			/* simple duplicate */
+		if (rinfo->parent_ec && list_member_ptr(indexECs, rinfo->parent_ec))
+			continue;			/* derived from same EquivalenceClass */
+		if (!contain_mutable_functions(clause) &&
+			predicate_implied_by(list_make1(clause), indexquals, false))
+			continue;			/* provably implied by indexquals */
+		qpqual = lappend(qpqual, rinfo);
+	}
+
+	/* Sort clauses into best execution order */
+	qpqual = order_qual_clauses(root, qpqual);
+
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
+	qpqual = extract_actual_clauses(qpqual, false); // TODO(#21141): pushdown
+
+	/*
+	 * When dealing with special operators, we will at this point have
+	 * duplicate clauses in qpqual and bitmapqualorig.  We may as well drop
+	 * 'em from bitmapqualorig, since there's no point in making the tests
+	 * twice.
+	 */
+	bitmapqualorig = list_difference_ptr(bitmapqualorig, qpqual);
+
+	/*
+	 * We have to replace any outer-relation variables with nestloop params in
+	 * the qpqual and bitmapqualorig expressions.  (This was already done for
+	 * expressions attached to plan nodes in the bitmapqualplan tree.)
+	 */
+	if (best_path->path.param_info)
+	{
+		qpqual = (List *)
+			replace_nestloop_params(root, (Node *) qpqual);
+		bitmapqualorig = (List *)
+			replace_nestloop_params(root, (Node *) bitmapqualorig);
+	}
+
+	/* Finally ready to build the plan node */
+	scan_plan = make_yb_bitmap_tablescan(tlist,
+										 qpqual,
+										 bitmapqualplan,
+										 bitmapqualorig,
+										 baserelid);
 
 	copy_generic_path_info(&scan_plan->scan.plan, &best_path->path);
 
@@ -4853,6 +5000,7 @@ create_nestloop_plan(PlannerInfo *root,
 	Relids		saveOuterRels = root->curOuterRels;
 
 	bool yb_is_batched;
+	double yb_first_batch_factor = 1.0;
 	size_t yb_num_hashClauseInfos;
 	YbBNLHashClauseInfo *yb_hashClauseInfos;
 
@@ -4894,6 +5042,11 @@ create_nestloop_plan(PlannerInfo *root,
 
 	if (yb_is_batched)
 	{
+		/* No rels supplied to inner from outer should be unbatched. */
+		Relids inner_unbatched =
+			YB_PATH_REQ_OUTER_UNBATCHED(best_path->innerjoinpath);
+		Assert(!bms_overlap(inner_unbatched, outerrelids));
+		(void)inner_unbatched;
 		/* Add the available batched outer rels. */
 		root->yb_availBatchedRelids =
 			lcons(outerrelids, root->yb_availBatchedRelids);
@@ -4929,20 +5082,33 @@ create_nestloop_plan(PlannerInfo *root,
 			}
 
 			if (rinfo->can_join &&
-				 OidIsValid(rinfo->hashjoinoperator) &&
-				 yb_can_batch_rinfo(rinfo, batched_outerrelids, inner_relids))
+				OidIsValid(rinfo->hashjoinoperator) &&
+				yb_can_batch_rinfo(rinfo, batched_outerrelids, inner_relids))
 			{
 				/* if nlhash can process this */
 				Assert(is_opclause(rinfo->clause));
 				RestrictInfo *batched_rinfo =
-					yb_get_batched_restrictinfo(rinfo,batched_outerrelids,
-											 			 inner_relids);
-
-				hashOpno = ((OpExpr *) batched_rinfo->clause)->opno;
+					yb_get_batched_restrictinfo(rinfo, batched_outerrelids,
+											 	inner_relids);
+				hashOpno = ((OpExpr *) rinfo->clause)->opno;
+				if (!bms_equal(batched_rinfo->left_relids, rinfo->left_relids))
+					hashOpno = get_commutator(hashOpno);
 			}
 
 			current_hinfo->hashOp = hashOpno;
 			current_hinfo++;
+		}
+
+		/* If there is a limit and yb_bnl_optimize_first_batch is on. */
+		if (yb_bnl_optimize_first_batch && root->limit_tuples)
+		{
+			SemiAntiJoinFactors semifactors;
+			compute_semi_anti_join_factors(root, best_path->path.parent,
+										   best_path->outerjoinpath->parent,best_path->innerjoinpath->parent,best_path->jointype, NULL,best_path->joinrestrictinfo,
+										   &semifactors);
+			double output_tuple_per_outer_tuple =
+				semifactors.outer_match_frac * semifactors.match_count;
+			yb_first_batch_factor = 1.0 / output_tuple_per_outer_tuple;
 		}
 	}
 
@@ -4981,17 +5147,29 @@ create_nestloop_plan(PlannerInfo *root,
 	nestParams = identify_current_nestloop_params(root, outerrelids);
 	if (yb_is_batched)
 	{
-		join_plan =
-			(NestLoop *) make_YbBatchedNestLoop(tlist,
-												joinclauses,
-												otherclauses,
-												nestParams,
-												outer_plan,
-												inner_plan,
-												best_path->jointype,
-												best_path->inner_unique,
-												yb_num_hashClauseInfos,
-												yb_hashClauseInfos);
+		YbBatchedNestLoop *bnl_plan =
+			make_YbBatchedNestLoop(tlist,
+								   joinclauses,
+								   otherclauses,
+								   nestParams,
+								   outer_plan,
+								   inner_plan,
+								   best_path->jointype,
+								   best_path->inner_unique,
+								   yb_first_batch_factor,
+								   yb_num_hashClauseInfos,
+								   yb_hashClauseInfos);
+		join_plan = (NestLoop *) bnl_plan;
+		(void) prepare_sort_from_pathkeys((Plan *) bnl_plan,
+										  best_path->path.pathkeys,
+										  NULL,
+										  NULL,
+										  true,
+										  &bnl_plan->numSortCols,
+										  &bnl_plan->sortColIdx,
+										  &bnl_plan->sortOperators,
+										  &bnl_plan->collations,
+										  &bnl_plan->nullsFirst);
 	}
 	else
 	{
@@ -5563,6 +5741,38 @@ replace_nestloop_params_mutator(Node *node, PlannerInfo *root)
 		/* Replace the PlaceHolderVar with a nestloop Param */
 		return (Node *) replace_nestloop_param_placeholdervar(root, phv);
 	}
+
+	/*
+	 * YB: If the expression is a RowCompareExpr that is in the form of
+	 * ROW(...) = YBBatchedExpr(ROW(...)), we need to convert it to
+	 * ROW(...) = ARRAY(ROW(...), ROW(...), ...) where the = operator
+	 * also represents a RowCompareExpr.
+	 */
+	if (IsA(node, RowCompareExpr))
+	{
+		RowCompareExpr *rcexpr = (RowCompareExpr *) node;
+		if(rcexpr->rctype == ROWCOMPARE_EQ)
+		{
+			RowCompareExpr *rcexpr_new = copyObject(rcexpr);
+			ArrayExpr *arrexpr = makeNode(ArrayExpr);
+
+			arrexpr->array_typeid = InvalidOid;
+			arrexpr->element_typeid = RECORDOID;
+			arrexpr->multidims = false;
+			arrexpr->array_collid = InvalidOid;
+			arrexpr->location = -1;
+			arrexpr->elements =
+				(List*) replace_nestloop_params(root, rcexpr->rargs);
+			rcexpr_new->rargs = (Node *) arrexpr;
+			return (Node*) rcexpr_new;
+		}
+	}
+
+	/*
+	 * YB: If the expression is an OpExpr that is in the form of
+	 * col = YBBatchedExpr(outer_val), we need to convert it to
+	 * col IN ARRAY(outer_val1, outer_val2, ...).
+	 */
 	if (IsA(node, OpExpr))
 	{
 		OpExpr *opexpr = (OpExpr*) node;
@@ -5580,20 +5790,14 @@ replace_nestloop_params_mutator(Node *node, PlannerInfo *root)
 			Oid scalar_type = InvalidOid;
 			Oid collid = InvalidOid;
 
-			Expr *inner_expr = (Expr*) linitial(opexpr->args);
+			Expr *inner_expr = (Expr *) linitial(opexpr->args);
 			saop->args = lappend(saop->args, inner_expr);
 
-			if(IsA(inner_expr, RowExpr))
-			{
-				RowExpr *rowexpr = (RowExpr *) inner_expr;
-				scalar_type = rowexpr->row_typeid;
-			}
-			else
-			{
-				Assert(IsA(inner_expr, Var) || IsA(inner_expr, RelabelType));
-				scalar_type = exprType((Node*) inner_expr);
-				collid = exprCollation((Node*)inner_expr);
-			}
+			Expr *outer_expr = (Expr *) lsecond(opexpr->args);
+			outer_expr = ((YbBatchedExpr *) outer_expr)->orig_expr;
+
+			scalar_type = exprType((Node*) outer_expr);
+			collid = exprCollation((Node*) outer_expr);
 
 			ArrayExpr *arrexpr = makeNode(ArrayExpr);
 			Oid array_type;
@@ -6234,115 +6438,6 @@ flatten_partitioned_rels(List *partitioned_rels)
 	return newlist;
 }
 
-/*
- * is_index_only_refs
- *		Check if all column references from the list are available from the
- *		index described by the indexinfo.
- */
-static bool
-is_index_only_refs(List *colrefs, IndexOptInfo *indexinfo)
-{
-	ListCell *lc;
-	foreach (lc, colrefs)
-	{
-		bool found = false;
-		YbExprColrefDesc *colref = castNode(YbExprColrefDesc, lfirst(lc));
-		for (int i = 0; i < indexinfo->ncolumns; i++)
-		{
-			if (colref->attno == indexinfo->indexkeys[i])
-			{
-				/*
-				 * If index key can not return, it does not have actual value
-				 * to evaluate the expression.
-				 */
-				if (indexinfo->canreturn[i])
-				{
-					found = true;
-					break;
-				}
-				else
-					return false;
-			}
-		}
-		if (!found)
-			return false;
-	}
-	return true;
-}
-
-/*
- * extract_pushdown_clauses
- *	  Extract actual clauses from RestrictInfo list and distribute them
- * 	  between three groups:
- *	  - local_quals - conditions not eligible for pushdown. They are evaluated
- *	  on the Postgres side on the rows fetched from DocDB;
- *	  - rel_remote_quals - conditions to pushdown with the request to the main
- *	  scanned relation. In the case of sequential scan or index only scan
- *	  the DocDB table or DocDB index respectively is the main (and only)
- *	  scanned relation, so the function returns only two groups;
- *	  - idx_remote_quals - conditions to pushdown with the request to the
- *	  secondary (index) relation. Used with the index scan on a secondary
- *	  index, and caller must provide IndexOptInfo record for the index.
- *	  - rel_colrefs, idx_colrefs are columns referenced by respective
- *	  rel_remote_quals or idx_remote_quals.
- *	  The output parameters local_quals, rel_remote_quals, rel_colrefs must
- *	  point to valid lists. The output parameters idx_remote_quals and
- *	  idx_colrefs may be NULL if the indexinfo is NULL.
- */
-static void
-extract_pushdown_clauses(List *restrictinfo_list,
-						 IndexOptInfo *indexinfo,
-						 List **local_quals,
-						 List **rel_remote_quals,
-						 List **rel_colrefs,
-						 List **idx_remote_quals,
-						 List **idx_colrefs)
-{
-	ListCell *lc;
-	foreach(lc, restrictinfo_list)
-	{
-		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
-		/* ignore pseudoconstants */
-		if (ri->pseudoconstant)
-			continue;
-
-		if (ri->yb_pushable)
-		{
-			List *colrefs = NIL;
-			bool pushable PG_USED_FOR_ASSERTS_ONLY;
-
-			/*
-			 * Find column references. It has already been determined that
-			 * the expression is pushable.
-			 */
-			pushable = YbCanPushdownExpr(ri->clause, &colrefs);
-			Assert(pushable);
-
-			/*
-			 * If there are both main and secondary (index) relations,
-			 * determine one to pushdown the condition. It is more efficient
-			 * to apply filter earlier, so prefer index, if it has all the
-			 * necessary columns.
-			 */
-			if (indexinfo == NULL ||
-				!is_index_only_refs(colrefs, indexinfo))
-			{
-				*rel_colrefs = list_concat(*rel_colrefs, colrefs);
-				*rel_remote_quals = lappend(*rel_remote_quals, ri->clause);
-			}
-			else
-			{
-				*idx_colrefs = list_concat(*idx_colrefs, colrefs);
-				*idx_remote_quals = lappend(*idx_remote_quals, ri->clause);
-			}
-		}
-		else
-		{
-			*local_quals = lappend(*local_quals, ri->clause);
-		}
-	}
-}
-
 /*****************************************************************************
  *
  *	PLAN NODE BUILDING ROUTINES
@@ -6379,7 +6474,10 @@ make_yb_seqscan(List *qptlist,
 				List *local_quals,
 				List *yb_pushdown_quals,
 				List *yb_pushdown_colrefs,
-				Index scanrelid)
+				Index scanrelid,
+				double yb_estimated_num_nexts,
+				double yb_estimated_num_seeks,
+				int yb_estimated_docdb_result_width)
 {
 	YbSeqScan  *node = makeNode(YbSeqScan);
 	Plan	   *plan = &node->scan.plan;
@@ -6389,6 +6487,9 @@ make_yb_seqscan(List *qptlist,
 	plan->lefttree = NULL;
 	plan->righttree = NULL;
 	node->scan.scanrelid = scanrelid;
+	node->yb_estimated_num_nexts = yb_estimated_num_nexts;
+	node->yb_estimated_num_seeks = yb_estimated_num_seeks;
+	node->yb_estimated_docdb_result_width = yb_estimated_docdb_result_width;
 	node->yb_pushdown.quals = yb_pushdown_quals;
 	node->yb_pushdown.colrefs = yb_pushdown_colrefs;
 
@@ -6430,8 +6531,9 @@ make_indexscan(List *qptlist,
 			   List *indexorderbyops,
 			   List *indextlist,
 			   ScanDirection indexscandir,
-			   double estimated_num_nexts,
-			   double estimated_num_seeks,
+			   double yb_estimated_num_nexts,
+			   double yb_estimated_num_seeks,
+			   int yb_estimated_docdb_result_width,
 			   YbIndexPathInfo yb_path_info)
 {
 	IndexScan  *node = makeNode(IndexScan);
@@ -6450,8 +6552,9 @@ make_indexscan(List *qptlist,
 	node->indexorderbyops = indexorderbyops;
 	node->indextlist = indextlist;
 	node->indexorderdir = indexscandir;
-	node->estimated_num_nexts = estimated_num_nexts;
-	node->estimated_num_seeks = estimated_num_seeks;
+	node->yb_estimated_num_nexts = yb_estimated_num_nexts;
+	node->yb_estimated_num_seeks = yb_estimated_num_seeks;
+	node->yb_estimated_docdb_result_width = yb_estimated_docdb_result_width;
 	node->yb_rel_pushdown.colrefs = yb_rel_pushdown_colrefs;
 	node->yb_rel_pushdown.quals = yb_rel_pushdown_quals;
 	node->yb_idx_pushdown.colrefs = yb_idx_pushdown_colrefs;
@@ -6472,8 +6575,9 @@ make_indexonlyscan(List *qptlist,
 				   List *indexorderby,
 				   List *indextlist,
 				   ScanDirection indexscandir,
-				   double estimated_num_nexts,
-				   double estimated_num_seeks)
+				   double yb_estimated_num_nexts,
+				   double yb_estimated_num_seeks,
+				   int yb_estimated_docdb_result_width)
 {
 	IndexOnlyScan *node = makeNode(IndexOnlyScan);
 	Plan	   *plan = &node->scan.plan;
@@ -6490,8 +6594,9 @@ make_indexonlyscan(List *qptlist,
 	node->indexorderdir = indexscandir;
 	node->yb_pushdown.colrefs = yb_pushdown_colrefs;
 	node->yb_pushdown.quals = yb_pushdown_quals;
-	node->estimated_num_nexts = estimated_num_nexts;
-	node->estimated_num_seeks = estimated_num_seeks;
+	node->yb_estimated_num_nexts = yb_estimated_num_nexts;
+	node->yb_estimated_num_seeks = yb_estimated_num_seeks;
+	node->yb_estimated_docdb_result_width = yb_estimated_docdb_result_width;
 
 	return node;
 }
@@ -6525,6 +6630,26 @@ make_bitmap_heapscan(List *qptlist,
 					 Index scanrelid)
 {
 	BitmapHeapScan *node = makeNode(BitmapHeapScan);
+	Plan	   *plan = &node->scan.plan;
+
+	plan->targetlist = qptlist;
+	plan->qual = qpqual;
+	plan->lefttree = lefttree;
+	plan->righttree = NULL;
+	node->scan.scanrelid = scanrelid;
+	node->bitmapqualorig = bitmapqualorig;
+
+	return node;
+}
+
+static YbBitmapTableScan *
+make_yb_bitmap_tablescan(List *qptlist,
+						 List *qpqual,
+						 Plan *lefttree,
+						 List *bitmapqualorig,
+						 Index scanrelid)
+{
+	YbBitmapTableScan *node = makeNode(YbBitmapTableScan);
 	Plan	   *plan = &node->scan.plan;
 
 	plan->targetlist = qptlist;
@@ -6863,6 +6988,7 @@ make_YbBatchedNestLoop(List *tlist,
 					   Plan *righttree,
 					   JoinType jointype,
 					   bool inner_unique,
+					   double first_batch_factor,
 					   size_t num_hashClauseInfos,
 					   YbBNLHashClauseInfo *hashClauseInfos)
 {
@@ -6877,6 +7003,7 @@ make_YbBatchedNestLoop(List *tlist,
 	node->nl.join.inner_unique = inner_unique;
 	node->nl.join.joinqual = joinclauses;
 	node->nl.nestParams = nestParams;
+	node->first_batch_factor = first_batch_factor;
 	node->num_hashClauseInfos = num_hashClauseInfos;
 	node->hashClauseInfos = hashClauseInfos;
 
@@ -8083,10 +8210,23 @@ is_projection_capable_path(Path *path)
 			 * get relaxed later.
 			 */
 			return false;
+		case T_NestLoop:
+			/*
+			 * Sorted Batched Nested Loop Joins cannot tolerate its tlist
+			 * being changed.
+			 */
+			return !(yb_is_nestloop_batched((NestPath *) path) &&
+					 path->pathkeys != NIL);
 		default:
 			break;
 	}
 	return true;
+}
+
+static bool
+is_bnl_projection_capable(YbBatchedNestLoop *bnl)
+{
+	return bnl->numSortCols == 0;
 }
 
 /*
@@ -8120,6 +8260,8 @@ is_projection_capable_plan(Plan *plan)
 			 * get relaxed later.
 			 */
 			return false;
+		case T_YbBatchedNestLoop:
+			return is_bnl_projection_capable((YbBatchedNestLoop *) plan);
 		default:
 			break;
 	}

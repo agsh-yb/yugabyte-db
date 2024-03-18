@@ -14,27 +14,13 @@ import com.yugabyte.yw.commissioner.tasks.CloudBootstrap;
 import com.yugabyte.yw.commissioner.tasks.CloudProviderDelete;
 import com.yugabyte.yw.commissioner.tasks.DestroyUniverse;
 import com.yugabyte.yw.commissioner.tasks.MultiTableBackup;
+import com.yugabyte.yw.commissioner.tasks.ReadOnlyKubernetesClusterDelete;
 import com.yugabyte.yw.commissioner.tasks.RebootNodeInUniverse;
 import com.yugabyte.yw.commissioner.tasks.params.IProviderTaskParams;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.services.YBClientService;
-import com.yugabyte.yw.forms.AbstractTaskParams;
-import com.yugabyte.yw.forms.BackupRequestParams;
-import com.yugabyte.yw.forms.BackupTableParams;
-import com.yugabyte.yw.forms.FinalizeUpgradeParams;
-import com.yugabyte.yw.forms.GFlagsUpgradeParams;
-import com.yugabyte.yw.forms.KubernetesGFlagsUpgradeParams;
-import com.yugabyte.yw.forms.KubernetesOverridesUpgradeParams;
-import com.yugabyte.yw.forms.ResizeNodeParams;
-import com.yugabyte.yw.forms.RestartTaskParams;
-import com.yugabyte.yw.forms.RestoreBackupParams;
-import com.yugabyte.yw.forms.RollbackUpgradeParams;
-import com.yugabyte.yw.forms.SoftwareUpgradeParams;
-import com.yugabyte.yw.forms.ThirdpartySoftwareUpgradeParams;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
-import com.yugabyte.yw.forms.UniverseTaskParams;
-import com.yugabyte.yw.forms.UpgradeTaskParams;
-import com.yugabyte.yw.forms.VMImageUpgradeParams;
+import com.yugabyte.yw.forms.*;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.SoftwareUpgradeState;
 import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.Backup.BackupCategory;
 import com.yugabyte.yw.models.Customer;
@@ -56,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
@@ -112,7 +99,8 @@ public class CustomerTaskManager {
               });
 
       Optional<Universe> optUniv =
-          customerTask.getTargetType().isUniverseTarget()
+          (customerTask.getTargetType().isUniverseTarget()
+                  || customerTask.getTargetType().equals(TargetType.Backup))
               ? Universe.maybeGet(customerTask.getTargetUUID())
               : Optional.empty();
       if (LOAD_BALANCER_TASK_TYPES.contains(taskInfo.getTaskType())) {
@@ -258,16 +246,17 @@ public class CustomerTaskManager {
               return;
           }
           taskParams.setPreviousTaskUUID(taskUUID);
-          UUID newTaskUUID = commissioner.submit(taskType, taskParams);
+          taskInfo
+              .getSubTasks()
+              .forEach(
+                  subtask -> {
+                    subtask.delete();
+                  });
+          UUID newTaskUUID = commissioner.submit(taskType, taskParams, taskUUID);
           beginTransaction();
           try {
             customerTask.updateTaskUUID(newTaskUUID);
             customerTask.resetCompletionTime();
-            Optional<TaskInfo> optional = TaskInfo.maybeGet(taskUUID);
-            if (optional.isPresent()) {
-              optional.get().getSubTasks().forEach(st -> st.delete());
-              optional.get().delete();
-            }
             commitTransaction();
           } catch (Exception e) {
             throw new RuntimeException("Unable to delete the previous task info: " + taskUUID);
@@ -299,26 +288,16 @@ public class CustomerTaskManager {
               .map(Objects::toString)
               .collect(Collectors.joining("','"));
 
-      // Delete orphaned parent tasks which do not have any associated customer task.
-      // It is rare but can happen as a customer task and task info are not saved in transaction.
-      // TODO It can be handled better with transaction but involves bigger change.
-      String query =
-          "DELETE FROM task_info WHERE parent_uuid IS NULL AND uuid NOT IN "
-              + "(SELECT task_uuid FROM customer_task)";
-      DB.sqlUpdate(query).execute();
-
       // Retrieve all incomplete customer tasks or task in incomplete state. Task state update
       // and customer completion time update are not transactional.
-      query =
+      String query =
           "SELECT ti.uuid AS task_uuid, ct.id AS customer_task_id "
               + "FROM task_info ti, customer_task ct "
               + "WHERE ti.uuid = ct.task_uuid "
               + "AND (ct.completion_time IS NULL "
               + "OR ti.task_state IN ('"
               + incompleteStates
-              + "') OR "
-              + "(ti.task_state='Aborted' AND ti.details->>'errorString' = 'Platform shutdown'"
-              + " AND ct.completion_time IS NULL))";
+              + "'))";
       // TODO use Finder.
       DB.sqlQuery(query)
           .findList()
@@ -331,6 +310,60 @@ public class CustomerTaskManager {
     } catch (Exception e) {
       LOG.error("Encountered error failing pending tasks", e);
     }
+  }
+
+  /**
+   * Updates the state of the universe in the event that the most recent task performed on it was an
+   * upgrade task that failed or was aborted which is called on YBA startup.
+   */
+  public void updateUniverseSoftwareUpgradeStateSet() {
+    Set<UUID> universeUUIDSet = Universe.getAllUUIDs();
+    for (UUID uuid : universeUUIDSet) {
+      Universe universe = Universe.getOrBadRequest(uuid);
+      Customer customer = Customer.get(universe.getCustomerId());
+      UUID placementModificationTaskUuid =
+          universe.getUniverseDetails().placementModificationTaskUuid;
+      if (placementModificationTaskUuid != null) {
+        CustomerTask placementModificationTask =
+            CustomerTask.getOrBadRequest(customer.getUuid(), placementModificationTaskUuid);
+        SoftwareUpgradeState state =
+            getUniverseSoftwareUpgradeStateBasedOnTask(universe, placementModificationTask);
+        if (!UniverseDefinitionTaskParams.IN_PROGRESS_UNIV_SOFTWARE_UPGRADE_STATES.contains(
+            universe.getUniverseDetails().softwareUpgradeState)) {
+          LOG.debug("Skipping universe upgrade state as actual task was not started.");
+        } else {
+          universe.updateUniverseSoftwareUpgradeState(state);
+          LOG.debug("Updated universe {} software upgrade state to  {}.", uuid, state);
+        }
+      }
+    }
+  }
+
+  private SoftwareUpgradeState getUniverseSoftwareUpgradeStateBasedOnTask(
+      Universe universe, CustomerTask customerTask) {
+    SoftwareUpgradeState state = universe.getUniverseDetails().softwareUpgradeState;
+    Optional<TaskInfo> taskInfo = TaskInfo.maybeGet(customerTask.getTaskUUID());
+    if (taskInfo.isPresent()) {
+      TaskInfo lastTaskInfo = taskInfo.get();
+      if (lastTaskInfo.getTaskState().equals(TaskInfo.State.Failure)
+          || lastTaskInfo.getTaskState().equals(TaskInfo.State.Aborted)) {
+        TaskType taskType = lastTaskInfo.getTaskType();
+        if (Arrays.asList(TaskType.RollbackUpgrade, TaskType.RollbackKubernetesUpgrade)
+            .contains(taskType)) {
+          state = SoftwareUpgradeState.RollbackFailed;
+        } else if (taskType.equals(TaskType.FinalizeUpgrade)) {
+          state = SoftwareUpgradeState.FinalizeFailed;
+        } else if (Arrays.asList(
+                TaskType.SoftwareUpgrade,
+                TaskType.SoftwareUpgradeYB,
+                TaskType.SoftwareKubernetesUpgrade,
+                TaskType.SoftwareKubernetesUpgradeYB)
+            .contains(taskType)) {
+          state = SoftwareUpgradeState.UpgradeFailed;
+        }
+      }
+    }
+    return state;
   }
 
   private void enableLoadBalancer(Universe universe) {
@@ -372,6 +405,9 @@ public class CustomerTaskManager {
       case CreateKubernetesUniverse:
       case CreateUniverse:
       case EditUniverse:
+      case InstallYbcSoftwareOnK8s:
+      case EditKubernetesUniverse:
+      case ReadOnlyKubernetesClusterCreate:
       case ReadOnlyClusterCreate:
         taskParams = Json.fromJson(oldTaskParams, UniverseDefinitionTaskParams.class);
         break;
@@ -393,6 +429,9 @@ public class CustomerTaskManager {
       case SoftwareUpgradeYB:
         taskParams = Json.fromJson(oldTaskParams, SoftwareUpgradeParams.class);
         break;
+      case UpdateKubernetesDiskSize:
+        taskParams = Json.fromJson(oldTaskParams, ResizeNodeParams.class);
+        break;
       case FinalizeUpgrade:
         taskParams = Json.fromJson(oldTaskParams, FinalizeUpgradeParams.class);
         break;
@@ -406,6 +445,9 @@ public class CustomerTaskManager {
       case RestartUniverse:
         taskParams = Json.fromJson(oldTaskParams, RestartTaskParams.class);
         break;
+      case RestartUniverseKubernetesUpgrade:
+        taskParams = Json.fromJson(oldTaskParams, RestartTaskParams.class);
+        break;
       case RebootUniverse:
         taskParams = Json.fromJson(oldTaskParams, UpgradeTaskParams.class);
         break;
@@ -415,6 +457,15 @@ public class CustomerTaskManager {
       case GFlagsUpgrade:
         taskParams = Json.fromJson(oldTaskParams, GFlagsUpgradeParams.class);
         break;
+      case CertsRotate:
+        taskParams = Json.fromJson(oldTaskParams, CertsRotateParams.class);
+        break;
+      case SystemdUpgrade:
+        taskParams = Json.fromJson(oldTaskParams, SystemdUpgradeParams.class);
+        break;
+      case ModifyAuditLoggingConfig:
+        taskParams = Json.fromJson(oldTaskParams, AuditLogConfigParams.class);
+        break;
       case AddNodeToUniverse:
       case RemoveNodeFromUniverse:
       case DeleteNodeFromUniverse:
@@ -422,6 +473,7 @@ public class CustomerTaskManager {
       case RebootNodeInUniverse:
       case StartNodeInUniverse:
       case StopNodeInUniverse:
+      case StartMasterOnNode:
         String nodeName = oldTaskParams.get("nodeName").textValue();
         String universeUUIDStr = oldTaskParams.get("universeUUID").textValue();
         UUID universeUUID = UUID.fromString(universeUUIDStr);
@@ -449,6 +501,12 @@ public class CustomerTaskManager {
           nodeTaskParams.setYbcSoftwareVersion(
               universe.getUniverseDetails().getYbcSoftwareVersion());
         }
+        taskParams = nodeTaskParams;
+        break;
+      case ReplaceNodeInUniverse:
+        nodeTaskParams = Json.fromJson(oldTaskParams, NodeTaskParams.class);
+        nodeName = oldTaskParams.get("nodeName").textValue();
+        nodeTaskParams.nodeName = nodeName;
         taskParams = nodeTaskParams;
         break;
       case BackupUniverse:
@@ -532,6 +590,9 @@ public class CustomerTaskManager {
         break;
       case CloudBootstrap:
         taskParams = Json.fromJson(oldTaskParams, CloudBootstrap.Params.class);
+        break;
+      case ReadOnlyClusterDelete:
+        taskParams = Json.fromJson(oldTaskParams, ReadOnlyKubernetesClusterDelete.Params.class);
         break;
       default:
         String errMsg =

@@ -15,12 +15,13 @@ from ybops.cloud.azure.method import AzureNetworkBootstrapMethod, AzureProvision
     AzureQueryUltraMethod, AzureCreateDnsEntryMethod, AzureEditDnsEntryMethod, \
     AzureDeleteDnsEntryMethod, AzureListDnsEntryMethod, AzureDeleteRootVolumesMethod, \
     AzurePauseInstancesMethod, AzureResumeInstancesMethod, AzureChangeInstanceTypeMethod, \
-    AzureCreateRootVolumesMethod, AzureReplaceRootVolumeMethod, AzureHardRebootInstancesMethod
+    AzureCreateRootVolumesMethod, AzureReplaceRootVolumeMethod, AzureHardRebootInstancesMethod, \
+    AzureQueryCurrentHostMethod
 from ybops.cloud.common.method import AccessCreateVaultMethod, ConfigureInstancesMethod, \
     ListInstancesMethod, InitYSQLMethod, UpdateDiskMethod, CronCheckMethod, \
     AccessEditVaultMethod, AccessDeleteKeyMethod, TransferXClusterCerts, \
     VerifySSHConnection, AddAuthorizedKey, RemoveAuthorizedKey, RebootInstancesMethod, RunHooks, \
-    WaitForConnection
+    WaitForConnection, ManageOtelCollector
 
 
 class AzureNetworkCommand(NetworkCommand):
@@ -59,6 +60,7 @@ class AzureInstanceCommand(InstanceCommand):
         self.add_method(AzureCreateRootVolumesMethod(self))
         self.add_method(AzureReplaceRootVolumeMethod(self))
         self.add_method(AzureHardRebootInstancesMethod(self))
+        self.add_method(ManageOtelCollector(self))
 
 
 class AzureAccessCommand(AccessCommand):
@@ -83,6 +85,7 @@ class AzureQueryCommand(QueryCommand):
         self.add_method(AzureQueryInstanceTypesMethod(self))
         self.add_method(AzureQueryVnetMethod(self))
         self.add_method(AzureQueryUltraMethod(self))
+        self.add_method(AzureQueryCurrentHostMethod(self))
 
 
 class AzureDnsCommand(DnsCommand):

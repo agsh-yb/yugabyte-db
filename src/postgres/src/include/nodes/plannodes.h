@@ -383,6 +383,9 @@ typedef struct YbSeqScan
 {
 	Scan		scan;
 	PushdownExprs yb_pushdown;
+	double		yb_estimated_num_nexts;
+	double		yb_estimated_num_seeks;
+	int 		yb_estimated_docdb_result_width;
 } YbSeqScan;
 
 /* ----------------
@@ -446,8 +449,9 @@ typedef struct IndexScan
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
 	PushdownExprs yb_idx_pushdown;
 	PushdownExprs yb_rel_pushdown;
-	double		estimated_num_nexts;
-	double		estimated_num_seeks;
+	double		yb_estimated_num_nexts;
+	double		yb_estimated_num_seeks;
+	int 		yb_estimated_docdb_result_width;
 	int         yb_distinct_prefixlen; /* distinct index scan prefix */
 	YbLockMechanism	yb_lock_mechanism;	/* locks possible as part of the scan */
 } IndexScan;
@@ -484,8 +488,9 @@ typedef struct IndexOnlyScan
 	 * In majority of cases it is NULL which means that indexqual will be used for tuple recheck.
 	 */
 	List	   *yb_indexqual_for_recheck;
-	double		estimated_num_nexts;
-	double		estimated_num_seeks;
+	double		yb_estimated_num_nexts;
+	double		yb_estimated_num_seeks;
+	int 		yb_estimated_docdb_result_width;
 	int         yb_distinct_prefixlen; /* distinct index scan prefix */
 } IndexOnlyScan;
 
@@ -494,9 +499,9 @@ typedef struct IndexOnlyScan
  *
  * BitmapIndexScan delivers a bitmap of potential tuple locations;
  * it does not access the heap itself.  The bitmap is used by an
- * ancestor BitmapHeapScan node, possibly after passing through
- * intermediate BitmapAnd and/or BitmapOr nodes to combine it with
- * the results of other BitmapIndexScans.
+ * ancestor BitmapHeapScan or YbBitmapTableScan node, possibly after
+ * passing through intermediate BitmapAnd and/or BitmapOr nodes to
+ * combine it with the results of other BitmapIndexScans.
  *
  * The fields have the same meanings as for IndexScan, except we don't
  * store a direction flag because direction is uninteresting.
@@ -529,6 +534,21 @@ typedef struct BitmapHeapScan
 	Scan		scan;
 	List	   *bitmapqualorig; /* index quals, in standard expr form */
 } BitmapHeapScan;
+
+/* ----------------
+ *		bitmap sequential scan node
+ *
+ * This needs a copy of the qual conditions being used by the input index
+ * scans because there are various cases where we need to recheck the quals;
+ * for example, when the bitmap is lossy about the specific rows on a page
+ * that meet the index condition.
+ * ----------------
+ */
+typedef struct YbBitmapTableScan
+{
+	Scan		scan;
+	List	   *bitmapqualorig; /* index quals, in standard expr form */
+} YbBitmapTableScan;
 
 /* ----------------
  *		tid scan node
@@ -759,25 +779,35 @@ typedef struct NestLoop
  */
 typedef struct YbBNLHashClauseInfo
 {
-	Oid hashOp;				/* Operator to hash the outer side of this clause
-							   with. */
+	Oid hashOp;				/*
+							 * Operator to hash the outer side of this clause
+							 * with. The inner side must be the left input of
+							 * this op.
+							 */
 	int innerHashAttNo;		/* Attno of inner side variable. */
 	Expr *outerParamExpr;	/* Outer expression of this clause. */
+	Expr *orig_expr;
 } YbBNLHashClauseInfo;
 
 typedef struct YbBatchedNestLoop
 {
 	NestLoop nl;
 
-	/*
-	 * Only relevant if we're using the hash batching strategy.
-	 */
+	double first_batch_factor;
+	/* Only relevant if we're using the hash batching strategy. */
 
-	YbBNLHashClauseInfo *hashClauseInfos; /*
-										   * Array of information about each
-										   * hashable join clause.
-										   */
+	/*
+	 * Array of information about each
+	 * hashable join clause.
+	 */
+	YbBNLHashClauseInfo *hashClauseInfos;
 	int num_hashClauseInfos;
+	/* remaining fields are just like the sort-key info in struct Sort */
+	int			numSortCols;		/* number of sort-key columns */
+	AttrNumber *sortColIdx;		/* their indexes in the target list */
+	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
+	Oid		   *collations;		/* OIDs of collations */
+	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
 } YbBatchedNestLoop;
 
 typedef struct NestLoopParam

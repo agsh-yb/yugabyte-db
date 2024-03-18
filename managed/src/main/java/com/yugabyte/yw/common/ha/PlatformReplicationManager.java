@@ -12,7 +12,6 @@ package com.yugabyte.yw.common.ha;
 
 import static play.mvc.Http.Status.BAD_REQUEST;
 
-import akka.actor.Cancellable;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
@@ -27,6 +26,8 @@ import com.yugabyte.yw.common.services.FileDataService;
 import com.yugabyte.yw.common.utils.FileUtils;
 import com.yugabyte.yw.models.HighAvailabilityConfig;
 import com.yugabyte.yw.models.PlatformInstance;
+import io.prometheus.client.CollectorRegistry;
+import io.prometheus.client.Gauge;
 import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
@@ -35,6 +36,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.pekko.actor.Cancellable;
 
 @Singleton
 @Slf4j
@@ -64,6 +67,19 @@ public class PlatformReplicationManager {
   private final FileDataService fileDataService;
 
   private final PrometheusConfigHelper prometheusConfigHelper;
+
+  private static final String INSTANCE_ADDRESS_LABEL = "instance_address";
+
+  public static final Gauge HA_LAST_BACKUP_TIME =
+      Gauge.build("yba_ha_last_backup_seconds", "Last backup time for remote instances")
+          .labelNames(INSTANCE_ADDRESS_LABEL)
+          .register(CollectorRegistry.defaultRegistry);
+
+  private static final String BACKUP_SIZE_LABEL = "last_backup_size";
+
+  public static final Gauge HA_LAST_BACKUP_SIZE =
+      Gauge.build("yba_ha_last_backup_size_mb", "Last backup size for remote instances")
+          .register(CollectorRegistry.defaultRegistry);
 
   @Inject
   public PlatformReplicationManager(
@@ -121,6 +137,8 @@ public class PlatformReplicationManager {
   public JsonNode stopAndDisable() {
     this.stop();
     replicationHelper.setBackupScheduleEnabled(false);
+    HA_LAST_BACKUP_TIME.clear();
+    HA_LAST_BACKUP_SIZE.clear();
 
     return this.getBackupInfo();
   }
@@ -194,7 +212,12 @@ public class PlatformReplicationManager {
     config.updateLastFailover();
     // Attempt to ensure all remote instances are in follower state.
     // Remotely demote any instance reporting to be a leader.
-    config.getRemoteInstances().forEach(replicationHelper::demoteRemoteInstance);
+    config
+        .getRemoteInstances()
+        .forEach(
+            instance -> {
+              replicationHelper.demoteRemoteInstance(instance, true);
+            });
     // Promote the new local leader.
     // we need to refresh because i.setIsLocalAndUpdate updated the underlying db bypassing
     // newLeader bean.
@@ -244,18 +267,30 @@ public class PlatformReplicationManager {
         .collect(Collectors.toSet());
   }
 
+  public boolean testConnection(
+      HighAvailabilityConfig config, String address, boolean acceptAnyCertificate) {
+    boolean result =
+        replicationHelper.testConnection(
+            config, config.getClusterKey(), address, acceptAnyCertificate);
+    if (!result) {
+      log.error("Error testing connection to " + address);
+    }
+    return result;
+  }
+
   @VisibleForTesting
-  boolean sendBackup(PlatformInstance remoteInstance) {
+  public boolean sendBackup(PlatformInstance remoteInstance) {
     HighAvailabilityConfig config = remoteInstance.getConfig();
     String clusterKey = config.getClusterKey();
     boolean result =
         replicationHelper
             .getMostRecentBackup()
             .map(
-                backup ->
-                    replicationHelper.exportBackups(
-                            config, clusterKey, remoteInstance.getAddress(), backup)
-                        && remoteInstance.updateLastBackup())
+                backup -> {
+                  HA_LAST_BACKUP_SIZE.set(backup.length() / (1024 * 1024));
+                  return replicationHelper.exportBackups(
+                      config, clusterKey, remoteInstance.getAddress(), backup);
+                })
             .orElse(false);
     if (!result) {
       log.error("Error sending platform backup to " + remoteInstance.getAddress());
@@ -306,13 +341,51 @@ public class PlatformReplicationManager {
                             // Send the platform backup to all followers.
                             Set<PlatformInstance> instancesToSync =
                                 remoteInstances.stream()
-                                    .filter(this::sendBackup)
+                                    .filter(
+                                        instance -> {
+                                          try {
+                                            return sendBackup(instance);
+                                          } catch (Exception e) {
+                                            log.error(
+                                                "Exception {} sending back to instance {}",
+                                                e.getMessage(),
+                                                instance.getAddress());
+                                            return false;
+                                          }
+                                        })
                                     .collect(Collectors.toSet());
 
                             // Sync the HA cluster state to all followers that successfully received
                             // a
                             // backup.
-                            instancesToSync.forEach(replicationHelper::syncToRemoteInstance);
+                            instancesToSync.forEach(
+                                instance -> {
+                                  try {
+                                    Date lastLastBackup = instance.getLastBackup();
+                                    instance.updateLastBackup(localInstance.getLastBackup());
+                                    if (!replicationHelper.syncToRemoteInstance(instance)) {
+                                      instance.updateLastBackup(lastLastBackup);
+                                      log.error(
+                                          "Error syncing config to remote instance {}",
+                                          instance.getAddress());
+                                    }
+                                  } catch (Exception e) {
+                                    log.error(
+                                        "Exception {} syncing config to remote instance {}",
+                                        e.getMessage(),
+                                        instance.getAddress());
+                                  }
+                                });
+                          });
+                  // Export metric on last backup
+                  remoteInstances.stream()
+                      .forEach(
+                          instance -> {
+                            if (instance.getLastBackup() != null) {
+                              HA_LAST_BACKUP_TIME
+                                  .labels(instance.getAddress())
+                                  .set(instance.getLastBackup().toInstant().getEpochSecond());
+                            }
                           });
                 } catch (Exception e) {
                   log.error("Error running sync for HA config {}", config.getUuid(), e);

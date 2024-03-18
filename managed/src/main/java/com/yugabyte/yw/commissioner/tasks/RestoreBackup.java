@@ -27,10 +27,10 @@ public class RestoreBackup extends UniverseTaskBase {
   protected RestoreBackup(
       BaseTaskDependencies baseTaskDependencies,
       YbcManager ybcManager,
-      OperatorStatusUpdaterFactory statusUpdaterFactory) {
+      OperatorStatusUpdaterFactory operatorStatusUpdaterFactory) {
     super(baseTaskDependencies);
     this.ybcManager = ybcManager;
-    this.kubernetesStatus = statusUpdaterFactory.create();
+    this.kubernetesStatus = operatorStatusUpdaterFactory.create();
   }
 
   @Override
@@ -50,6 +50,10 @@ public class RestoreBackup extends UniverseTaskBase {
       lockUniverse(-1 /* expectedUniverseVersion */);
 
       try {
+
+        if (isFirstTry()) {
+          backupHelper.validateRestoreOverwrites(taskParams().backupStorageInfoList, universe);
+        }
 
         if (universe.isYbcEnabled()
             && !universe
@@ -85,7 +89,7 @@ public class RestoreBackup extends UniverseTaskBase {
         getRunnableTask().runSubTasks();
         unlockUniverseForUpdate();
         if (restore != null) {
-          restore.update(taskUUID, Restore.State.Completed);
+          restore.update(getTaskUUID(), Restore.State.Completed);
         }
 
       } catch (CancellationException ce) {
@@ -93,7 +97,7 @@ public class RestoreBackup extends UniverseTaskBase {
         isAbort = true;
         // Aborted
         if (restore != null) {
-          restore.update(taskUUID, Restore.State.Aborted);
+          restore.update(getTaskUUID(), Restore.State.Aborted);
           RestoreKeyspace.update(restore, TaskInfo.State.Aborted);
         }
         kubernetesStatus.updateRestoreJobStatus("Aborted Restore task", getUserTaskUUID());

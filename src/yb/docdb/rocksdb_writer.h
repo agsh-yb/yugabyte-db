@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <span>
+
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/transaction.h"
@@ -109,6 +111,16 @@ class TransactionalWriter : public rocksdb::DirectWriter {
   RowMarkType row_mark_;
   SubTransactionId subtransaction_id_;
   std::unordered_map<KeyBuffer, dockv::IntentTypeSet, ByteBufferHash> weak_intents_;
+};
+
+class PostApplyMetadataWriter : public rocksdb::DirectWriter {
+ public:
+  explicit PostApplyMetadataWriter(std::span<const PostApplyTransactionMetadata> metadatas);
+
+  Status Apply(rocksdb::DirectWriteHandler* handler) override;
+
+ private:
+  std::span<const PostApplyTransactionMetadata> metadatas_;
 };
 
 // Base class used by IntentsWriter to handle found intents.
@@ -287,7 +299,8 @@ class ExternalIntentsBatchWriter : public rocksdb::DirectWriter,
 
   // Parse the merged external intent value, and write them to regular writer handler. Also updates
   // min/max schema version.
-  Status PrepareApplyExternalIntentsBatch(
+  // Returns true when the entire batch was applied, and false if some intents were skipped.
+  Result<bool> PrepareApplyExternalIntentsBatch(
       const Slice& original_input_value, ExternalTxnApplyStateData* apply_data,
       rocksdb::DirectWriteHandler* regular_write_handler);
 

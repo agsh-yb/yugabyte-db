@@ -23,6 +23,7 @@ import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.QueryDistributionSuggestionResponse;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.common.YbaApi;
 import com.yugabyte.yw.rbac.annotations.AuthzPath;
 import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
 import com.yugabyte.yw.rbac.annotations.RequiredPermissionOnResource;
@@ -55,9 +56,11 @@ public class UniversePerfController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "WARNING: This is a preview API that could change.",
       value = "Get query distribution improvement suggestion for a universe",
       nickname = "getQueryDistributionSuggestions",
       response = QueryDistributionSuggestionResponse.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.16.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -79,10 +82,13 @@ public class UniversePerfController extends AuthenticatedController {
    * @return list of serialized HashedTimestampColumnFinderResponse entries.
    */
   @ApiOperation(
+      notes =
+          "WARNING: This is a preview API that could change. Returns list of hash indexes on"
+              + " timestamp columns.",
       value = "Return list of hash indexes",
-      notes = "Returns list of hash indexes on timestamp columns.",
       nickname = "getRangeHash",
       response = HashedTimestampColumnFinderResponse.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.16.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -107,10 +113,13 @@ public class UniversePerfController extends AuthenticatedController {
    * @return list of serialized UnusedIndexFinderResponse entries.
    */
   @ApiOperation(
+      notes =
+          "WARNING: This is a preview API that could change. "
+              + "Returns list of unused indexes, along with their database and table.",
       value = "Return list of each unused index across the universe",
-      notes = "Returns list of unused indexes, along with their database and table.",
       nickname = "getUnusedIndexes",
       response = UnusedIndexFinderResponse.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.16.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =

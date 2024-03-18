@@ -48,6 +48,8 @@
 
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/rpc/rpc_context.h"
+
 #include "yb/tablet/tablet_fwd.h"
 
 #include "yb/tserver/read_query.h"
@@ -123,6 +125,10 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
                           GetOldTransactionsResponsePB* resp,
                           rpc::RpcContext context) override;
 
+  void GetOldSingleShardWaiters(const GetOldSingleShardWaitersRequestPB* req,
+                                GetOldSingleShardWaitersResponsePB* resp,
+                                rpc::RpcContext context) override;
+
   void GetTransactionStatusAtParticipant(const GetTransactionStatusAtParticipantRequestPB* req,
                                          GetTransactionStatusAtParticipantResponsePB* resp,
                                          rpc::RpcContext context) override;
@@ -178,6 +184,10 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
                          ListMasterServersResponsePB* resp,
                          rpc::RpcContext context) override;
 
+void ClearUniverseUuid(const ClearUniverseUuidRequestPB* req,
+                       ClearUniverseUuidResponsePB* resp,
+                       rpc::RpcContext context) override;
+
   void GetLockStatus(const GetLockStatusRequestPB* req,
                      GetLockStatusResponsePB* resp,
                      rpc::RpcContext context) override;
@@ -189,12 +199,20 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
                          CancelTransactionResponsePB* resp,
                          rpc::RpcContext context) override;
 
+  void CheckTserverTabletHealth(const CheckTserverTabletHealthRequestPB* req,
+                                  CheckTserverTabletHealthResponsePB* resp,
+                                  rpc::RpcContext context) override;
+
   void StartRemoteSnapshotTransfer(
       const StartRemoteSnapshotTransferRequestPB* req, StartRemoteSnapshotTransferResponsePB* resp,
       rpc::RpcContext context) override;
 
   void GetTabletKeyRanges(
       const GetTabletKeyRangesRequestPB* req, GetTabletKeyRangesResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClearAllMetaCachesOnServer(
+      const ClearAllMetaCachesOnServerRequestPB* req, ClearAllMetaCachesOnServerResponsePB* resp,
       rpc::RpcContext context) override;
 
   void Shutdown() override;
@@ -205,13 +223,6 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
   Result<std::shared_ptr<tablet::AbstractTablet>> GetTabletForRead(
     const TabletId& tablet_id, tablet::TabletPeerPtr tablet_peer,
     YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet) override;
-
-  template<class Resp>
-  bool CheckWriteThrottlingOrRespond(
-      double score, tablet::TabletPeer* tablet_peer, Resp* resp, rpc::RpcContext* context);
-
-  template <class Req, class Resp, class F>
-  void PerformAtLeader(const Req& req, Resp* resp, rpc::RpcContext* context, const F& f);
 
   Result<uint64_t> DoChecksum(const ChecksumRequestPB* req, CoarseTimePoint deadline);
 
@@ -301,6 +312,15 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
       UpdateTransactionTablesVersionResponsePB* resp,
       rpc::RpcContext context) override;
 
+  void CloneTablet(
+      const tablet::CloneTabletRequestPB* req,
+      CloneTabletResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClonePgSchema(
+      const ClonePgSchemaRequestPB* req, ClonePgSchemaResponsePB* resp,
+      rpc::RpcContext context) override;
+
   void TestRetry(
       const TestRetryRequestPB* req, TestRetryResponsePB* resp, rpc::RpcContext context) override;
 
@@ -308,6 +328,12 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
   TabletServer* const server_;
 
   Status DoCreateTablet(const CreateTabletRequestPB* req, CreateTabletResponsePB* resp);
+
+  Status DoClonePgSchema(const ClonePgSchemaRequestPB* req, ClonePgSchemaResponsePB* resp);
+
+  Status SetupCDCSDKRetention(
+      const tablet::ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
+      const tablet::TabletPeerPtr& peer);
 
   // Used to implement wait/signal mechanism for backfill requests.
   // Since the number of concurrently allowed backfill requests is

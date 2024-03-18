@@ -30,6 +30,7 @@ import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CloudSpecificInfo;
+import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
@@ -60,7 +61,8 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -429,11 +431,14 @@ public class PlacementInfoUtil {
     // STEP 3: Remove nodes.
 
     // Removing unnecessary nodes (full/part move or dedicated switch)
+    boolean forceFullMove = isForceFullMove(cluster, universe, clusterOpType);
+    LOG.debug("Force full move: {}", forceFullMove);
     taskParams.getNodesInCluster(cluster.uuid).stream()
         .filter(n -> n.state != NodeState.ToBeRemoved)
         .forEach(
             node -> {
-              if (!Objects.equals(
+              if (forceFullMove
+                  || !Objects.equals(
                       node.cloudInfo.instance_type, cluster.userIntent.getInstanceTypeForNode(node))
                   || (!cluster.userIntent.dedicatedNodes
                       && node.isMaster
@@ -513,7 +518,7 @@ public class PlacementInfoUtil {
     cluster.userIntent.numNodes = getNodeCountInPlacement(cluster.placementInfo);
 
     // STEP 5: Sync nodes with placement info
-    configureNodesUsingPlacementInfo(cluster, taskParams.nodeDetailsSet, universe);
+    configureNodesUsingPlacementInfo(cluster, taskParams.nodeDetailsSet, universe, !forceFullMove);
     applyDedicatedModeChanges(universe, cluster, taskParams);
 
     LOG.info("Set of nodes after node configure: {}.", taskParams.nodeDetailsSet);
@@ -532,6 +537,48 @@ public class PlacementInfoUtil {
       return rf;
     }
     return Math.max(rf, result);
+  }
+
+  /**
+   * Determines whether a full move operation should be forced for a given cluster and universe.
+   *
+   * @param cluster modified cluster
+   * @param universe current universe state
+   * @param clusterOpType cluster operation being performed
+   * @return {@code true} if a full move operation should be forced, {@code false} otherwise.
+   */
+  private static boolean isForceFullMove(
+      Cluster cluster, Universe universe, ClusterOperationType clusterOpType) {
+    if (clusterOpType.equals(UniverseConfigureTaskParams.ClusterOperationType.EDIT)) {
+      Cluster currentCluster = universe.getUniverseDetails().getPrimaryCluster();
+      DeviceInfo newDeviceInfo = cluster.userIntent.deviceInfo;
+      DeviceInfo currentDeviceInfo = currentCluster.userIntent.deviceInfo;
+      if (!Objects.equals(newDeviceInfo, currentDeviceInfo) && newDeviceInfo != null) {
+        LOG.debug("Device info has changed from {} to {}", currentDeviceInfo, newDeviceInfo);
+        return !isOnlyVolumeSizeIncrease(currentDeviceInfo, newDeviceInfo);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Checks if the volume size has increased and no other device information has changed.
+   *
+   * @param oldDeviceInfo The old device information.
+   * @param newDeviceInfo The new device information.
+   * @return True if the volume size has increased and no other device information has changed,
+   *     false otherwise.
+   */
+  private static boolean isOnlyVolumeSizeIncrease(
+      DeviceInfo oldDeviceInfo, DeviceInfo newDeviceInfo) {
+    if (oldDeviceInfo != null && newDeviceInfo != null) {
+      if (newDeviceInfo.volumeSize > oldDeviceInfo.volumeSize) {
+        DeviceInfo oldDeviceInfoCloned = oldDeviceInfo.clone();
+        oldDeviceInfoCloned.volumeSize = newDeviceInfo.volumeSize;
+        return oldDeviceInfoCloned.equals(newDeviceInfo);
+      }
+    }
+    return false;
   }
 
   /**
@@ -736,7 +783,10 @@ public class PlacementInfoUtil {
         universe == null
             ? taskParams.getPrimaryCluster().userIntent.universeName
             : universe.getUniverseDetails().getPrimaryCluster().userIntent.universeName;
-    taskParams.nodePrefix = Util.getNodePrefix(customerId, universeName);
+    taskParams.nodePrefix =
+        universe == null
+            ? Util.getNodePrefix(customerId, universeName)
+            : universe.getUniverseDetails().nodePrefix;
   }
 
   private static boolean isDedicatedModeChanged(Cluster cluster, Set<NodeDetails> nodeDetailsSet) {
@@ -1052,7 +1102,7 @@ public class PlacementInfoUtil {
     if (numNodes > 0 && numNodes < replicationFactor) {
       String errMsg =
           String.format(
-              "Number of nodes %d cannot be less than the replication " + " factor %d.",
+              "Number of nodes %d cannot be less than the replication factor %d.",
               numNodes, replicationFactor);
       LOG.error(errMsg);
       throw new UnsupportedOperationException(errMsg);
@@ -1260,6 +1310,7 @@ public class PlacementInfoUtil {
       NodeDetails currentNode = nodeIter.next();
       if (currentNode.isInPlacement(clusterUUID)
           && currentNode.azUuid.equals(targetAZUuid)
+          && currentNode.state == NodeState.ToBeAdded
           && !currentNode.isMaster) {
         nodeIter.remove();
 
@@ -1300,9 +1351,13 @@ public class PlacementInfoUtil {
    * @param cluster
    * @param nodes
    * @param universe
+   * @param allowRecoverNodes flag to indicate if recovering node state to other nodes is allowed
    */
   private static void configureNodesUsingPlacementInfo(
-      Cluster cluster, Collection<NodeDetails> nodes, Universe universe) {
+      Cluster cluster,
+      Collection<NodeDetails> nodes,
+      Universe universe,
+      boolean allowRecoverNodes) {
     Collection<NodeDetails> nodesInCluster =
         nodes.stream().filter(n -> n.isInPlacement(cluster.uuid)).collect(Collectors.toSet());
     LinkedHashSet<PlacementIndexes> indexes =
@@ -1329,6 +1384,7 @@ public class PlacementInfoUtil {
                   node ->
                       node.state == NodeState.ToBeRemoved
                           && node.isTserver
+                          && allowRecoverNodes
                           && Objects.equals(
                               node.cloudInfo.instance_type,
                               cluster.userIntent.getInstanceType(node.getAzUuid())),
@@ -1597,6 +1653,12 @@ public class PlacementInfoUtil {
           && existingNode.machineImage != null) {
         nodeDetails.machineImage = existingNode.machineImage;
         nodeDetails.ybPrebuiltAmi = existingNode.ybPrebuiltAmi;
+        if (existingNode.sshPortOverride != null) {
+          nodeDetails.sshPortOverride = existingNode.sshPortOverride;
+        }
+        if (StringUtils.isNotBlank(existingNode.sshUserOverride)) {
+          nodeDetails.sshUserOverride = existingNode.sshUserOverride;
+        }
         break;
       }
     }
@@ -1642,7 +1704,49 @@ public class PlacementInfoUtil {
     result.state = NodeState.ToBeAdded;
     result.nodeIdx = -1; // Erasing index.
     result.nodeName = null;
+    result.nodeUuid = null;
     return result;
+  }
+
+  public static NodeDetails createToBeAddedNode(NodeDetails templateNode) {
+    NodeDetails newNode = new NodeDetails();
+    newNode.cloudInfo = new CloudSpecificInfo();
+    newNode.machineImage = templateNode.machineImage;
+    if (templateNode.sshPortOverride != null) {
+      newNode.sshPortOverride = templateNode.sshPortOverride;
+    }
+    if (StringUtils.isNotBlank(templateNode.sshUserOverride)) {
+      newNode.sshUserOverride = templateNode.sshUserOverride;
+    }
+    newNode.ybPrebuiltAmi = templateNode.ybPrebuiltAmi;
+    newNode.placementUuid = templateNode.placementUuid;
+    newNode.azUuid = templateNode.azUuid;
+
+    newNode.disksAreMountedByUUID = true;
+    newNode.isMaster = templateNode.isMaster;
+    if (newNode.isMaster) {
+      newNode.masterState = NodeDetails.MasterState.ToStart;
+    }
+    newNode.isTserver = templateNode.isTserver;
+    newNode.state = NodeDetails.NodeState.ToBeAdded;
+
+    if (templateNode.cloudInfo == null) {
+      throw new RuntimeException(
+          String.format(
+              "Node to be copied is missing cloudInfo. Node template name: %s",
+              templateNode.getNodeName()));
+    }
+
+    newNode.cloudInfo.region = templateNode.cloudInfo.region;
+    newNode.cloudInfo.cloud = templateNode.cloudInfo.cloud;
+    newNode.cloudInfo.az = templateNode.cloudInfo.az;
+    newNode.cloudInfo.subnet_id = templateNode.cloudInfo.subnet_id;
+    newNode.cloudInfo.secondary_subnet_id = templateNode.cloudInfo.secondary_subnet_id;
+    newNode.cloudInfo.instance_type = templateNode.cloudInfo.instance_type;
+    newNode.cloudInfo.assignPublicIP = templateNode.cloudInfo.assignPublicIP;
+    newNode.cloudInfo.useTimeSync = templateNode.cloudInfo.useTimeSync;
+
+    return newNode;
   }
 
   public static class SelectMastersResult {
@@ -2001,7 +2105,7 @@ public class PlacementInfoUtil {
     while (numTotalMasters > 0) {
       if (zones.isEmpty()) {
         throw new IllegalStateException(
-            "No zones left to place masters. " + "Not enough tserver nodes selected");
+            "No zones left to place masters. Not enough tserver nodes selected");
       }
       PlacementAZ az = zones.remove();
       az.replicationFactor++;

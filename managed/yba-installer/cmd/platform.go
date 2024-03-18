@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/common/shell"
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/config"
 	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/logging"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/replicated/replicatedctl"
 	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/systemd"
 )
 
@@ -569,6 +569,7 @@ func (plat Platform) MigrateFromReplicated() error {
 			return err
 		}
 	} else {
+		log.Debug("found server.pem from docker.")
 		serverPemPath := filepath.Join(common.GetSelfSignedCertsDir(), common.ServerPemPath)
 		pemFile, err := common.Create(serverPemPath)
 		if err != nil {
@@ -579,6 +580,15 @@ func (plat Platform) MigrateFromReplicated() error {
 		if _, err := pemFile.WriteString(pemVal); err != nil {
 			return fmt.Errorf("failed to write pem file at %s: %w", serverPemPath, err)
 		}
+
+		log.Debug("Copying replicated ca key and cert for server.pem")
+		// Key file
+		common.CopyFile(filepath.Join(replicatedctl.SecretsDirectory, "ca.key"),
+			filepath.Join(common.GetSelfSignedCertsDir(), "replicated-ca.key"))
+		// Cert file
+		common.CopyFile(filepath.Join(replicatedctl.SecretsDirectory, "ca.crt"),
+			filepath.Join(common.GetSelfSignedCertsDir(), "replicated-ca.crt"))
+
 	}
 
 	//Create the platform.log file so that we can start platform as
@@ -625,10 +635,11 @@ func (plat Platform) FinishReplicatedMigrate() error {
 			log.DebugLF("skipping directory " + file.Name() + " as it is not a symlink")
 			continue
 		}
-		err = common.ResolveSymlink(filepath.Join(
-			common.GetBaseInstall(), "data/yb-platform/releases", file.Name()))
+		src := filepath.Join(common.GetReplicatedBaseDir(), "releases", file.Name())
+		target := filepath.Join(common.GetBaseInstall(), "data/yb-platform/releases", file.Name())
+		err = common.ResolveSymlink(src, target)
 		if err != nil {
-			return fmt.Errorf("Could not complete migration of platform: %w", err)
+			return fmt.Errorf("could not complete migration of platform: %w", err)
 		}
 	}
 	return nil
@@ -688,7 +699,7 @@ func createPemFormatKeyAndCert() error {
 
 func (plat Platform) symlinkReplicatedData() error {
 	// First do the previous releases.
-	releases, err := ioutil.ReadDir(filepath.Join(common.GetReplicatedBaseDir(), "releases/"))
+	releases, err := os.ReadDir(filepath.Join(common.GetReplicatedBaseDir(), "releases/"))
 	if err != nil {
 		return fmt.Errorf("could not read replicated releases dir: %w", err)
 	}

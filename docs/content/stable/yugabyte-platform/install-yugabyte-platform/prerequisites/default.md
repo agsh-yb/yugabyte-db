@@ -16,20 +16,21 @@ You can install YugabyteDB Anywhere (YBA) using the following methods:
 
 | Method | Using | Use If |
 | :--- | :--- | :--- |
-| YBA Installer | yba-ctl CLI | You are performing a new installation. |
+| YBA Installer | yba-ctl CLI | You are performing a new installation.<br>You are ready to migrate from a Replicated installation. {{<badge/ea>}} |
 | Replicated | Docker containers | Your installation already uses Replicated. |
 | Kubernetes | Helm chart | You're deploying in Kubernetes. |
 
 All installation methods support installing YBA with and without (airgapped) Internet connectivity.
 
-Licensing (such as a license file in the case of Replicated, or appropriate repository access in the case of Kubernetes) may be required prior to installation.  Contact {{% support-platform %}} for assistance.
+Licensing (such as a license file in the case of YBA Installer or Replicated, or appropriate repository access in the case of Kubernetes) may be required prior to installation. Contact {{% support-platform %}} for assistance.
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
-  <li>
+   <li>
     <a href="../installer/" class="nav-link">
       <i class="fa-solid fa-building" aria-hidden="true"></i>YBA Installer</a>
   </li>
+
   <li>
     <a href="../default/" class="nav-link active">
       <i class="fa-solid fa-cloud"></i>Replicated</a>
@@ -42,17 +43,30 @@ Licensing (such as a license file in the case of Replicated, or appropriate repo
 
 </ul>
 
+{{< note title="Replicated end of life" >}}
+
+YugabyteDB Anywhere will end support for Replicated installation at the end of 2024. You can migrate existing Replicated YugabyteDB Anywhere installations using YBA Installer. See [Migrate from Replicated](../../install-software/installer/#migrate-from-replicated).
+
+{{< /note >}}
+
+Installing using Replicated requires the following:
+
+- Ability to install and configure [docker-engine](https://docs.docker.com/engine/).
+- Ability to install and configure [Replicated](https://www.replicated.com/install-options/), which is a containerized application itself and needs to pull containers from its own [Replicated.com container registry](https://help.replicated.com/docs/native/getting-started/docker-registries/).
+- Ability to pull Yugabyte container images from the [Quay.io](https://quay.io/) container registry (this will be done by Replicated automatically).
+
 ## Supported Linux distributions
 
 YugabyteDB Anywhere is supported on all Linux distributions that Replicated supports. This includes, but is not limited to the following:
 
 - CentOS 7
-- Alma Linux 8
-- Alma Linux 9
+- AlmaLinux 8
+- AlmaLinux 9
 - Ubuntu 18
 - Ubuntu 20
 - RedHat Enterprise Linux 7
 - RedHat Enterprise Linux 8
+- SUSE Linux Enterprise Server (SLES) 15 SP4 {{<badge/ea>}}
 
 ## Hardware requirements
 
@@ -60,15 +74,25 @@ A node running YugabyteDB Anywhere is expected to meet the following requirement
 
 - 4 cores
 - 8 GB memory
-- 200 GB disk space
+- 265+ GB disk space (see following table)
+
+| Path | Usage | Free Space Required |
+| :--- | :--- | :--- |
+| / | Assuming /opt/yugabyte shares a file system with / | 50 GB |
+| /tmp | Used during Install and Upgrade | 10 GB<sup>1</sup> |
+| /opt/yugabyte | Database configuration and Prometheus logs | 150+ GB<sup>1,2</sup> |
+| /var/lib/docker | Running YBA components | 40 GB<sup>1</sup> |
+| /var/lib/replicated | Images and staging | 15 GB<sup>1</sup> |
+
+<sup>1</sup> Where two or more of these paths share a file system, the free space required on that file system is the sum of the free space requirements.
+
+<sup>2</sup> YugabyteDB Anywhere installations managing many nodes, or universes with many tables may require more than 150 GB to retain Prometheus logs, depending on retention. Installations managing fewer objects may need as little as 50-100 GB for /opt/yugabyte.
 
 ## Prepare the host
 
 YugabyteDB Anywhere uses [Replicated scheduler](https://www.replicated.com/) for software distribution and container management. You need to ensure that the host can pull containers from the [Replicated Docker Registries](https://help.replicated.com/docs/native/getting-started/docker-registries/).
 
 Replicated installs a compatible Docker version if it is not pre-installed on the host. The currently supported Docker version is 20.10.n.
-
-Installing on airgapped hosts requires additional configurations, as described in [Airgapped hosts](#airgapped-hosts).
 
 ### Airgapped hosts
 

@@ -261,7 +261,7 @@ public class EncryptionAtRestUtil {
     } catch (Exception e) {
       String errMsg =
           String.format(
-              "Error attempting to retrieve the number of key rotations " + "universe %s",
+              "Error attempting to retrieve the number of key rotations universe %s",
               universeUUID.toString());
       LOG.error(errMsg, e);
     }
@@ -331,7 +331,7 @@ public class EncryptionAtRestUtil {
             String.join(
                 "/",
                 Arrays.asList(
-                    Arrays.copyOfRange(dirParts, dirParts.length - 3, dirParts.length - 1))));
+                    Arrays.copyOfRange(dirParts, dirParts.length - 5, dirParts.length - 1))));
 
     return new File(storageLocationDir.getAbsolutePath(), BACKUP_KEYS_FILE_NAME);
   }

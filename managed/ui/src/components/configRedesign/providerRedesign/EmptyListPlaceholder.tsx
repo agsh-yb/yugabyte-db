@@ -9,8 +9,8 @@ import clsx from 'clsx';
 import { YBButton } from '../../../redesign/components';
 
 import styles from './EmptyListPlaceholder.module.scss';
-import { RbacValidator } from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
+import { RbacValidator } from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
 
 interface EmptyListPlaceholderProps {
   actionButtonText: string;
@@ -30,16 +30,9 @@ export const EmptyListPlaceholder = ({
   dataTestIdPrefix,
   onActionButtonClick
 }: EmptyListPlaceholderProps) => (
-
   <div className={clsx(styles.emptyListContainer, className)}>
     {PLUS_ICON}
-    <RbacValidator
-      accessRequiredOn={{
-        onResource: "CUSTOMER_ID",
-        ...UserPermissionMap.createProvider
-      }}
-      isControl
-    >
+    <RbacValidator accessRequiredOn={ApiPermissionMap.CREATE_PROVIDER} isControl>
       <YBButton
         style={{ minWidth: '200px' }}
         variant="primary"

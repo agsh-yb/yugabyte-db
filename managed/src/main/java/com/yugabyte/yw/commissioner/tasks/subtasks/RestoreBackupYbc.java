@@ -15,6 +15,7 @@ import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil.YbcBackupResponse;
 import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.services.YbcClientService;
 import com.yugabyte.yw.common.utils.Pair;
@@ -80,7 +81,7 @@ public class RestoreBackupYbc extends YbcTaskBase {
   public void run() {
     BackupStorageInfo backupStorageInfo = taskParams().backupStorageInfoList.get(0);
 
-    TaskInfo taskInfo = TaskInfo.getOrBadRequest(userTaskUUID);
+    TaskInfo taskInfo = TaskInfo.getOrBadRequest(getUserTaskUUID());
     boolean isResumable = false;
     if (taskInfo.getTaskType().equals(TaskType.RestoreBackup)) {
       isResumable = true;
@@ -118,13 +119,13 @@ public class RestoreBackupYbc extends YbcTaskBase {
     RestoreKeyspace restoreKeyspace = null;
     boolean updateRestoreSizeInBytes = true;
     if (!restoreKeyspaceIfPresent.isPresent()) {
-      log.info("Creating entry for restore keyspace: {}", taskUUID);
-      restoreKeyspace = RestoreKeyspace.create(taskUUID, taskParams());
+      log.info("Creating entry for restore keyspace: {}", getTaskUUID());
+      restoreKeyspace = RestoreKeyspace.create(getTaskUUID(), taskParams());
     } else {
       restoreKeyspace = restoreKeyspaceIfPresent.get();
-      restoreKeyspace.updateTaskUUID(taskUUID);
+      restoreKeyspace.updateTaskUUID(getTaskUUID());
       updateRestoreSizeInBytes = false;
-      restoreKeyspace.update(taskUUID, RestoreKeyspace.State.InProgress);
+      restoreKeyspace.update(getTaskUUID(), RestoreKeyspace.State.InProgress);
     }
     long backupSize = 0L;
     // Send create restore to yb-controller
@@ -146,10 +147,11 @@ public class RestoreBackupYbc extends YbcTaskBase {
                     taskParams().customerUUID,
                     taskParams().storageConfigUUID,
                     dsmTaskId,
-                    backupStorageInfo);
+                    backupStorageInfo,
+                    taskParams().getUniverseUUID());
             String successMarkerString =
                 ybcManager.downloadSuccessMarker(
-                    downloadSuccessMarkerRequest, taskParams().getUniverseUUID(), dsmTaskId);
+                    downloadSuccessMarkerRequest, dsmTaskId, ybcClient);
             if (StringUtils.isEmpty(successMarkerString)) {
               throw new PlatformServiceException(
                   INTERNAL_SERVER_ERROR, "Got empty success marker response, exiting.");
@@ -172,9 +174,8 @@ public class RestoreBackupYbc extends YbcTaskBase {
                   taskParams().storageConfigUUID,
                   backupStorageInfo,
                   taskId,
-                  taskParams().getSuccessMarker());
-          YbcBackupUtil.validateConfigWithSuccessMarker(
-              taskParams().getSuccessMarker(), restoreTaskCreateRequest.getCsConfig(), false);
+                  taskParams().getSuccessMarker(),
+                  taskParams().getUniverseUUID());
           BackupServiceTaskCreateResponse response =
               ybcClient.restoreNamespace(restoreTaskCreateRequest);
           if (response.getStatus().getCode().equals(ControllerStatus.OK)) {
@@ -225,24 +226,24 @@ public class RestoreBackupYbc extends YbcTaskBase {
         Restore.updateRestoreSizeForRestore(taskParams().prefixUUID, backupSize);
       }
       if (restoreKeyspace != null) {
-        restoreKeyspace.update(taskUUID, RestoreKeyspace.State.Completed);
+        restoreKeyspace.update(getTaskUUID(), RestoreKeyspace.State.Completed);
       }
     } catch (CancellationException ce) {
       if (!taskExecutor.isShutdown()) {
         // update aborted/failed - not showing aborted from here.
         if (restoreKeyspace != null) {
-          restoreKeyspace.update(taskUUID, RestoreKeyspace.State.Aborted);
+          restoreKeyspace.update(getTaskUUID(), RestoreKeyspace.State.Aborted);
         }
-        ybcManager.deleteYbcBackupTask(taskParams().getUniverseUUID(), taskId, ybcClient);
+        ybcManager.deleteYbcBackupTask(taskId, ybcClient);
       }
       Throwables.propagate(ce);
     } catch (Throwable e) {
       log.error(String.format("Failed with error %s", e.getMessage()));
       if (restoreKeyspace != null) {
-        restoreKeyspace.update(taskUUID, RestoreKeyspace.State.Failed);
+        restoreKeyspace.update(getTaskUUID(), RestoreKeyspace.State.Failed);
       }
       if (StringUtils.isNotBlank(taskId)) {
-        ybcManager.deleteYbcBackupTask(taskParams().getUniverseUUID(), taskId, ybcClient);
+        ybcManager.deleteYbcBackupTask(taskId, ybcClient);
       }
       Throwables.propagate(e);
     } finally {
@@ -268,13 +269,54 @@ public class RestoreBackupYbc extends YbcTaskBase {
       if (backupConfig == null) {
         return;
       }
-      // Restore universe DB version should be greater or equal to the backup DB version.
-      if (backupConfig.ybdbVersion != null
-          && Util.compareYbVersions(
-                  restoreUniverseDBVersion, backupConfig.ybdbVersion, true /*suppressFormatError*/)
-              < 0) {
-        throw new PlatformServiceException(
-            BAD_REQUEST, "Unable to restore backup as it was taken on higher DB version.");
+      // Skip all DB version checks if the runtime flag "yb.skip_version_checks" is true. User must
+      // take care of downgrades and restores.
+      if (!confGetter.getGlobalConf(GlobalConfKeys.skipVersionChecks)) {
+        // Do the following DB version checks only if both the source universe version or target
+        // universe version are part of stable or preview. Restoring a backup can now only happen
+        // from stable to stable and preview to preview.
+        boolean isPreviousVersionStable = Util.isStableVersion(backupConfig.ybdbVersion, false);
+        boolean isCurrentVersionStable = Util.isStableVersion(restoreUniverseDBVersion, false);
+        // Skip version checks if runtime flag enabled. User must take care of downgrades
+        if (isPreviousVersionStable ^ isCurrentVersionStable) {
+          String msg =
+              String.format(
+                  "Cannot restore backup from preview to stable version or stable to preview. If"
+                      + " required, set runtime flag 'yb.skip_version_checks' to true. Tried to"
+                      + " restore a backup from '%s' to '%s'.",
+                  backupConfig.ybdbVersion, restoreUniverseDBVersion);
+          throw new PlatformServiceException(BAD_REQUEST, msg);
+        }
+        // Restore universe DB version should be greater or equal to the backup universe DB
+        // current
+        // version or version to which it can rollback.
+        if (backupConfig.ybdbVersion != null
+            && Util.compareYbVersions(
+                    restoreUniverseDBVersion,
+                    backupConfig.ybdbVersion,
+                    true /*suppressFormatError*/)
+                < 0) {
+          if (backupConfig.rollbackYbdbVersion == null) {
+            throw new PlatformServiceException(
+                BAD_REQUEST, "Unable to restore backup as it was taken on higher DB version.");
+          }
+          if (backupConfig.rollbackYbdbVersion != null
+              && Util.compareYbVersions(
+                      restoreUniverseDBVersion,
+                      backupConfig.rollbackYbdbVersion,
+                      true /*suppressFormatError*/)
+                  < 0) {
+            throw new PlatformServiceException(
+                BAD_REQUEST,
+                String.format(
+                    "Unable to restore as the current universe is at an older DB version %s but"
+                        + " the backup was taken on a universe with DB version %s that can"
+                        + " rollback only to %s",
+                    restoreUniverseDBVersion,
+                    backupConfig.ybdbVersion,
+                    backupConfig.rollbackYbdbVersion));
+          }
+        }
       }
       // Validate that all master and tserver auto flags present during backup
       // should exist in restore universe.

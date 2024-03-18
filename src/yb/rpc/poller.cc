@@ -15,7 +15,10 @@
 
 #include "yb/rpc/scheduler.h"
 
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/locks.h"
 #include "yb/util/logging.h"
+#include "yb/util/unique_lock.h"
 
 using namespace std::placeholders;
 
@@ -28,17 +31,17 @@ Poller::Poller(const std::string& log_prefix, std::function<void()> callback)
 }
 
 void Poller::Start(Scheduler* scheduler, MonoDelta interval) {
+  std::lock_guard lock(mutex_);
+  if (closing_) {
+    return;
+  }
   scheduler_ = scheduler;
   interval_ = interval;
-
-  std::lock_guard lock(mutex_);
-  if (!closing_) {
-    Schedule();
-  }
+  Schedule();
 }
 
-void Poller::Shutdown() NO_THREAD_SAFETY_ANALYSIS {
-  std::unique_lock<std::mutex> lock(mutex_);
+void Poller::Shutdown() {
+  UniqueLock lock(mutex_);
   if (!closing_) {
     closing_ = true;
     if (scheduler_ == nullptr) {
@@ -49,7 +52,7 @@ void Poller::Shutdown() NO_THREAD_SAFETY_ANALYSIS {
       scheduler_->Abort(poll_task_id_);
     }
   }
-  cond_.wait(lock, [this]() NO_THREAD_SAFETY_ANALYSIS {
+  WaitOnConditionVariable(&cond_, &lock, [this]() NO_THREAD_SAFETY_ANALYSIS {
     return poll_task_id_ == rpc::kUninitializedScheduledTaskId;
   });
 }
@@ -65,7 +68,7 @@ void Poller::Poll(const Status& status) {
     if (!status.ok() || closing_) {
       LOG_WITH_PREFIX(INFO) << "Poll stopped: " << status;
       poll_task_id_ = rpc::kUninitializedScheduledTaskId;
-      cond_.notify_one();
+      YB_PROFILE(cond_.notify_one());
       return;
     }
   }
@@ -80,7 +83,7 @@ void Poller::Poll(const Status& status) {
       poll_task_id_ = rpc::kUninitializedScheduledTaskId;
     }
     if (poll_task_id_ == rpc::kUninitializedScheduledTaskId) {
-      cond_.notify_one();
+      YB_PROFILE(cond_.notify_one());
     }
   }
 }

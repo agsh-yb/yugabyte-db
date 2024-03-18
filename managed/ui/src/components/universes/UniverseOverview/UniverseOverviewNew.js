@@ -15,11 +15,7 @@ import {
   CpuUsagePanel,
   QueryDisplayPanel
 } from '../../metrics';
-import {
-  YBResourceCount,
-  YBCost,
-  DescriptionList,
-} from '../../../components/common/descriptors';
+import { YBResourceCount, YBCost, DescriptionList } from '../../../components/common/descriptors';
 import { RegionMap, YBMapLegend } from '../../maps';
 import {
   isNonEmptyObject,
@@ -34,12 +30,22 @@ import {
   isDedicatedNodePlacement
 } from '../../../utils/UniverseUtils';
 import { FlexContainer, FlexGrow, FlexShrink } from '../../common/flexbox/YBFlexBox';
+import { DBVersionWidget } from '../../../redesign/features/universe/universe-overview/DBVersionWidget';
+import { PreFinalizeBanner } from '../../../redesign/features/universe/universe-actions/rollback-upgrade/components/PreFinalizeBanner';
+import { FailedBanner } from '../../../redesign/features/universe/universe-actions/rollback-upgrade/components/FailedBanner';
 import { getPromiseState } from '../../../utils/PromiseUtils';
 import { YBButton, YBModal } from '../../common/forms/fields';
 import { isEnabled, isDisabled } from '../../../utils/LayoutUtils';
-import { RbacValidator } from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
+import { RbacValidator } from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
 import { RuntimeConfigKey } from '../../../redesign/helpers/constants';
+import {
+  SoftwareUpgradeState,
+  getcurrentUniverseFailedTask,
+  SoftwareUpgradeTaskType,
+  getUniverseStatus,
+  UniverseState
+} from '../helpers/universeHelpers';
 
 class DatabasePanel extends PureComponent {
   static propTypes = {
@@ -465,25 +471,54 @@ export default class UniverseOverviewNew extends Component {
       </Col>
     );
   };
-  getPrimaryClusterWidget = (currentUniverse) => {
-    const isDedicatedNodes = isDedicatedNodePlacement(currentUniverse);
 
+  getPrimaryClusterWidget = (currentUniverse, isRollBackFeatureEnabled) => {
+    const isDedicatedNodes = isDedicatedNodePlacement(currentUniverse);
     if (isNullOrEmpty(currentUniverse)) return;
-    return isDedicatedNodes ? (
-      <Col lg={4} sm={8} md={8} xs={12}>
+
+    const clusterWidgetSize = isDedicatedNodes ? 4 : this.hasReadReplica(currentUniverse) ? 3 : 4;
+
+    if (isRollBackFeatureEnabled) {
+      return (
+        <Col lg={clusterWidgetSize} sm={8} md={6} xs={12}>
+          <ClusterInfoPanelContainer
+            type={'primary'}
+            universeInfo={currentUniverse}
+            isDedicatedNodes={isDedicatedNodes}
+            runtimeConfigs={this.props.runtimeConfigs}
+          />
+        </Col>
+      );
+    } else {
+      return isDedicatedNodes ? (
+        <Col lg={clusterWidgetSize} sm={8} md={6} xs={12}>
+          <ClusterInfoPanelContainer
+            type={'primary'}
+            universeInfo={currentUniverse}
+            isDedicatedNodes={isDedicatedNodes}
+            runtimeConfigs={this.props.runtimeConfigs}
+          />
+        </Col>
+      ) : (
+        <Col lg={clusterWidgetSize} sm={6} md={6} xs={12}>
+          <ClusterInfoPanelContainer
+            type={'primary'}
+            universeInfo={currentUniverse}
+            isDedicatedNodes={isDedicatedNodes}
+            runtimeConfigs={this.props.runtimeConfigs}
+          />
+        </Col>
+      );
+    }
+  };
+
+  getReadReplicaClusterWidget = (currentUniverse) => {
+    if (isNullOrEmpty(currentUniverse)) return;
+    return (
+      <Col lg={3} sm={6} md={6} xs={12}>
         <ClusterInfoPanelContainer
-          type={'primary'}
+          type={'read-replica'}
           universeInfo={currentUniverse}
-          isDedicatedNodes={isDedicatedNodes}
-          runtimeConfigs={this.props.runtimeConfigs}
-        />
-      </Col>
-    ) : (
-      <Col lg={2} sm={6} md={4} xs={8}>
-        <ClusterInfoPanelContainer
-          type={'primary'}
-          universeInfo={currentUniverse}
-          isDedicatedNodes={isDedicatedNodes}
           runtimeConfigs={this.props.runtimeConfigs}
         />
       </Col>
@@ -537,8 +572,11 @@ export default class UniverseOverviewNew extends Component {
   };
 
   getHealthWidget = (healthCheck, universeInfo) => {
+    const isDedicatedNodes = isDedicatedNodePlacement(universeInfo);
+    const hasReadReplicaCluster = this.hasReadReplica(universeInfo);
+
     return (
-      <Col lg={4} md={8} sm={8} xs={12}>
+      <Col lg={isDedicatedNodes && hasReadReplicaCluster ? 3 : 4} md={6} sm={8} xs={12}>
         <HealthInfoPanel healthCheck={healthCheck} universeInfo={universeInfo} />
       </Col>
     );
@@ -560,11 +598,11 @@ export default class UniverseOverviewNew extends Component {
     const metricKey = isKubernetes ? 'container_volume_stats' : 'disk_usage';
     const secondaryMetric = isKubernetes
       ? [
-        {
-          metric: 'container_volume_max_usage',
-          name: 'size'
-        }
-      ]
+          {
+            metric: 'container_volume_max_usage',
+            name: 'size'
+          }
+        ]
       : null;
     const useK8CustomResourcesObject = this.props.runtimeConfigs?.data?.configEntries?.find(
       (c) => c.key === RuntimeConfigKey.USE_K8_CUSTOM_RESOURCES_FEATURE_FLAG
@@ -607,10 +645,11 @@ export default class UniverseOverviewNew extends Component {
     );
   };
 
-  getCPUWidget = (universeInfo) => {
+  getCPUWidget = (universeInfo, isRollBackFeatureEnabled) => {
     // For kubernetes the CPU usage would be in container tab, rest it would be server tab.
     const isItKubernetesUniverse = isKubernetesUniverse(universeInfo);
     const isDedicatedNodes = isDedicatedNodePlacement(universeInfo);
+    const hasReadReplicaCluster = this.hasReadReplica(universeInfo);
     const subTab = isItKubernetesUniverse ? 'container' : 'server';
     const useK8CustomResourcesObject = this.props.runtimeConfigs?.data?.configEntries?.find(
       (c) => c.key === RuntimeConfigKey.USE_K8_CUSTOM_RESOURCES_FEATURE_FLAG
@@ -618,7 +657,12 @@ export default class UniverseOverviewNew extends Component {
     const useK8CustomResources = useK8CustomResourcesObject?.value === 'true';
 
     return (
-      <Col lg={isDedicatedNodes ? 2 : 4} md={4} sm={4} xs={6}>
+      <Col
+        lg={(isDedicatedNodes && !isRollBackFeatureEnabled) || hasReadReplicaCluster ? 2 : 4}
+        md={4}
+        sm={4}
+        xs={6}
+      >
         <StandaloneMetricsPanelContainer
           metricKey={isItKubernetesUniverse ? 'container_cpu_usage' : 'cpu_usage'}
           isDedicatedNodes={isDedicatedNodes && !isItKubernetesUniverse}
@@ -733,7 +777,7 @@ export default class UniverseOverviewNew extends Component {
         <RbacValidator
           accessRequiredOn={{
             onResource: universeInfo.universeUUID,
-            ...UserPermissionMap.updateUniverse
+            ...ApiPermissionMap.MODIFY_UNIVERSE
           }}
           isControl
         >
@@ -752,13 +796,17 @@ export default class UniverseOverviewNew extends Component {
     const infoWidget = (
       <YBWidget
         className={'overview-widget-database'}
-        headerLeft={'Version'}
         headerRight={showUpdate && !universePaused ? upgradeLink() : null}
+        noHeader
+        size={1}
         body={
-          <FlexContainer className={'centered'} direction={'column'}>
-            <FlexGrow>
+          <FlexContainer className={'cost-widget centered'} direction={'row'}>
+            <FlexShrink>
+              <span className="version__label">{'Version'}</span>
+            </FlexShrink>
+            <FlexShrink>
               <DatabasePanel universeInfo={universeInfo} tasks={tasks} />
-            </FlexGrow>
+            </FlexShrink>
             <FlexShrink>
               {lastUpdateDate && (
                 <div className="text-lightgray text-light">
@@ -779,7 +827,7 @@ export default class UniverseOverviewNew extends Component {
       />
     );
     return (
-      <Col lg={2} md={4} sm={4} xs={6}>
+      <Col lg={4} md={4} sm={4} xs={6}>
         {infoWidget}
       </Col>
     );
@@ -790,10 +838,11 @@ export default class UniverseOverviewNew extends Component {
       universe,
       universe: { currentUniverse },
       alerts,
+      updateAvailable,
       tasks,
-      currentCustomer
+      currentCustomer,
+      runtimeConfigs
     } = this.props;
-
     const universeInfo = currentUniverse.data;
     const nodePrefixes = [universeInfo.universeDetails.nodePrefix];
     const isItKubernetesUniverse = isKubernetesUniverse(universeInfo);
@@ -802,18 +851,55 @@ export default class UniverseOverviewNew extends Component {
     const primaryCluster = getPrimaryCluster(clusters);
     const userIntent = primaryCluster && primaryCluster?.userIntent;
     const dedicatedNodes = userIntent?.dedicatedNodes;
+    const failedTask = getcurrentUniverseFailedTask(universeInfo, tasks.customerTaskList);
+    const ybSoftwareUpgradeState = universeDetails?.softwareUpgradeState;
+    const universeStatus = getUniverseStatus(universeInfo);
+    const isUpgradePreCheckFailed =
+      universeStatus.state === UniverseState.GOOD &&
+      failedTask?.type === SoftwareUpgradeTaskType.SOFTWARE_UPGRADE;
+
+    const isRollBackFeatureEnabled =
+      runtimeConfigs?.data?.configEntries?.find(
+        (c) => c.key === 'yb.upgrade.enable_rollback_support'
+      )?.value === 'true';
 
     const isQueryMonitoringEnabled = localStorage.getItem('__yb_query_monitoring__') === 'true';
     return (
       <Fragment>
+        {isRollBackFeatureEnabled &&
+          ybSoftwareUpgradeState === SoftwareUpgradeState.PRE_FINALIZE && (
+            <Row className="p-16">{<PreFinalizeBanner universeData={universeInfo} />}</Row>
+          )}
+        {isRollBackFeatureEnabled &&
+          [SoftwareUpgradeState.ROLLBACK_FAILED, SoftwareUpgradeState.UPGRADE_FAILED].includes(
+            ybSoftwareUpgradeState
+          ) &&
+          [
+            SoftwareUpgradeTaskType.ROLLBACK_UPGRADE,
+            SoftwareUpgradeTaskType.SOFTWARE_UPGRADE
+          ].includes(failedTask?.type) &&
+          !isUpgradePreCheckFailed && (
+            <Row className="p-16">
+              <FailedBanner universeData={universeInfo} taskDetail={failedTask} />
+            </Row>
+          )}
         <Row>
           {isEnabled(currentCustomer.data.features, 'universes.details.overview.costs') &&
             this.getCostWidget(universeInfo)}
+          <Col lg={4} md={6} sm={8} xs={12}>
+            {getPromiseState(currentUniverse).isSuccess() && (
+              <DBVersionWidget
+                higherVersionCount={updateAvailable}
+                isRollBackFeatureEnabled={isRollBackFeatureEnabled}
+                failedTaskDetails={failedTask}
+              />
+            )}
+          </Col>
         </Row>
         <Row>
-          {this.getDatabaseWidget(universeInfo, tasks)}
-          {this.getPrimaryClusterWidget(universeInfo)}
-          {this.getCPUWidget(universeInfo)}
+          {this.getPrimaryClusterWidget(universeInfo, isRollBackFeatureEnabled)}
+          {this.hasReadReplica(universeInfo) && this.getReadReplicaClusterWidget(universeInfo)}
+          {this.getCPUWidget(universeInfo, isRollBackFeatureEnabled)}
           {isDisabled(currentCustomer.data.features, 'universes.details.health')
             ? this.getAlertWidget(alerts, universeInfo)
             : this.getHealthWidget(universe.healthCheck, universeInfo)}

@@ -23,14 +23,14 @@ import { RolesAndResourceMapping } from '../../policy/RolesAndResourceMapping';
 import { YBButton, YBInputField } from '../../../../components';
 import { editUsersRolesBindings, getRoleBindingsForUser } from '../../api';
 import { convertRbacBindingsToUISchema } from './UserUtils';
-import { RbacValidator, hasNecessaryPerm } from '../../common/RbacValidator';
+import { RbacValidator, hasNecessaryPerm } from '../../common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../ApiAndUserPermMapping';
 
 import { RbacUserWithResources } from '../interface/Users';
 import { UserContextMethods, UserPages, UserViewContext } from './UserContext';
 import { createErrorMessage } from '../../../universe/universe-form/utils/helpers';
 import { ForbiddenRoles, Role } from '../../roles';
 import { getEditUserValidationSchema } from './UserValidationSchema';
-import { UserPermissionMap } from '../../UserPermPathMapping';
 
 import { ReactComponent as ArrowLeft } from '../../../../assets/arrow_left.svg';
 import { ReactComponent as Delete } from '../../../../assets/trashbin.svg';
@@ -145,6 +145,13 @@ export const EditUser = () => {
         })();
       }}
       saveLabel={t('title')}
+      disableSave={
+        currentUser?.uuid !== undefined &&
+        !hasNecessaryPerm({
+          ...ApiPermissionMap.MODIFY_USER,
+          onResource: { USER: currentUser?.uuid }
+        })
+      }
     >
       <Box className={classes.root}>
         <div className={classes.header}>
@@ -159,12 +166,15 @@ export const EditUser = () => {
             {t('title')}
           </div>
           <RbacValidator
-            accessRequiredOn={UserPermissionMap.deleteUser}
+            accessRequiredOn={{
+              ...ApiPermissionMap.DELETE_USER,
+              onResource: { USER: currentUser?.uuid }
+            }}
             customValidateFunction={() => {
               return (
                 hasNecessaryPerm({
-                  ...UserPermissionMap.deleteUser,
-                  onResource: currentUser?.uuid
+                  ...ApiPermissionMap.DELETE_USER,
+                  onResource: { USER: currentUser?.uuid }
                 }) &&
                 currentUser?.uuid !== localStorage.getItem('userId') &&
                 !isSuperAdmin

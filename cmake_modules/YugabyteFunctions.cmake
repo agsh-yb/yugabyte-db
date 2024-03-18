@@ -757,8 +757,10 @@ function(parse_build_root_basename)
   endif()
   get_filename_component(YB_BUILD_ROOT_BASENAME "${CMAKE_CURRENT_BINARY_DIR}" NAME)
 
-  EXEC_PROGRAM("${BUILD_SUPPORT_DIR}/show_build_root_name_regex.sh"
+  execute_process(COMMAND "${BUILD_SUPPORT_DIR}/show_build_root_name_regex.sh"
                OUTPUT_VARIABLE BUILD_ROOT_BASENAME_RE)
+  # Remove trailing new line from BUILD_ROOT_BASENAME_RE.
+  string(REGEX REPLACE "\n$" "" BUILD_ROOT_BASENAME_RE "${BUILD_ROOT_BASENAME_RE}")
   string(REGEX MATCH "${BUILD_ROOT_BASENAME_RE}" RE_MATCH_RESULT "${YB_BUILD_ROOT_BASENAME}")
   if("$ENV{YB_DEBUG_BUILD_ROOT_BASENAME_PARSING}" STREQUAL "1")
     message("Parsing build root basename: ${YB_BUILD_ROOT_BASENAME}")
@@ -1014,7 +1016,7 @@ macro(yb_setup_odyssey)
   endif()
   if(IS_GCC)
     list(APPEND OD_EXTRA_COMPILER_FLAGS -Wno-pedantic)
-    if("${COMPILER_VERSION}" MATCHES "^12[.].*$")
+    if("${COMPILER_VERSION}" MATCHES "^1[2-9][.].*$")
       # To work around:
       # https://gist.github.com/mbautin/c4d4193ff1c2c310ff6ed4d8a01bd385
       list(APPEND OD_EXTRA_COMPILER_FLAGS -Wno-address)
@@ -1055,4 +1057,11 @@ macro(add_extra_yb_flags_in_odyssey)
   foreach(od_extra_c_flag IN LISTS OD_EXTRA_C_FLAGS)
     string(APPEND CMAKE_C_FLAGS " ${od_extra_c_flag}")
   endforeach()
+endmacro()
+
+macro(add_cxx_no_sanitize_flag flag)
+  if(NOT "${CXX_NO_SANITIZE_FLAG}" STREQUAL "")
+    string(APPEND CXX_NO_SANITIZE_FLAG ",")
+  endif()
+  string(APPEND CXX_NO_SANITIZE_FLAG "${flag}")
 endmacro()

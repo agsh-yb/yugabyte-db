@@ -40,6 +40,7 @@ NOBODY_UID=65534
 RESTART_PROCESSES=true
 # When true, we will ignore the pgrestore_path and use pg_restore found on the system
 USE_SYSTEM_PG=false
+K8S_BACKUP_DIR="/opt/yugabyte"
 
 set +e
 # Check whether the script is being run from a VM running replicated-based Yugabyte Platform.
@@ -65,11 +66,13 @@ fi
 set -e
 
 # Assume the script is being run from a systemctl-based Yugabyte Platform installation otherwise.
-if [[ "$DOCKER_BASED" = false ]] && [[ "$INSIDE_CONTAINER" = false ]]; then
+set +u # Allow checking undefined variables, mostly for the global env kubernetes_service_host
+if [[ "$DOCKER_BASED" = false ]] && [[ "$INSIDE_CONTAINER" = false ]] && [[ "$KUBERNETES_SERVICE_HOST" = "" ]]; then
   SERVICE_BASED=true
 else
   SERVICE_BASED=false
 fi
+set -u # Disallow undefined variables
 
 # Takes docker container and command as arguments. Executes docker cmd if docker-based or not.
 docker_aware_cmd() {
@@ -309,6 +312,7 @@ create_backup() {
   ybdb="${15}"
   ysql_dump_path="${16}"
   include_releases_flag="**/releases/**"
+  include_uploaded_releases_flag="**/upload/release_artifacts/**"
 
   mkdir -p "${output_path}"
 
@@ -328,11 +332,11 @@ create_backup() {
       exclude_flags="${exclude_flags} --exclude_releases"
     fi
     kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- /bin/bash -c \
-      "${backup_script} create ${verbose_flag} ${exclude_flags} --output /opt/yugabyte/yugaware"
+      "${backup_script} create ${verbose_flag} ${exclude_flags} --output ${K8S_BACKUP_DIR}"
     # Determine backup archive filename.
     # Note: There is a slight race condition here. It will always use the most recent backup file.
     backup_file=$(kubectl -n "${k8s_namespace}" -c yugaware exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "cd /opt/yugabyte/yugaware && ls -1 backup*.tgz | tail -n 1")
+      /bin/bash -c "cd ${K8S_BACKUP_DIR} && ls -1 backup*.tgz | tail -n 1")
     backup_file=${backup_file%$'\r'}
     # Ensure backup succeeded.
     if [[ -z "${backup_file}" ]]; then
@@ -340,35 +344,14 @@ create_backup() {
       return
     fi
 
-    # The version_metadata.json file is always present in the container, so
-    # we don't need to check if the file exists before copying it to the output path.
-
-    # Note that the copied path is version_metadata_backup.json and not version_metadata.json
-    # because executing yb_platform_backup.sh with the kubectl command will first execute the
-    # script in the container, making the version metadata file already be renamed to
-    # version_metadata_backup.json and placed at location
-    # /opt/yugabyte/yugaware/version_metadata_backup.json in the container. We extract this file
-    # from the container to our local machine for version checking.
-
-    version_path="/opt/yugabyte/yugaware/${VERSION_METADATA_BACKUP}"
-
-
-    # Copy version_metadata_backup.json from container to local machine.
-    kubectl cp "${k8s_pod}:${version_path}" "${output_path}/${VERSION_METADATA_BACKUP}" \
-      -n "${k8s_namespace}" -c yugaware
-
-    # Delete version_metadata_backup.json from container.
-    kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "rm /opt/yugabyte/yugaware/${VERSION_METADATA_BACKUP}"
-
     echo "Copying backup from container"
     # Copy backup archive from container to local machine.
-    kubectl -n "${k8s_namespace}" -c yugaware cp \
-      "${k8s_pod}:${backup_file}" "${output_path}/${backup_file}"
+    kubectl -n "${k8s_namespace}" -c yugaware cp --request-timeout="${k8s_timeout}" \
+      "${k8s_pod}:${K8S_BACKUP_DIR}/${backup_file}" "${output_path}/${backup_file}"
 
     # Delete backup archive from container.
     kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "rm /opt/yugabyte/yugaware/backup*.tgz"
+      /bin/bash -c "rm ${K8S_BACKUP_DIR}/backup*.tgz"
     echo "Done"
     return
   fi
@@ -379,14 +362,14 @@ create_backup() {
 
     metadata_regex="**/yugaware/conf/${VERSION_METADATA}"
     if [[ "${yba_installer}" = true ]]; then
-      version=$(basename $(realpath /opt/yugabyte/software/active))
+      version=$(basename $(realpath ${data_dir}/software/active))
       metadata_regex="**/${version}/**/yugaware/conf/${VERSION_METADATA}"
     fi
     version_path=$(docker_aware_cmd "yugaware" "find ${data_dir} -wholename ${metadata_regex}")
 
     # At least keep some default as a worst case.
     if [ ! -f ${version_path} ] || [ -z ${version_path} ]; then
-      version_path="/opt/yugabyte/yugaware/conf/${VERSION_METADATA}"
+      version_path="${data_dir}/yugaware/conf/${VERSION_METADATA}"
     fi
 
     command="cp ${version_path} ${data_dir}/${VERSION_METADATA_BACKUP}"
@@ -395,6 +378,7 @@ create_backup() {
 
   if [[ "$exclude_releases" = true ]]; then
     include_releases_flag=""
+    include_uploaded_releases_flag=""
   fi
 
   modify_service yb-platform stop
@@ -423,7 +407,7 @@ create_backup() {
               "**/prometheus/targets/**" "**/data/yb-platform/node-agent/certs/**" \
               "**/data/node-agent/certs/**" "**/provision/**/provision_instance.py" \
               "**/${PLATFORM_DUMP_FNAME}" "**/${VERSION_METADATA_BACKUP}" \
-              "${include_releases_flag}") )
+              "${include_releases_flag}" "${include_uploaded_releases_flag}") )
 
   # Backup prometheus data.
   if [[ "$exclude_prometheus" = false ]]; then
@@ -443,10 +427,13 @@ create_backup() {
   echo "Creating platform backup package..."
   cd ${data_dir}
 
-  eval find ${FIND_OPTIONS[@]}
+  eval find -L ${FIND_OPTIONS[@]}
 
   gzip -9 < ${tar_name} > ${tgz_name}
   cleanup "${tar_name}"
+
+  # Delete the version metadata backup if we had created it earlier
+  docker_aware_cmd "yugaware" "rm -f ${data_dir}/${VERSION_METADATA_BACKUP}"
 
   echo "Finished creating backup ${tgz_name}"
   modify_service yb-platform restart
@@ -471,46 +458,19 @@ restore_backup() {
   ybai_data_dir="${16}"
   prometheus_dir_regex="\.\/${PROMETHEUS_SNAPSHOT_DIR}\/[[:digit:]]{8}T[[:digit:]]{6}Z-[[:alnum:]]{16}\/$"
 
-  current_metadata_path=""
-
-  if [ -f "../../src/main/resources/${VERSION_METADATA}" ]; then
-
-      current_metadata_path="../../src/main/resources/${VERSION_METADATA}"
-
-  else
-
-      metadata_regex="**/yugaware/conf/${VERSION_METADATA}"
-      if [[ "${yba_installer}" = true ]]; then
-        version=$(basename $(realpath ${data_dir}/software/active))
-        metadata_regex="**/${version}/**/yugaware/conf/${VERSION_METADATA}"
-      fi
-      current_metadata_path=$(find ${destination} -wholename ${metadata_regex})
-
-      # At least keep some default as a worst case.
-      if [ ! -f ${current_metadata_path} ] || [ -z ${current_metadata_path} ]; then
-        current_metadata_path="/opt/yugabyte/yugaware/conf/${VERSION_METADATA}"
-      fi
-
-  fi
-
-
   # Perform K8s restore.
   if [[ -n "${k8s_namespace}" ]] || [[ -n "${k8s_pod}" ]]; then
 
     # Copy backup archive to container.
     echo "Copying backup to container"
-    kubectl -n "${k8s_namespace}" -c yugaware cp \
-      "${input_path}" "${k8s_pod}:/opt/yugabyte/yugaware/"
+    kubectl -n "${k8s_namespace}" -c yugaware cp --request-timeout="${k8s_timeout}" \
+      "${input_path}" "${k8s_pod}:${K8S_BACKUP_DIR}"
     echo "Done"
-
-    # Copy version_metadata_backup.json to container.
-    kubectl -n "${k8s_namespace}" -c yugaware cp \
-      "${r_pth}" "${k8s_pod}:/opt/yugabyte/yugaware/"
 
     # Determine backup archive filename.
     # Note: There is a slight race condition here. It will always use the most recent backup file.
     backup_file=$(kubectl -n "${k8s_namespace}" -c yugaware exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "cd /opt/yugabyte/yugaware && ls -1 backup*.tgz | tail -n 1")
+      /bin/bash -c "cd ${K8S_BACKUP_DIR} && ls -1 backup*.tgz | tail -n 1")
     backup_file=${backup_file%$'\r'}
     # Run restore script in container.
     verbose_flag=""
@@ -522,31 +482,48 @@ restore_backup() {
     #Passing in the required argument for --disable_version_check if set to true, since
     #the script is called again within the Kubernetes container.
     d="--disable_version_check"
-    cont_path="/opt/yugabyte/yugaware"
 
     if [ "$disable_version_check" != true ]; then
       kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- /bin/bash -c \
-        "${backup_script} restore ${verbose_flag} --input ${cont_path}/${backup_file}"
+        "${backup_script} restore ${verbose_flag} --input ${K8S_BACKUP_DIR}/${backup_file}"
     else
       kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- /bin/bash -c \
-        "${backup_script} restore ${verbose_flag} --input ${cont_path}/${backup_file} ${d}"
+        "${backup_script} restore ${verbose_flag} --input ${K8S_BACKUP_DIR}/${backup_file} ${d}"
     fi
-
-    # Delete version_metadata_backup.json from container.
-    kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "rm /opt/yugabyte/yugaware/${VERSION_METADATA_BACKUP}"
-
-    # Delete version_metadata.json from container (it already exists at conf folder)
-    kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "rm /opt/yugabyte/yugaware/${VERSION_METADATA}"
 
     # Delete backup archive from container.
     kubectl -n "${k8s_namespace}" exec -it "${k8s_pod}" -c yugaware -- \
-      /bin/bash -c "rm /opt/yugabyte/yugaware/backup*.tgz"
+      /bin/bash -c "rm ${K8S_BACKUP_DIR}/backup*.tgz"
     return
   fi
 
   if [ "$disable_version_check" != true ]; then
+
+    current_metadata_path=""
+
+    if [ -f "../../src/main/resources/${VERSION_METADATA}" ]; then
+
+        current_metadata_path="../../src/main/resources/${VERSION_METADATA}"
+
+    else
+
+        metadata_regex="**/yugaware/conf/${VERSION_METADATA}"
+        if [[ "${yba_installer}" = true ]]; then
+          version=$(basename $(realpath ${data_dir}/software/active))
+          metadata_regex="**/${version}/**/yugaware/conf/${VERSION_METADATA}"
+        fi
+        # Ignore errors in case of directories where we don't have permissions
+        set +e
+        current_metadata_path=$(find ${destination} -wholename ${metadata_regex})
+        set -e
+
+        # At least keep some default as a worst case.
+        if [ ! -f ${current_metadata_path} ] || [ -z ${current_metadata_path} ]; then
+          current_metadata_path="${data_dir}/yugaware/conf/${VERSION_METADATA}"
+        fi
+
+    fi
+
     command="cat ${current_metadata_path}"
 
     version_cmd='import json, sys; print(json.load(sys.stdin)["version_number"])'
@@ -558,13 +535,29 @@ restore_backup() {
     curr_platform_version=${version}-${build}
 
     backup_metadata_path=$(tar -tzf ${input_path} | grep ${VERSION_METADATA_BACKUP} | head -1)
-    tar -xzf ${input_path} ${backup_metadata_path}
+    if [[ "${backup_metadata_path}" == "" ]]; then
+      echo "cannot perform version check on backup ${input_path}, no ${VERSION_METADATA_BACKUP}
+      found. Please run restore with --disable_version_check or take a new backup with \
+      ${VERSION_METADATA_BACKUP}"
+      exit 1
+    fi
+    tar -xzf ${input_path} -C ${K8S_BACKUP_DIR} ${backup_metadata_path}
+    set +e
+    backup_metadata_path=$(find ${K8S_BACKUP_DIR} -name ${VERSION_METADATA_BACKUP} | head -1)
+    set -e
+    if [ ! -f ${backup_metadata_path} ] || [ -z ${backup_metadata_path} ]; then
+      echo "could not find untarred ${VERSION_METADATA_BACKUP}"
+      exit 1
+    fi
     # The version_metadata.json file is always present in a release package, and it would have
     # been stored during create_backup(), so we don't need to check if the file exists before
     # restoring it from the restore path.
     backup_yba_version=$(cat "${backup_metadata_path}" | ${PYTHON_EXECUTABLE} -c "${version_cmd}")
     backup_yba_build=$(cat "${backup_metadata_path}" | ${PYTHON_EXECUTABLE} -c "${build_cmd}")
     back_plat_version=${backup_yba_version}-${backup_yba_build}
+
+    # Delete the backup metadata path after using it
+    rm ${backup_metadata_path}
 
     if [ ${curr_platform_version} != ${back_plat_version} ]
     then
@@ -579,23 +572,20 @@ restore_backup() {
 
   modify_service yb-platform stop
 
-  db_backup_path="${destination}/${PLATFORM_DUMP_FNAME}"
-  yugabackup="${destination}"/"${MIGRATION_BACKUP_DIR}"
-  trap 'delete_db_backup ${db_backup_path}' RETURN
+  untar_dir="${destination}"
   tar_cmd="tar -xzf"
   if [[ "${verbose}" = true ]]; then
     tar_cmd="tar -xzvf"
   fi
   if [[ "${migration}" = true ]]; then
-    # Copy over migration backup data into the correct yba-installer paths
-    db_backup_path="${yugabackup}"/"${PLATFORM_DUMP_FNAME}"
-    rm -rf "${yugabackup}"
-    mkdir -p "${yugabackup}"
-    $tar_cmd "${input_path}" --directory "${yugabackup}"
+    untar_dir="${destination}"/"${MIGRATION_BACKUP_DIR}"
+    rm -rf "${untar_dir}"
+    mkdir -p "${untar_dir}"
+    $tar_cmd "${input_path}" --directory "${untar_dir}"
 
     # Copy over releases. Need to ignore node-agent/ybc releases
     set +e
-    releasesdir=$(find "${yugabackup}" -name "releases" -type d | \
+    releasesdir=$(find "${untar_dir}" -name "releases" -type d | \
                   grep -v "ybc" | grep -v "node-agent")
     set -e
     if [[ "$releasesdir" != "" ]] && [[ -d "$releasesdir" ]]; then
@@ -604,20 +594,24 @@ restore_backup() {
     # Node-agent/ybc foldes can be copied entirely into
     # Copy releases, ybc, certs, keys, over
     # xcerts/keys/licenses can all go directly into data directory
-    BACKUP_DIRS=('*ybc' '*data/certs' '*data/keys' '*data/licenses' '*node-agent')
+    BACKUP_DIRS=('*ybc' '*data/certs' '*data/keys' '*data/licenses' '*node-agent' \
+      '*upload/release_artifacts')
     for d in "${BACKUP_DIRS[@]}"
     do
       set +e
-      found_dir=$(find "${yugabackup}" -path "$d" -type d)
+      found_dir=$(find "${untar_dir}" -path "$d" -type d)
       set -e
       if [[ "$found_dir" != "" ]] && [[ -d "$found_dir" ]]; then
         cp -R "$found_dir" "$ybai_data_dir"
       fi
     done
   else
-    $tar_cmd "${input_path}" --directory "${destination}"
+    # Skipping old files due to issues with k8s restore without permission to overwrite
+    $tar_cmd "${input_path}" --directory "${destination}" --skip-old-files
   fi
 
+  db_backup_path="${untar_dir}"/"${PLATFORM_DUMP_FNAME}"
+  trap 'delete_db_backup ${db_backup_path}' RETURN
   if [[ "${ybdb}" = true ]]; then
     restore_ybdb_backup "${db_backup_path}" "${db_username}" "${db_host}" "${db_port}" \
       "${verbose}" "${yba_installer}" "${ysqlsh_path}"
@@ -637,14 +631,17 @@ restore_backup() {
     modify_service prometheus stop
     # Find snapshot directory in backup
     run_sudo_cmd "rm -rf ${PROMETHEUS_DATA_DIR}/*"
-    # snapshot_dir="${destination}/'${prom_snapshot:2}'*"
-    run_sudo_cmd "mv ${destination}/'${prom_snapshot:2}'* ${PROMETHEUS_DATA_DIR}"
+    run_sudo_cmd "mv ${untar_dir}/${prom_snapshot:2}* ${PROMETHEUS_DATA_DIR}"
     if [[ "${yba_installer}" = true ]] && [[ "${migration}" = true ]]; then
-      backup_targets=$(find "${yugabackup}" -name swamper_targets -type d)
+      set +e
+      backup_targets=$(find "${untar_dir}" -name swamper_targets -type d)
+      set -e
       if  [[ "$backup_targets" != "" ]] && [[ -d "$backup_targets" ]]; then
         run_sudo_cmd "cp -Tr ${backup_targets} ${destination}/data/prometheus/swamper_targets"
       fi
-      backup_rules=$(find "${yugabackup}" -name swamper_rules -type d)
+      set +e
+      backup_rules=$(find "${untar_dir}" -name swamper_rules -type d)
+      set -e
       if  [[ "$backup_rules" != "" ]] && [[ -d "$backup_rules" ]]; then
         run_sudo_cmd "cp -Tr ${backup_rules} ${destination}/data/prometheus/swamper_rules"
       fi
@@ -658,7 +655,7 @@ restore_backup() {
       run_sudo_cmd "chown -R ${NOBODY_UID}:${NOBODY_UID} ${PROMETHEUS_DATA_DIR}"
     fi
     # Clean up snapshot after restore
-    run_sudo_cmd "rm -rf ${destination}/${PROMETHEUS_SNAPSHOT_DIR}"
+    run_sudo_cmd "rm -rf ${untar_dir}/${PROMETHEUS_SNAPSHOT_DIR}"
     # Manually execute so postgres TRAP executes.
     modify_service prometheus restart
     if [[ "$DOCKER_BASED" = true ]]; then
@@ -673,9 +670,11 @@ restore_backup() {
   if [[ "$migration" = true ]]; then
     rm -rf "${destination}/${MIGRATION_BACKUP_DIR}"
   fi
-  if [[ "$yba_installer" = true ]]; then
-    run_sudo_cmd "chown -R ${yba_user}:${yba_user} ${ybai_data_dir}"
-  fi
+
+
+  # Delete any extra version metadata files. These may not exist, so this is best effort
+  rm -f ${data_dir}/${VERSION_METADATA_BACKUP}
+  rm -f ${data_dir}/yugaware/${VERSION_METADATA}
 
   modify_service yb-platform restart
 
@@ -709,6 +708,7 @@ print_backup_usage() {
   echo "  -t, --prometheus_port=PORT     prometheus port (default: 9090)"
   echo "  --k8s_namespace                kubernetes namespace"
   echo "  --k8s_pod                      kubernetes pod"
+  echo "  --k8s_timeout                  kubernetes cp timeout duration (default: 30m)"
   echo "  --yba_installer                yba_installer installation (default: false)"
   echo "  --plain_sql                    output a plain-text SQL script from pg_dump"
   echo "  --ybdb                         ybdb backup (default: false)"
@@ -735,6 +735,7 @@ print_restore_usage() {
   echo "  -U, --yba_user=USERNAME        yugabyte anywhere user (default: yugabyte)"
   echo "  --k8s_namespace                kubernetes namespace"
   echo "  --k8s_pod                      kubernetes pod"
+  echo "  --k8s_timeout                  kubernetes cp timeout duration (default: 30m)"
   echo "  --disable_version_check        disable the backup version check (default: false)"
   echo "  --yba_installer                yba_installer backup (default: false)"
   echo "  --ybdb                         ybdb restore (default: false)"
@@ -779,6 +780,7 @@ prometheus_port=9090
 prometheus_user=prometheus
 k8s_namespace=""
 k8s_pod=""
+k8s_timeout="30m"
 data_dir=/opt/yugabyte
 verbose=false
 disable_version_check=false
@@ -868,6 +870,10 @@ case $command in
           ;;
         --k8s_pod)
           k8s_pod=$2
+          shift 2
+          ;;
+        --k8s_timeout)
+          k8s_timeout=$2
           shift 2
           ;;
         --yba_installer)
@@ -982,6 +988,10 @@ case $command in
           ;;
         --k8s_pod)
           k8s_pod=$2
+          shift 2
+          ;;
+        --k8s_timeout)
+          k8s_timeout=$2
           shift 2
           ;;
         --disable_version_check)

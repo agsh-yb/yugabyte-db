@@ -15,7 +15,8 @@ A YugabyteDB cluster consists of two distributed services - the [YB-TServer](../
 
 ## Basics
 
-- YugabyteDB works on a variety of operating systems. For production workloads, the recommended operating systems are CentOS 7.*n* and RHEL 7.*n*.
+- YugabyteDB supports both x86 and ARM (aarch64) CPU architectures.
+- YugabyteDB is supported on a variety of [operating systems](../../reference/configuration/operating-systems/). For production workloads, the recommended operating systems are AlmaLinux 8 and RHEL 8.
 - The appropriate system limits should be set using [`ulimit`](../manual-deployment/system-config/#ulimits) on each node running a YugabyteDB server.
 - [NTP or chrony](../manual-deployment/system-config/#ntp) should be used to synchronize time among the machines.
 
@@ -169,7 +170,7 @@ YugabyteDB can run on a number of public clouds.
 
 - Use the N2 high-CPU instance family. As a second choice, the N2 standard instance family can be used.
 - Recommended instance types are `n2-highcpu-16` and `n2-highcpu-32`.
-- [Local SSDs](https://cloud.google.com/compute/docs/disks/#localssds) are the preferred storage option, as they provide improved performance over attached disks, but the data is not replicated and can be lost if the node fails. This option is ideal for databases such as YugabyteDB that manage their own replication and can guarantee high availability (HA). For more details on these tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-vs-remote-ssds).
+- [Local SSDs](https://cloud.google.com/compute/docs/disks/#localssds) are the preferred storage option, as they provide improved performance over attached disks, but the data is not replicated and can be lost if the node fails. This option is ideal for databases such as YugabyteDB that manage their own replication and can guarantee high availability (HA). For more details on these tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-versus-remote-ssds).
   - Each local SSD is 375 GB in size, but you can attach up to eight local SSD devices for 3 TB of total local SSD storage space per instance.
 - As a second choice, [remote persistent SSDs](https://cloud.google.com/compute/docs/disks/#pdspecs) perform well. Make sure the size of these SSDs are at least 250GB in size, larger if more IOPS are needed:
   - The number of IOPS scale automatically in proportion to the size of the disk.
@@ -178,6 +179,6 @@ YugabyteDB can run on a number of public clouds.
 ### Azure
 
 - Use v5 options with 16 vCPU in the Storage Optimized (preferred) or General Purpose VM types. For a busy YSQL instance, use 32 vCPU.
-- For an application that cannot tolerate P99 spikes, local SSDs (Storage Optimized instances) are the preferred option. For more details on the tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-vs-remote-ssds).
+- For an application that cannot tolerate P99 spikes, local SSDs (Storage Optimized instances) are the preferred option. For more details on the tradeoffs, refer to [Local vs remote SSDs](../../deploy/kubernetes/best-practices/#local-versus-remote-ssds).
 - If local SSDs are not available, use ultra disks to eliminate expected latency on Azure premium disks. Refer to the Azure [disk recommendations](https://azure.microsoft.com/en-us/blog/azure-ultra-disk-storage-microsoft-s-service-for-your-most-i-o-demanding-workloads/) and Azure documentation on [disk types](https://docs.microsoft.com/en-us/azure/virtual-machines/disks-types) for databases.
 - Turn on Accelerated Networking, and use VNet peering for multiple VPCs and connectivity to object stores.

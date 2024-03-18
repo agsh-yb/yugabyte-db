@@ -17,6 +17,7 @@ import com.yugabyte.yw.forms.UniverseResp;
 import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.common.YbaApi;
 import com.yugabyte.yw.models.extended.UserWithFeatures;
 import com.yugabyte.yw.rbac.annotations.AuthzPath;
 import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
@@ -48,10 +49,12 @@ public class UniverseController extends AuthenticatedController {
 
   /** List the universes for a given customer. */
   @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
       value = "List universes",
       response = UniverseResp.class,
       responseContainer = "List",
       nickname = "listUniverses")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -80,7 +83,12 @@ public class UniverseController extends AuthenticatedController {
     return PlatformResults.withData(universeRespList);
   }
 
-  @ApiOperation(value = "Get a universe", response = UniverseResp.class, nickname = "getUniverse")
+  @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
+      value = "Get a universe",
+      response = UniverseResp.class,
+      nickname = "getUniverse")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -94,7 +102,12 @@ public class UniverseController extends AuthenticatedController {
         UniverseResp.create(universe, null, runtimeConfigFactory.globalRuntimeConf()));
   }
 
-  @ApiOperation(value = "Delete a universe", response = YBPTask.class, nickname = "deleteUniverse")
+  @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
+      value = "Delete a universe",
+      response = YBPTask.class,
+      nickname = "deleteUniverse")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =

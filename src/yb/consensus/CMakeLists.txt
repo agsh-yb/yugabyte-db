@@ -31,7 +31,6 @@
 #
 
 set(YB_PCH_PREFIX consensus)
-set(YB_PCH_DEP_LIBS opid_proto)
 
 #########################################
 # consensus_metadata_proto
@@ -81,7 +80,7 @@ ADD_YB_LIBRARY(consensus_proto
 ADD_YB_LIBRARY(
   consensus_error
   SRCS consensus_error.cc
-  DEPS consensus_proto yb_util)
+  DEPS consensus_proto yb_ash yb_util)
 
 #########################################
 # log_proto

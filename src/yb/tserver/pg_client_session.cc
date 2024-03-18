@@ -80,8 +80,13 @@ DEFINE_RUNTIME_string(ysql_sequence_cache_method, "connection",
     "Where sequence values are cached for both existing and new sequences. Valid values are "
     "\"connection\" and \"server\"");
 
+DEFINE_RUNTIME_bool(ysql_ddl_transaction_wait_for_ddl_verification, false,
+                    "If set, DDL transactions will wait for DDL verification to complete before "
+                    "returning to the client. ");
+
 DECLARE_bool(ysql_serializable_isolation_for_ddl_txn);
-DECLARE_bool(ysql_ddl_rollback_enabled);
+DECLARE_bool(ysql_yb_ddl_rollback_enabled);
+DECLARE_bool(yb_enable_cdc_consistent_snapshot_streams);
 
 namespace yb {
 namespace tserver {
@@ -479,17 +484,32 @@ struct SharedExchangeQueryParams {
 };
 
 struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformData {
+  std::weak_ptr<PgClientSession> session;
+
   SharedExchange* exchange;
+
+  CoarseTimePoint deadline;
 
   CountDownLatch latch{1};
 
-  SharedExchangeQuery(uint64_t session_id_, PgTableCache* table_cache_, SharedExchange* exchange_)
-      : PerformData(session_id_, table_cache_, &exchange_req, &exchange_resp, &exchange_sidecars),
-        exchange(exchange_) {
+  SharedExchangeQuery(
+      std::shared_ptr<PgClientSession> session_, PgTableCache* table_cache_,
+      SharedExchange* exchange_)
+      : PerformData(
+            session_->id(), table_cache_, &exchange_req, &exchange_resp, &exchange_sidecars),
+        session(std::move(session_)), exchange(exchange_) {
   }
 
+  // Initialize query from data stored in exchange with specified size.
+  // The serialized query has the following format:
+  // 8 bytes - timeout in milliseconds.
+  // remaining bytes - serialized PgPerformRequestPB protobuf.
   Status Init(size_t size) {
-    return pb_util::ParseFromArray(&req, to_uchar_ptr(exchange->Obtain(size)), size);
+    auto input = to_uchar_ptr(exchange->Obtain(size));
+    auto end = input + size;
+    deadline = CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(LittleEndian::Load64(input));
+    input += sizeof(uint64_t);
+    return pb_util::ParseFromArray(&req, input, end - input);
   }
 
   void Wait() {
@@ -497,21 +517,37 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
   }
 
   void SendResponse() override {
+    using google::protobuf::io::CodedOutputStream;
     rpc::ResponseHeader header;
     header.set_call_id(42);
     auto resp_size = resp.ByteSizeLong();
     sidecars.MoveOffsetsTo(resp_size, header.mutable_sidecar_offsets());
-    auto header_size = header.ByteSizeLong();
-    auto* start = exchange->Obtain(
-        header_size + resp_size + sidecars.size() + kMaxVarint32Length * 2);
+    auto header_size = header.ByteSize();
+    auto body_size = narrow_cast<uint32_t>(resp_size + sidecars.size());
+    auto full_size =
+        CodedOutputStream::VarintSize32(header_size) + header_size +
+        CodedOutputStream::VarintSize32(body_size) + body_size;
+    auto* start = exchange->Obtain(full_size);
+    RefCntBuffer buffer;
+    if (!start) {
+      buffer = RefCntBuffer(full_size - sidecars.size());
+      start = pointer_cast<std::byte*>(buffer.data());
+    }
     auto* out = start;
-    out = WriteVarint32ToArray(narrow_cast<uint32_t>(header_size), out);
+    out = WriteVarint32ToArray(header_size, out);
     out = SerializeWithCachedSizesToArray(header, out);
-    out = WriteVarint32ToArray(narrow_cast<uint32_t>(resp_size + sidecars.size()), out);
+    out = WriteVarint32ToArray(body_size, out);
     out = SerializeWithCachedSizesToArray(resp, out);
-    sidecars.CopyTo(out);
-    out += sidecars.size();
-    exchange->Respond(out - start);
+    if (!buffer) {
+      sidecars.CopyTo(out);
+      out += sidecars.size();
+      DCHECK_EQ(out - start, full_size);
+      exchange->Respond(full_size);
+    } else {
+      auto locked_session = session.lock();
+      auto id = locked_session ? locked_session->SaveData(buffer, std::move(sidecars.buffer())) : 0;
+      exchange->Respond(kTooBigResponseMask | id);
+    }
     latch.CountDown();
   }
 };
@@ -530,6 +566,10 @@ HybridTime GetInTxnLimit(const PgPerformOptionsPB& options, ClockBase* clock) {
   }
   auto in_txn_limit = HybridTime::FromPB(options.in_txn_limit_ht().value());
   return in_txn_limit ? in_txn_limit : clock->Now();
+}
+
+Status Commit(client::YBTransaction* txn, PgResponseCache::Disabler disabler) {
+  return txn->CommitFuture().get();
 }
 
 } // namespace
@@ -602,7 +642,7 @@ Status PgClientSession::DropTable(
   if (req.index()) {
     client::YBTableName indexed_table;
     RETURN_NOT_OK(client().DeleteIndexTable(
-        yb_table_id, &indexed_table, !FLAGS_ysql_ddl_rollback_enabled /* wait */,
+        yb_table_id, &indexed_table, !FLAGS_ysql_yb_ddl_rollback_enabled /* wait */,
         metadata, context->GetClientDeadline()));
     indexed_table.SetIntoTableIdentifierPB(resp->mutable_indexed_table());
     table_cache_.Invalidate(indexed_table.table_id());
@@ -610,7 +650,7 @@ Status PgClientSession::DropTable(
     return Status::OK();
   }
 
-  RETURN_NOT_OK(client().DeleteTable(yb_table_id, !FLAGS_ysql_ddl_rollback_enabled, metadata,
+  RETURN_NOT_OK(client().DeleteTable(yb_table_id, !FLAGS_ysql_yb_ddl_rollback_enabled, metadata,
         context->GetClientDeadline()));
   table_cache_.Invalidate(yb_table_id);
   return Status::OK();
@@ -657,7 +697,16 @@ Status PgClientSession::AlterTable(
         YQL_DATABASE_PGSQL, req.rename_table().database_name(), req.rename_table().table_name());
     alterer->RenameTo(new_table_name);
   }
-
+  if (req.has_replica_identity()) {
+    client::YBTablePtr yb_table;
+    RETURN_NOT_OK(GetTable(table_id, &table_cache_, &yb_table));
+    auto table_properties = yb_table->schema().table_properties();
+    PgReplicaIdentity replica_identity;
+    RETURN_NOT_OK(
+        GetReplicaIdentityEnumValue(req.replica_identity().replica_identity(), &replica_identity));
+    table_properties.SetReplicaIdentity(replica_identity);
+    alterer->SetTableProperties(table_properties);
+  }
   alterer->timeout(context->GetClientDeadline() - CoarseMonoClock::now());
   RETURN_NOT_OK(alterer->Alter());
   table_cache_.Invalidate(table_id);
@@ -682,10 +731,31 @@ Status PgClientSession::CreateReplicationSlot(
   options.emplace(cdc::kSourceType, CDCRequestSource_Name(cdc::CDCRequestSource::CDCSDK));
   options.emplace(cdc::kCheckpointType, CDCCheckpointType_Name(cdc::CDCCheckpointType::EXPLICIT));
 
+  std::optional<CDCSDKSnapshotOption> snapshot_option;
+  if (FLAGS_yb_enable_cdc_consistent_snapshot_streams) {
+    switch (req.snapshot_action()) {
+      case REPLICATION_SLOT_NOEXPORT_SNAPSHOT:
+        snapshot_option = CDCSDKSnapshotOption::NOEXPORT_SNAPSHOT;
+        break;
+      case REPLICATION_SLOT_USE_SNAPSHOT:
+        snapshot_option = CDCSDKSnapshotOption::USE_SNAPSHOT;
+        break;
+      case REPLICATION_SLOT_UNKNOWN_SNAPSHOT:
+        // Crash in debug and return InvalidArgument in release mode.
+        RSTATUS_DCHECK(false, InvalidArgument, "invalid snapshot_action UNKNOWN");
+      default:
+        return STATUS_FORMAT(InvalidArgument, "invalid snapshot_action $0", req.snapshot_action());
+    }
+  }
+
+  uint64_t consistent_snapshot_time;
   auto stream_result = VERIFY_RESULT(client().CreateCDCSDKStreamForNamespace(
       GetPgsqlNamespaceId(req.database_oid()), options,
-      ReplicationSlotName(req.replication_slot_name())));
+      /* populate_namespace_id_as_table_id */ false,
+      ReplicationSlotName(req.replication_slot_name()),
+      snapshot_option, context->GetClientDeadline(), &consistent_snapshot_time));
   *resp->mutable_stream_id() = stream_result.ToString();
+  resp->set_cdcsdk_consistent_snapshot_time(consistent_snapshot_time);
   return Status::OK();
 }
 
@@ -870,15 +940,27 @@ Status PgClientSession::FinishTransaction(
     const PgFinishTransactionRequestPB& req, PgFinishTransactionResponsePB* resp,
     rpc::RpcContext* context) {
   saved_priority_ = std::nullopt;
-  auto kind = req.ddl_mode() ? PgClientSessionKind::kDdl : PgClientSessionKind::kPlain;
+  auto is_ddl = false;
+  auto kind = PgClientSessionKind::kPlain;
+  auto has_docdb_schema_changes = false;
+  std::optional<uint32_t> silently_altered_db;
+  if (req.has_ddl_mode()) {
+    const auto& ddl_mode = req.ddl_mode();
+    is_ddl = true;
+    kind = PgClientSessionKind::kDdl;
+    has_docdb_schema_changes = ddl_mode.has_docdb_schema_changes();
+    if (ddl_mode.has_silently_altered_db()) {
+      silently_altered_db = ddl_mode.silently_altered_db().value();
+    }
+  }
   auto& txn = Transaction(kind);
   if (!txn) {
-    VLOG_WITH_PREFIX_AND_FUNC(2) << "ddl: " << req.ddl_mode() << ", no running transaction";
+    VLOG_WITH_PREFIX_AND_FUNC(2) << "ddl: " << is_ddl << ", no running transaction";
     return Status::OK();
   }
 
   const TransactionMetadata* metadata = nullptr;
-  if (FLAGS_report_ysql_ddl_txn_status_to_master && req.has_docdb_schema_changes()) {
+  if (has_docdb_schema_changes) {
     metadata = VERIFY_RESULT(GetDdlTransactionMetadata(true, context->GetClientDeadline()));
     LOG_IF(DFATAL, !metadata) << "metadata is required";
   }
@@ -887,9 +969,13 @@ Status PgClientSession::FinishTransaction(
   Session(kind)->SetTransaction(nullptr);
 
   if (req.commit()) {
-    const auto commit_status = txn_value->CommitFuture().get();
+    const auto commit_status = Commit(
+        txn_value.get(),
+        silently_altered_db ? response_cache_.Disable(*silently_altered_db)
+                            : PgResponseCache::Disabler());
+
     VLOG_WITH_PREFIX_AND_FUNC(2)
-        << "ddl: " << req.ddl_mode() << ", txn: " << txn_value->id()
+        << "ddl: " << is_ddl << ", txn: " << txn_value->id()
         << ", commit: " << commit_status;
     // If commit_status is not ok, we cannot be sure whether the commit was successful or not. It
     // is possible that the commit succeeded at the transaction coordinator but we failed to get
@@ -909,16 +995,32 @@ Status PgClientSession::FinishTransaction(
     }
   } else {
     VLOG_WITH_PREFIX_AND_FUNC(2)
-        << "ddl: " << req.ddl_mode() << ", txn: " << txn_value->id() << ", abort";
+        << "ddl: " << is_ddl << ", txn: " << txn_value->id() << ", abort";
     txn_value->Abort();
   }
 
-  if (metadata) {
-    // If we failed to report the status of this DDL transaction, we can just log and ignore it,
-    // as the poller in the YB-Master will figure out the status of this transaction using the
-    // transaction status tablet and PG catalog.
-    ERROR_NOT_OK(client().ReportYsqlDdlTxnStatus(*metadata, req.commit()),
-                 "Sending ReportYsqlDdlTxnStatus call failed");
+  // If this transaction was DDL that had DocDB syscatalog changes, then the YB-Master may have
+  // any operations postponed to the end of transaction. Report the status of the transaction and
+  // wait for the post-processing by YB-Master to end.
+  if (FLAGS_ysql_yb_ddl_rollback_enabled && has_docdb_schema_changes && metadata) {
+    if (FLAGS_report_ysql_ddl_txn_status_to_master) {
+      // If we failed to report the status of this DDL transaction, we can just log and ignore it,
+      // as the poller in the YB-Master will figure out the status of this transaction using the
+      // transaction status tablet and PG catalog.
+      ERROR_NOT_OK(client().ReportYsqlDdlTxnStatus(*metadata, req.commit()),
+                  "Sending ReportYsqlDdlTxnStatus call failed");
+    }
+
+    if (FLAGS_ysql_ddl_transaction_wait_for_ddl_verification) {
+      // Wait for DDL verification to end. This may include actions such as a) removing an added
+      // column in case of ADD COLUMN abort b) dropping a column marked for deletion in case of
+      // DROP COLUMN commit. c) removing DELETE marker on a column if DROP COLUMN aborted d) Roll
+      // back changes to table/column names in case of transaction abort. d) dropping a table in
+      // case of DROP TABLE commit. All the above actions take place only after the transaction
+      // is completed.
+      ERROR_NOT_OK(client().WaitForDdlVerificationToFinish(*metadata),
+                  "WaitForDdlVerificationToFinish call failed");
+    }
   }
   return Status::OK();
 }
@@ -953,6 +1055,11 @@ template <class DataPtr>
 Status PgClientSession::DoPerform(const DataPtr& data, CoarseTimePoint deadline,
                                   rpc::RpcContext* context) {
   auto& options = *data->req.mutable_options();
+  if (const auto& wait_state = ash::WaitStateInfo::CurrentWaitState()) {
+    if (options.has_ash_metadata()) {
+      wait_state->UpdateMetadataFromPB(options.ash_metadata(), /* use_hex */ false);
+    }
+  }
   auto ddl_mode = options.ddl_mode() || options.yb_non_ddl_txn_for_sys_tables_allowed();
   if (!ddl_mode && xcluster_context_ && xcluster_context_->is_xcluster_read_only_mode()) {
     for (const auto& op : data->req.ops()) {
@@ -1120,13 +1227,16 @@ PgClientSession::SetupSession(
   auto session = Session(kind).get();
   client::YBTransaction* transaction = Transaction(kind).get();
 
-  VLOG_WITH_PREFIX(4) << __func__ << ": " << options.ShortDebugString();
+  VLOG_WITH_PREFIX_AND_FUNC(4) << options.ShortDebugString() << ", deadline: "
+                               << MonoDelta(deadline - CoarseMonoClock::now());
 
   const auto txn_serial_no = options.txn_serial_no();
   const auto read_time_serial_no = options.read_time_serial_no();
   UsedReadTimePtr used_read_time;
   if (options.restart_transaction()) {
-    RSTATUS_DCHECK(!options.ddl_mode(), NotSupported, "Restarting a DDL transaction not supported");
+    if (options.ddl_mode()) {
+      return STATUS(NotSupported, "Restarting a DDL transaction not supported");
+    }
     Transaction(kind) = VERIFY_RESULT(RestartTransaction(session, transaction));
     transaction = Transaction(kind).get();
   } else {
@@ -1428,6 +1538,33 @@ Status PgClientSession::UpdateSequenceTuple(
   return Status::OK();
 }
 
+size_t PgClientSession::SaveData(const RefCntBuffer& buffer, WriteBuffer&& sidecars) {
+  std::lock_guard lock(pending_data_mutex_);
+  for (size_t i = 0; i != pending_data_.size(); ++i) {
+    if (pending_data_[i].empty()) {
+      pending_data_[i].AddBlock(buffer, 0);
+      pending_data_[i].Take(&sidecars);
+      return i;
+    }
+  }
+  pending_data_.emplace_back(0);
+  pending_data_.back().AddBlock(buffer, 0);
+  pending_data_.back().Take(&sidecars);
+  return pending_data_.size() - 1;
+}
+
+Status PgClientSession::FetchData(
+    const PgFetchDataRequestPB& req, PgFetchDataResponsePB* resp,
+    rpc::RpcContext* context) {
+  size_t data_id = req.data_id();
+  std::lock_guard lock(pending_data_mutex_);
+  if (data_id >= pending_data_.size() || pending_data_[data_id].empty()) {
+    return STATUS_FORMAT(NotFound, "Data $0 not found for session $1", data_id, id_);
+  }
+  context->sidecars().Start().Take(&pending_data_[data_id]);
+  return Status::OK();
+}
+
 Status PgClientSession::FetchSequenceTuple(
     const PgFetchSequenceTupleRequestPB& req, PgFetchSequenceTupleResponsePB* resp,
     rpc::RpcContext* context) {
@@ -1638,6 +1775,7 @@ void PgClientSession::GetTableKeyRanges(
     yb::tserver::PgGetTableKeyRangesRequestPB const& req,
     yb::tserver::PgGetTableKeyRangesResponsePB* resp, yb::rpc::RpcContext context) {
   const auto table = table_cache_.Get(PgObjectId::GetYbTableIdFromPB(req.table_id()));
+  resp->set_current_ht(clock_->Now().ToUint64());
   if (!table.ok()) {
     StatusToPB(table.status(), resp->mutable_status());
     context.RespondSuccess();
@@ -1646,6 +1784,11 @@ void PgClientSession::GetTableKeyRanges(
 
   auto session = EnsureSession(PgClientSessionKind::kPlain, context.GetClientDeadline());
   auto shared_context = std::make_shared<rpc::RpcContext>(std::move(context));
+  const auto read_time_serial_no = req.read_time_serial_no();
+  if (read_time_serial_no_ != read_time_serial_no) {
+    ResetReadPoint(PgClientSessionKind::kPlain);
+    read_time_serial_no_ = read_time_serial_no;
+  }
   GetTableKeyRanges(
       session, *table, req.lower_bound_key(), req.upper_bound_key(), req.max_num_ranges(),
       req.range_size_bytes(), req.is_forward(), req.max_key_length(), &shared_context->sidecars(),
@@ -1758,13 +1901,10 @@ Status PgClientSession::CheckPlainSessionReadTime() {
 
 std::shared_ptr<CountDownLatch> PgClientSession::ProcessSharedRequest(
     size_t size, SharedExchange* exchange) {
-  // TODO(shared_mem) Use the same timeout as RPC scenario.
-  const auto kTimeout = std::chrono::seconds(60);
-  auto deadline = CoarseMonoClock::now() + kTimeout;
-  auto data = std::make_shared<SharedExchangeQuery>(id_, &table_cache_, exchange);
+  auto data = std::make_shared<SharedExchangeQuery>(shared_this_.lock(), &table_cache_, exchange);
   auto status = data->Init(size);
   if (status.ok()) {
-    status = DoPerform(data, deadline, nullptr);
+    status = DoPerform(data, data->deadline, nullptr);
   }
   if (!status.ok()) {
     StatusToPB(status, data->resp.mutable_status());

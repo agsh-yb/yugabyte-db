@@ -46,6 +46,7 @@
 #include "yb/util/locks.h"
 #include "yb/util/strongly_typed_bool.h"
 #include "yb/util/thread.h"
+#include "yb/util/write_buffer.h"
 
 DECLARE_bool(ysql_enable_db_catalog_version_mode);
 
@@ -70,6 +71,7 @@ class PgMutationCounter;
     (DropReplicationSlot) \
     (DropTable) \
     (DropTablegroup) \
+    (FetchData) \
     (FetchSequenceTuple) \
     (FinishTransaction) \
     (InsertSequenceTuple) \
@@ -143,6 +145,29 @@ class PgClientSession {
 
   BOOST_PP_SEQ_FOR_EACH(PG_CLIENT_SESSION_METHOD_DECLARE, ~, PG_CLIENT_SESSION_METHODS);
   BOOST_PP_SEQ_FOR_EACH(PG_CLIENT_SESSION_ASYNC_METHOD_DECLARE, ~, PG_CLIENT_SESSION_ASYNC_METHODS);
+
+  size_t SaveData(const RefCntBuffer& buffer, WriteBuffer&& sidecars);
+
+  Status GetReplicaIdentityEnumValue(
+      PgReplicaIdentityType replica_identity_proto, PgReplicaIdentity *replica_identity_enum) {
+    switch (replica_identity_proto) {
+      case DEFAULT:
+        *replica_identity_enum = PgReplicaIdentity::DEFAULT;
+        break;
+      case FULL:
+        *replica_identity_enum = PgReplicaIdentity::FULL;
+        break;
+      case NOTHING:
+        *replica_identity_enum = PgReplicaIdentity::NOTHING;
+        break;
+      case CHANGE:
+        *replica_identity_enum = PgReplicaIdentity::CHANGE;
+        break;
+      default:
+        RSTATUS_DCHECK(false, InvalidArgument, "Invalid Replica Identity Type");
+    }
+    return Status::OK();
+  }
 
  private:
   std::string LogPrefix();
@@ -258,6 +283,9 @@ class PgClientSession {
   std::optional<uint64_t> saved_priority_;
   TransactionMetadata ddl_txn_metadata_;
   UsedReadTime plain_session_used_read_time_;
+
+  simple_spinlock pending_data_mutex_;
+  std::vector<WriteBuffer> pending_data_ GUARDED_BY(pending_data_mutex_);
 };
 
 }  // namespace tserver

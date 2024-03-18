@@ -14,19 +14,22 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskSubType;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.XClusterConfig;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.tuple.Pair;
+import org.yb.client.YBClient;
 
 @Slf4j
 public abstract class SoftwareUpgradeTaskBase extends UpgradeTaskBase {
@@ -55,18 +58,13 @@ public abstract class SoftwareUpgradeTaskBase extends UpgradeTaskBase {
         .build();
   }
 
-  protected UpgradeContext getRollbackUpgradeContext(
-      Set<NodeDetails> nodesToSkipMasterActions,
-      Set<NodeDetails> nodesToSkipTServerActions,
-      String targetSoftwareVersion) {
+  protected UpgradeContext getRollbackUpgradeContext(String targetSoftwareVersion) {
     return UpgradeContext.builder()
         .reconfigureMaster(false)
         .runBeforeStopping(false)
         .processInactiveMaster(true)
         .processTServersFirst(true)
         .targetSoftwareVersion(targetSoftwareVersion)
-        .nodesToSkipMasterActions(nodesToSkipMasterActions)
-        .nodesToSkipTServerActions(nodesToSkipTServerActions)
         .build();
   }
 
@@ -87,7 +85,7 @@ public abstract class SoftwareUpgradeTaskBase extends UpgradeTaskBase {
   }
 
   protected void createUpgradeTaskFlowTasks(
-      Pair<List<NodeDetails>, List<NodeDetails>> nodes,
+      MastersAndTservers nodes,
       String newVersion,
       UpgradeContext upgradeContext,
       boolean reProvision) {
@@ -226,8 +224,9 @@ public abstract class SoftwareUpgradeTaskBase extends UpgradeTaskBase {
   }
 
   protected void createPrecheckTasks(Universe universe, String newVersion) {
-    Pair<List<NodeDetails>, List<NodeDetails>> nodes = fetchNodes(taskParams().upgradeOption);
-    Set<NodeDetails> allNodes = toOrderedSet(nodes);
+    super.createPrecheckTasks(universe);
+    MastersAndTservers nodes = fetchNodes(taskParams().upgradeOption);
+    Set<NodeDetails> allNodes = toOrderedSet(nodes.asPair());
 
     // Preliminary checks for upgrades.
     createCheckUpgradeTask(newVersion).setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
@@ -240,5 +239,88 @@ public abstract class SoftwareUpgradeTaskBase extends UpgradeTaskBase {
       createAvailableMemoryCheck(allNodes, Util.AVAILABLE_MEMORY, memAvailableLimit)
           .setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
     }
+
+    createLocaleCheckTask(new ArrayList<>(universe.getNodes()))
+        .setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
+
+    createCheckGlibcTask(new ArrayList<>(universe.getNodes()), newVersion)
+        .setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
+
+    addBasicPrecheckTasks();
+  }
+
+  /**
+   * Returns a pair of list of nodes which have same DB version or in Live state.
+   *
+   * @param universe
+   * @param nodes
+   * @param requiredVersion
+   * @return pair of list of nodes
+   */
+  protected MastersAndTservers filterOutAlreadyProcessedNodes(
+      Universe universe, MastersAndTservers nodes, String requiredVersion) {
+    Set<NodeDetails> masterNodesWithSameDBVersion =
+        getNodesWithSameDBVersion(universe, nodes.mastersList, ServerType.MASTER, requiredVersion);
+    List<NodeDetails> masterNodes =
+        nodes.mastersList.stream()
+            .filter(
+                node ->
+                    (!masterNodesWithSameDBVersion.contains(node)
+                        || !node.state.equals(NodeState.Live)))
+            .collect(Collectors.toList());
+    Set<NodeDetails> tserverNodesWithSameDBVersion =
+        getNodesWithSameDBVersion(
+            universe, nodes.tserversList, ServerType.TSERVER, requiredVersion);
+    List<NodeDetails> tserverNodes =
+        nodes.tserversList.stream()
+            .filter(
+                node ->
+                    (!tserverNodesWithSameDBVersion.contains(node)
+                        || !node.state.equals(NodeState.Live)))
+            .collect(Collectors.toList());
+    return new MastersAndTservers(masterNodes, tserverNodes);
+  }
+
+  private Set<NodeDetails> getNodesWithSameDBVersion(
+      Universe universe,
+      List<NodeDetails> nodeDetails,
+      ServerType serverType,
+      String requiredVersion) {
+    if (!Util.isYbVersionFormatValid(requiredVersion)) {
+      return new HashSet<>();
+    }
+    try (YBClient client =
+        ybService.getClient(universe.getMasterAddresses(), universe.getCertificateClientToNode())) {
+      return nodeDetails.stream()
+          .filter(node -> isDBVersionSameOnNode(client, node, serverType, requiredVersion))
+          .collect(Collectors.toSet());
+    } catch (Exception e) {
+      log.error("Error while fetching versions on universe : {} ", universe.getUniverseUUID(), e);
+      return new HashSet<>();
+    }
+  }
+
+  private boolean isDBVersionSameOnNode(
+      YBClient client, NodeDetails node, ServerType serverType, String softwareVersion) {
+    int port = serverType.equals(ServerType.MASTER) ? node.masterRpcPort : node.tserverRpcPort;
+    try {
+
+      Optional<String> version =
+          ybService.getServerVersion(client, node.cloudInfo.private_ip, port);
+      if (version.isPresent()) {
+        String serverVersion = version.get();
+        log.debug(
+            "Found version {} on node:{} port {}", serverVersion, node.cloudInfo.private_ip, port);
+        if (!Util.isYbVersionFormatValid(serverVersion)) {
+          return false;
+        } else if (CommonUtils.isReleaseEqual(softwareVersion, serverVersion)) {
+          return true;
+        }
+      }
+    } catch (Exception e) {
+      log.error(
+          "Error fetching version info on node: {} port: {} ", node.cloudInfo.private_ip, port, e);
+    }
+    return false;
   }
 }

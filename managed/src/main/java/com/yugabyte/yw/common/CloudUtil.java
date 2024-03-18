@@ -2,16 +2,15 @@
 
 package com.yugabyte.yw.common;
 
-import static play.mvc.Http.Status.PRECONDITION_FAILED;
-
 import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.common.backuprestore.BackupUtil.PerLocationBackupInfo;
-import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil.YbcBackupResponse;
-import com.yugabyte.yw.common.backuprestore.ybc.YbcBackupUtil.YbcBackupResponse.ResponseCloudStoreSpec.BucketLocation;
 import com.yugabyte.yw.forms.RestorePreflightParams;
 import com.yugabyte.yw.forms.RestorePreflightResponse;
 import com.yugabyte.yw.models.Backup.BackupCategory;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.configs.data.CustomerConfigData;
+import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.ProxyConfig;
 import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.Collections;
@@ -22,12 +21,15 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.AllArgsConstructor;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.yb.ybc.ProxySpec;
 
 public interface CloudUtil extends StorageUtil {
 
   @AllArgsConstructor
-  public static class ConfigLocationInfo {
+  public static class CloudLocationInfo {
     public String bucket;
     public String cloudPath;
   }
@@ -49,13 +51,13 @@ public interface CloudUtil extends StorageUtil {
 
   public static final String DUMMY_DATA = "dummy-text";
 
-  public ConfigLocationInfo getConfigLocationInfo(String location);
+  public CloudLocationInfo getCloudLocationInfo(
+      String region, CustomerConfigData configData, String backupLocation);
 
-  public void deleteKeyIfExists(CustomerConfigData configData, String defaultBackupLocation)
-      throws Exception;
+  public boolean deleteKeyIfExists(CustomerConfigData configData, String defaultBackupLocation);
 
-  public void deleteStorage(CustomerConfigData configData, List<String> backupLocations)
-      throws Exception;
+  public boolean deleteStorage(
+      CustomerConfigData configData, Map<String, List<String>> backupRegionLocationsMap);
 
   public <T> T listBuckets(CustomerConfigData configData);
 
@@ -95,6 +97,14 @@ public interface CloudUtil extends StorageUtil {
   default void validate(CustomerConfigData configData, List<ExtraPermissionToValidate> permissions)
       throws Exception {
     // default fall through stub
+  }
+
+  public default boolean shouldUseHttpsProxy(CustomerConfigData configData) {
+    return true;
+  }
+
+  public default ProxySpec getOldProxySpec(CustomerConfigData configData) {
+    return null;
   }
 
   default UUID getRandomUUID() {
@@ -142,29 +152,32 @@ public interface CloudUtil extends StorageUtil {
     return preflightResponseBuilder.build();
   }
 
-  public default void validateStorageConfigOnSuccessMarker(
-      CustomerConfigData configData, YbcBackupResponse successMarker) {
-    Map<String, String> configLocationMap = getRegionLocationsMap(configData);
-    Map<String, BucketLocation> successMarkerBucketLocationMap =
-        successMarker.responseCloudStoreSpec.getBucketLocationsMap();
-    successMarkerBucketLocationMap.entrySet().stream()
-        .forEach(
-            sME -> {
-              if (!configLocationMap.containsKey(sME.getKey())) {
-                throw new PlatformServiceException(
-                    PRECONDITION_FAILED,
-                    String.format("Storage config does not contain region %s", sME.getKey()));
-              }
-              String configBucket =
-                  getConfigLocationInfo(configLocationMap.get(sME.getKey())).bucket;
-              if (!configBucket.equals(sME.getValue().bucket)) {
-                throw new PlatformServiceException(
-                    PRECONDITION_FAILED,
-                    String.format(
-                        "Unknown bucket %s found for region %s, wanted: %s",
-                        configBucket, sME.getKey(), sME.getValue().bucket));
-              }
-              // TODO: Arjav Garg: Verify list and Read permissions for sME.getValue().cloudDir.
-            });
+  @Override
+  public default org.yb.ybc.ProxyConfig createYbcProxyConfig(
+      Universe universe, CustomerConfigData configData) {
+    boolean useHttpsProxy = shouldUseHttpsProxy(configData);
+    Map<NodeDetails, ProxyConfig> nodeProxyMap = universe.getNodeProxyConfigMap();
+    Map<String, ProxySpec> pSpecMap =
+        nodeProxyMap.entrySet().parallelStream()
+            .filter(e -> (e.getKey().cloudInfo.private_ip != null))
+            .filter(
+                e ->
+                    (e.getValue() != null)
+                        && (useHttpsProxy
+                            ? StringUtils.isNotBlank(e.getValue().getHttpsProxy())
+                            : StringUtils.isNotBlank(e.getValue().getHttpProxy())))
+            .collect(
+                Collectors.toMap(
+                    e -> e.getKey().cloudInfo.private_ip,
+                    e -> e.getValue().getYbcProxySpec(useHttpsProxy)));
+    if (MapUtils.isNotEmpty(pSpecMap)) {
+      return org.yb.ybc.ProxyConfig.newBuilder().putAllNodeProxyMap(pSpecMap).build();
+    }
+    // Old flow
+    ProxySpec pSpec = getOldProxySpec(configData);
+    if (pSpec != null) {
+      return org.yb.ybc.ProxyConfig.newBuilder().setDefaultProxy(pSpec).build();
+    }
+    return null;
   }
 }

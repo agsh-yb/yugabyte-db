@@ -55,12 +55,12 @@ func Install(version string) {
 
 func createInstallDirs() {
 	createDirs := []string{
-		GetBaseInstall(),
 		GetSoftwareRoot(),
 		dm.WorkingDirectory(),
 		filepath.Join(GetBaseInstall(), "data"),
 		filepath.Join(GetBaseInstall(), "data/logs"),
 		GetInstallerSoftwareDir(),
+		GetBaseInstall(),
 	}
 
 	for _, dir := range createDirs {
@@ -154,10 +154,13 @@ func Uninstall(serviceNames []string, removeData bool) {
 				log.Info(fmt.Sprintf("Failed to delete yba installer data dir %s", GetYBAInstallerDataDir()))
 			}
 		}
+		// Remove yba-ctl only when data is removed so state is preserved
+		err = RemoveAll(YbactlInstallDir())
+		if err != nil {
+			log.Warn(fmt.Sprintf("Failed to delete yba-ctl dir %s", YbactlInstallDir()))
+		}
 	}
 
-	// Remove yba-ctl
-	RemoveAll(YbactlInstallDir())
 	os.Remove("/usr/bin/" + GoBinaryName)
 }
 
@@ -380,7 +383,7 @@ func FixConfigValues() {
 	var serverCertPath, serverKeyPath string
 	if len(viper.GetString("server_cert_path")) == 0 {
 		log.Info("Generating self-signed server certificates")
-		serverCertPath, serverKeyPath = generateSelfSignedCerts()
+		serverCertPath, serverKeyPath = GenerateSelfSignedCerts()
 		SetYamlValue(InputFile(), "server_cert_path", serverCertPath)
 		SetYamlValue(InputFile(), "server_key_path", serverKeyPath)
 		InitViper()
@@ -388,16 +391,16 @@ func FixConfigValues() {
 
 	if viper.GetBool("postgres.install.enabled") &&
 		len(viper.GetString("postgres.install.password")) == 0 {
-			log.Info("Generating default password for postgres")
-			SetYamlValue(InputFile(), "postgres.install.password", GenerateRandomStringURLSafe(32))
-			InitViper()
+		log.Info("Generating default password for postgres")
+		SetYamlValue(InputFile(), "postgres.install.password", GenerateRandomStringURLSafe(32))
+		InitViper()
 	}
 
 	if viper.GetBool("prometheus.enableAuth") &&
 		len(viper.GetString("prometheus.authPassword")) == 0 {
-			log.Info("Generating default password for prometheus")
-			SetYamlValue(InputFile(), "prometheus.authPassword", GenerateRandomStringURLSafe(32))
-			InitViper()
+		log.Info("Generating default password for prometheus")
+		SetYamlValue(InputFile(), "prometheus.authPassword", GenerateRandomStringURLSafe(32))
+		InitViper()
 	}
 
 	if viper.GetBool("prometheus.enableHttps") {
@@ -409,7 +412,8 @@ func FixConfigValues() {
 
 }
 
-func generateSelfSignedCerts() (string, string) {
+// GenerateSelfSignedCerts will create self signed certifacts and return their paths.
+func GenerateSelfSignedCerts() (string, string) {
 	certsDir := GetSelfSignedCertsDir()
 	serverCertPath := filepath.Join(certsDir, ServerCertPath)
 	serverKeyPath := filepath.Join(certsDir, ServerKeyPath)
@@ -433,6 +437,33 @@ func generateSelfSignedCerts() (string, string) {
 
 	return serverCertPath, serverKeyPath
 
+}
+
+// RegenerateSelfSignedCerts will recreate the server cert and server key file with existing
+// ca cert/key files.
+// No directories will be created, this should already exist.
+// Returns the path to the server cert and key.
+func RegenerateSelfSignedCerts() (string, string) {
+	certsDir := GetSelfSignedCertsDir()
+	caCertPath := filepath.Join(certsDir, "ca_cert.pem")
+	caKeyPath := filepath.Join(certsDir, "ca_key.pem")
+	if _, err := os.Stat(caCertPath); errors.Is(err, os.ErrNotExist) {
+		log.Info("no ca certs found, regenerating the entire cert chian")
+		return GenerateSelfSignedCerts()
+	}
+	caCert, err := parseCertFromPem(caCertPath)
+	if err != nil {
+		log.Fatal("failed to parse certificate: " + err.Error())
+	}
+	caKey, err := parsePrivateKey(caKeyPath)
+	if err != nil {
+		log.Fatal("failed to parse private key: " + err.Error())
+	}
+	serverCertPath := filepath.Join(certsDir, ServerCertPath)
+	serverKeyPath := filepath.Join(certsDir, ServerKeyPath)
+	generateCert(serverCertPath, serverKeyPath, false /*isCA*/, serverCertTimeout,
+		viper.GetString("host"), caCert, caKey)
+	return serverCertPath, serverKeyPath
 }
 
 // WaitForYBAReady waits for a YBA to be running with specified version

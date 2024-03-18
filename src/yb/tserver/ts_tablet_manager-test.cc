@@ -184,7 +184,8 @@ class TsTabletManagerTest : public YBTest {
     auto table_info = std::make_shared<tablet::TableInfo>(
         "TEST: ", tablet::Primary::kTrue, table_id, tablet_id, tablet_id,
         TableType::DEFAULT_TABLE_TYPE, full_schema, qlexpr::IndexMap(),
-        boost::none /* index_info */, 0 /* schema_version */, partition.first);
+        boost::none /* index_info */, 0 /* schema_version */, partition.first,
+        "" /* pg_table_id */);
     auto tablet_peer = VERIFY_RESULT(tablet_manager_->CreateNewTablet(
         table_info, tablet_id, partition.second, config_));
     if (out_tablet_peer) {
@@ -776,6 +777,46 @@ TEST_F(TsTabletManagerTest, DataAndWalFilesLocations) {
                                                  &wal);
     ASSERT_EQ(data.substr(0, drive_path_len), wal.substr(0, drive_path_len));
   }
+}
+
+TEST_F(TsTabletManagerTest, EvenDriveSelection) {
+  std::string wal;
+  std::string data;
+  auto drive_path_len = GetDrivePath(0).size();
+  constexpr size_t kNumTables = 1000;
+  constexpr size_t kNumTablets = kDrivesNum / 2;
+  std::unordered_map<std::string, size_t> num_tablets_assigned_to_drive;
+  for (size_t i = 0; i < kNumTables; ++i) {
+    std::string prev_data_drive;
+    for (size_t j = 0; j < kNumTablets; ++j) {
+      tablet_manager_->GetAndRegisterDataAndWalDir(fs_manager_,
+                                                  Substitute("table-$0", i+ 1),
+                                                  Substitute("tablet-$0", j + 1),
+                                                  &data,
+                                                  &wal);
+      const auto chosen_data_drive = data.substr(0, drive_path_len);
+      const auto chosen_wal_drive = data.substr(0, drive_path_len);
+      ASSERT_EQ(chosen_data_drive, chosen_wal_drive);
+      ASSERT_NE(chosen_data_drive, prev_data_drive);
+      num_tablets_assigned_to_drive[chosen_wal_drive] += 1;
+      prev_data_drive = chosen_data_drive;
+    }
+  }
+  LOG(INFO) << "Data drive distribution " << yb::ToString(num_tablets_assigned_to_drive);
+  auto comparator = [](std::pair<std::string, size_t> a, std::pair<std::string, size_t> b) -> bool {
+    return a.second > b.second;
+  };
+  size_t max_count =
+      std::max_element(
+          num_tablets_assigned_to_drive.begin(), num_tablets_assigned_to_drive.end(), comparator)
+          ->second;
+  ASSERT_LE(max_count, ceil(1.0 * kNumTables * kNumTablets / kDrivesNum));
+  size_t min_count =
+      std::min_element(
+          num_tablets_assigned_to_drive.begin(), num_tablets_assigned_to_drive.end(), comparator)
+          ->second;
+  ASSERT_GE(min_count, floor(1.0 * kNumTables * kNumTablets / kDrivesNum));
+  ASSERT_LE(max_count - min_count, 1);
 }
 
 namespace {

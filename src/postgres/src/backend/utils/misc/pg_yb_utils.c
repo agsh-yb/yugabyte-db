@@ -43,6 +43,7 @@
 #include "access/xact.h"
 #include "executor/ybcExpr.h"
 #include "catalog/catalog.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
@@ -76,13 +77,19 @@
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/variable.h"
+#include "commands/ybccmds.h"
+#include "common/ip.h"
 #include "common/pg_yb_common.h"
 #include "lib/stringinfo.h"
 #include "libpq/hba.h"
+#include "libpq/libpq.h"
+#include "libpq/libpq-be.h"
 #include "optimizer/cost.h"
+#include "parser/parse_utilcmd.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/rel.h"
@@ -97,8 +104,9 @@
 #include "yb/yql/pggate/ybc_pggate.h"
 #include "pgstat.h"
 #include "nodes/readfuncs.h"
+#include "yb_ash.h"
 
-#ifdef __linux__
+#ifdef HAVE_SYS_PRCTL_H
 #include <sys/prctl.h>
 #endif
 
@@ -320,9 +328,12 @@ static Bitmapset *GetTablePrimaryKeyBms(Relation rel,
 	int            natts         = RelationGetNumberOfAttributes(rel);
 	Bitmapset      *pkey         = NULL;
 	YBCPgTableDesc ybc_tabledesc = NULL;
+	MemoryContext  oldctx;
 
 	/* Get the primary key columns 'pkey' from YugaByte. */
-	HandleYBStatus(YBCPgGetTableDesc(dboid, YbGetStorageRelid(rel), &ybc_tabledesc));
+	HandleYBStatus(YBCPgGetTableDesc(dboid, YbGetRelfileNodeId(rel),
+		&ybc_tabledesc));
+	oldctx = MemoryContextSwitchTo(CacheMemoryContext);
 	for (AttrNumber attnum = minattr; attnum <= natts; attnum++)
 	{
 		if ((!includeYBSystemColumns && !IsRealYBColumn(rel, attnum)) ||
@@ -343,21 +354,30 @@ static Bitmapset *GetTablePrimaryKeyBms(Relation rel,
 		}
 	}
 
+	MemoryContextSwitchTo(oldctx);
 	return pkey;
 }
 
 Bitmapset *YBGetTablePrimaryKeyBms(Relation rel)
 {
-	return GetTablePrimaryKeyBms(rel,
-								 YBGetFirstLowInvalidAttributeNumber(rel) /* minattr */,
-								 false /* includeYBSystemColumns */);
+	if (!rel->primary_key_bms) {
+		rel->primary_key_bms = GetTablePrimaryKeyBms(
+			rel,
+			YBGetFirstLowInvalidAttributeNumber(rel) /* minattr */,
+			false /* includeYBSystemColumns */);
+	}
+	return rel->primary_key_bms;
 }
 
 Bitmapset *YBGetTableFullPrimaryKeyBms(Relation rel)
 {
-	return GetTablePrimaryKeyBms(rel,
-								 YBSystemFirstLowInvalidAttributeNumber + 1 /* minattr */,
-								 true /* includeYBSystemColumns */);
+	if (!rel->full_primary_key_bms) {
+		rel->full_primary_key_bms = GetTablePrimaryKeyBms(
+			rel,
+			YBSystemFirstLowInvalidAttributeNumber + 1 /* minattr */,
+			true /* includeYBSystemColumns */);
+	}
+	return rel->full_primary_key_bms;
 }
 
 extern bool YBRelHasOldRowTriggers(Relation rel, CmdType operation)
@@ -436,29 +456,35 @@ YBTransactionsEnabled()
 }
 
 bool
-IsYBReadCommitted()
+YBIsReadCommittedSupported()
 {
 	static int cached_value = -1;
 	if (cached_value == -1)
 	{
+
+#ifdef NDEBUG
 		cached_value = YBCIsEnvVarTrueWithDefault("FLAGS_yb_enable_read_committed_isolation", false);
+#else
+		cached_value = YBCIsEnvVarTrueWithDefault("FLAGS_yb_enable_read_committed_isolation", true);
+#endif
 	}
-	return IsYugaByteEnabled() && cached_value &&
+	return cached_value;
+}
+
+bool
+IsYBReadCommitted()
+{
+	return IsYugaByteEnabled() && YBIsReadCommittedSupported() &&
 				 (XactIsoLevel == XACT_READ_COMMITTED || XactIsoLevel == XACT_READ_UNCOMMITTED);
 }
 
 bool
 YBIsWaitQueueEnabled()
 {
-#ifdef NDEBUG
-  static bool kEnableWaitQueues = false;
-#else
-	static bool kEnableWaitQueues = true;
-#endif
 	static int cached_value = -1;
 	if (cached_value == -1)
 	{
-		cached_value = YBCIsEnvVarTrueWithDefault("FLAGS_enable_wait_queues", kEnableWaitQueues);
+		cached_value = YBCIsEnvVarTrueWithDefault("FLAGS_enable_wait_queues", true);
 	}
 	return IsYugaByteEnabled() && cached_value;
 }
@@ -492,16 +518,9 @@ bool
 YBIsDBCatalogVersionMode()
 {
 	static bool cached_is_db_catalog_version_mode = false;
-	static int cached_gflag = -1;
 
 	if (cached_is_db_catalog_version_mode)
 		return true;
-
-	if (cached_gflag == -1)
-	{
-		cached_gflag = YBCIsEnvVarTrueWithDefault(
-			"FLAGS_ysql_enable_db_catalog_version_mode", false);
-	}
 
 	/*
 	 * During bootstrap phase in initdb, CATALOG_VERSION_PROTOBUF_ENTRY is used
@@ -509,7 +528,7 @@ YBIsDBCatalogVersionMode()
 	 */
 	if (!IsYugaByteEnabled() ||
 		YbGetCatalogVersionType() != CATALOG_VERSION_CATALOG_TABLE ||
-		!cached_gflag)
+		!*YBCGetGFlags()->ysql_enable_db_catalog_version_mode)
 		return false;
 
 	/*
@@ -559,7 +578,7 @@ YBIsDBCatalogVersionMode()
 			 * then stale read/write RPCs are possible which can lead to wrong
 			 * results;
 			 */
-			elog(INFO, "change to per-db mode");
+			elog(LOG, "change to per-db mode");
 			if (MyDatabaseId != TemplateDbOid)
 			{
 				yb_last_known_catalog_cache_version = 1;
@@ -616,6 +635,9 @@ YBCanEnableDBCatalogVersionMode()
 	if (YBCIsSysTablePrefetchingStarted())
 		return false;
 
+	if (yb_test_stay_in_global_catalog_version_mode)
+		return false;
+
 	/*
 	 * We assume that the table pg_yb_catalog_version has either exactly
 	 * one row in global catalog version mode, or one row per database in
@@ -624,13 +646,13 @@ YBCanEnableDBCatalogVersionMode()
 	 * upgrade, the pg_yb_catalog_version is transactionally updated
 	 * to have one row per database.
 	 */
-	return (YbGetNumberOfDatabases() > 1);
+	return YbCatalogVersionTableInPerdbMode();
 }
 
 /*
  * Used to determine whether we should preload certain catalog tables.
  */
-bool YbNeedAdditionalCatalogTables() 
+bool YbNeedAdditionalCatalogTables()
 {
 	return *YBCGetGFlags()->ysql_catalog_preload_additional_tables ||
 			IS_NON_EMPTY_STR_FLAG(YBCGetGFlags()->ysql_catalog_preload_additional_table_list);
@@ -711,6 +733,16 @@ GetStatusMsgAndArgumentsByCode(const uint32_t pg_err_code,
 				*detail_nargs = status_nargs;
 				*detail_args = status_args;
 			}
+			else if(YBCIsTxnAbortedError(txn_err_code))
+			{
+				*msg_buf = "current transaction is expired or aborted";
+				*msg_nargs = 0;
+				*msg_args = NULL;
+
+				*detail_buf = status_msg;
+				*detail_nargs = status_nargs;
+				*detail_args = status_args;
+			}
 			break;
 		case ERRCODE_UNIQUE_VIOLATION:
 			*msg_buf = "duplicate key value violates unique constraint \"%s\"";
@@ -750,20 +782,18 @@ HandleYBStatusIgnoreNotFound(YBCStatus status, bool *not_found)
 	HandleYBStatus(status);
 }
 
-extern void HandleYBStatusIgnoreAlreadyPresent(YBCStatus status,
-											   bool *already_present)
+void
+HandleYBStatusWithCustomErrorForNotFound(YBCStatus status,
+										 const char *message_for_not_found)
 {
-	if (!status)
-		return;
+	bool		not_found = false;
 
-	if (YBCStatusIsAlreadyPresent(status))
-	{
-		*already_present = true;
-		YBCFreeStatus(status);
-		return;
-	}
-	*already_present = false;
-	HandleYBStatus(status);
+	HandleYBStatusIgnoreNotFound(status, &not_found);
+
+	if (not_found)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("%s", message_for_not_found)));
 }
 
 void
@@ -812,7 +842,8 @@ void
 YBInitPostgresBackend(
 	const char *program_name,
 	const char *db_name,
-	const char *user_name)
+	const char *user_name,
+	uint64_t *session_id)
 {
 	HandleYBStatus(YBCInit(program_name, palloc, cstring_to_text_with_len));
 
@@ -835,8 +866,15 @@ YBInitPostgresBackend(
 		callbacks.UnixEpochToPostgresEpoch = &YbUnixEpochToPostgresEpoch;
 		callbacks.ConstructArrayDatum = &YbConstructArrayDatum;
 		callbacks.CheckUserMap = &check_usermap;
-		YBCInitPgGate(type_table, count, callbacks);
+		callbacks.PgstatReportWaitStart = &yb_pgstat_report_wait_start;
+		YBCPgAshConfig ash_config;
+		ash_config.metadata = &MyProc->yb_ash_metadata;
+		ash_config.is_metadata_set = &MyProc->yb_is_ash_metadata_set;
+		ash_config.yb_enable_ash = &yb_enable_ash;
+		YBCInitPgGate(type_table, count, callbacks, session_id, &ash_config);
 		YBCInstallTxnDdlHook();
+		if (yb_ash_enable_infra)
+			YbAshInstallHooks();
 
 		/*
 		 * For each process, we create one YBC session for PostgreSQL to use
@@ -855,7 +893,15 @@ YBInitPostgresBackend(
 		 * mapped to PG backends.
 		 */
 		yb_pgstat_add_session_info(YBCPgGetSessionID());
+		if (yb_ash_enable_infra)
+			YbAshSetSessionId(YBCPgGetSessionID());
 	}
+}
+
+bool
+YbGetCurrentSessionId(uint64_t *session_id)
+{
+	return YBCGetCurrentPgSessionId(session_id);
 }
 
 void
@@ -1277,6 +1323,8 @@ bool yb_disable_wait_for_backends_catalog_version = false;
 bool yb_enable_base_scans_cost_model = false;
 int yb_wait_for_backends_catalog_version_timeout = 5 * 60 * 1000;	/* 5 min */
 bool yb_prefer_bnl = false;
+bool yb_explain_hide_non_deterministic_fields = false;
+bool yb_enable_saop_pushdown = true;
 
 //------------------------------------------------------------------------------
 // YB Debug utils.
@@ -1291,11 +1339,25 @@ bool yb_test_system_catalogs_creation = false;
 
 bool yb_test_fail_next_ddl = false;
 
+bool yb_test_fail_next_inc_catalog_version = false;
+
+double yb_test_ybgin_disable_cost_factor = 2.0;
+
 char *yb_test_block_index_phase = "";
 
 char *yb_test_fail_index_state_change = "";
 
-bool ddl_rollback_enabled = false;
+bool yb_test_fail_table_rewrite_after_creation = false;
+
+bool yb_test_stay_in_global_catalog_version_mode = false;
+
+bool yb_test_table_rewrite_keep_old_table = false;
+
+bool yb_ddl_rollback_enabled = false;
+
+bool yb_silence_advisory_locks_not_supported_error = false;
+
+bool yb_use_hash_splitting_by_default = true;
 
 const char*
 YBDatumToString(Datum datum, Oid typid)
@@ -1357,16 +1419,31 @@ YBIsInitDbAlreadyDone()
 /*---------------------------------------------------------------------------*/
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
-typedef struct DdlTransactionState {
+typedef struct CatalogModificationAspects
+{
+	uint64_t applied;
+	uint64_t pending;
+
+} CatalogModificationAspects;
+
+typedef struct DdlTransactionState
+{
 	int nesting_level;
 	MemoryContext mem_context;
-	bool is_catalog_version_increment;
-	bool is_breaking_catalog_change;
+	CatalogModificationAspects catalog_modification_aspects;
 	bool is_global_ddl;
 	NodeTag original_node_tag;
 } DdlTransactionState;
 
 static DdlTransactionState ddl_transaction_state = {0};
+
+static void
+MergeCatalogModificationAspects(
+	CatalogModificationAspects *aspects, bool apply) {
+	if (apply)
+		aspects->applied |= aspects->pending;
+	aspects->pending = 0;
+}
 
 static void
 YBResetEnableNonBreakingDDLMode()
@@ -1430,13 +1507,13 @@ YBGetDdlNestingLevel()
 	return ddl_transaction_state.nesting_level;
 }
 
-void YbSetIsGlobalDDL() {
+void YbSetIsGlobalDDL()
+{
 	ddl_transaction_state.is_global_ddl = true;
 }
 
 void
-YBIncrementDdlNestingLevel(bool is_catalog_version_increment,
-						   bool is_breaking_catalog_change)
+YBIncrementDdlNestingLevel(YbDdlMode mode)
 {
 	if (ddl_transaction_state.nesting_level == 0)
 	{
@@ -1448,17 +1525,31 @@ YBIncrementDdlNestingLevel(bool is_catalog_version_increment,
 		HandleYBStatus(YBCPgEnterSeparateDdlTxnMode());
 	}
 	++ddl_transaction_state.nesting_level;
-	/*
-	* The is_catalog_version_increment and is_breaking_catalog_change flags
-	* should only be set if it is not already true.
-	*/
-	ddl_transaction_state.is_catalog_version_increment |= is_catalog_version_increment;
-	ddl_transaction_state.is_breaking_catalog_change |= is_breaking_catalog_change;
+	ddl_transaction_state.catalog_modification_aspects.pending |= mode;
+}
+
+static YbDdlMode
+YbCatalogModificationAspectsToDdlMode(uint64_t catalog_modification_aspects)
+{
+	YbDdlMode mode = catalog_modification_aspects;
+	switch(mode)
+	{
+		case YB_DDL_MODE_NO_ALTERING: switch_fallthrough();
+		case YB_DDL_MODE_SILENT_ALTERING: switch_fallthrough();
+		case YB_DDL_MODE_VERSION_INCREMENT: switch_fallthrough();
+		case YB_DDL_MODE_BREAKING_CHANGE: return mode;
+	}
+	Assert(false);
+	return YB_DDL_MODE_BREAKING_CHANGE;
 }
 
 void
 YBDecrementDdlNestingLevel()
 {
+	const bool has_write = YBCPgHasWriteOperationsInDdlTxnMode();
+	MergeCatalogModificationAspects(
+		&ddl_transaction_state.catalog_modification_aspects, has_write);
+
 	--ddl_transaction_state.nesting_level;
 	if (yb_test_fail_next_ddl)
 	{
@@ -1467,36 +1558,37 @@ YBDecrementDdlNestingLevel()
 	}
 	if (ddl_transaction_state.nesting_level == 0)
 	{
-		if (GetCurrentMemoryContext() == ddl_transaction_state.mem_context)
-			MemoryContextSwitchTo(ddl_transaction_state.mem_context->parent);
 		/*
 		 * We cannot reset the ddl memory context as we do in the abort case
 		 * (see YBResetDdlState) because there are cases where objects
 		 * allocated during the ddl transaction are still needed after this
 		 * ddl transaction commits successfully.
 		 */
-		ddl_transaction_state.mem_context = NULL;
+
+		if (GetCurrentMemoryContext() == ddl_transaction_state.mem_context)
+			MemoryContextSwitchTo(ddl_transaction_state.mem_context->parent);
 
 		YBResetEnableNonBreakingDDLMode();
-		bool is_catalog_version_increment = ddl_transaction_state.is_catalog_version_increment;
-		bool is_breaking_catalog_change = ddl_transaction_state.is_breaking_catalog_change;
-		bool is_global_ddl = ddl_transaction_state.is_global_ddl;
-		/*
-		 * Reset these flags to false prior to executing
-		 * YbIncrementMasterCatalogVersionTableEntry() such that
-		 * even when it throws an exception we still reset the flags.
-		 */
-		ddl_transaction_state.is_catalog_version_increment = false;
-		ddl_transaction_state.is_breaking_catalog_change = false;
-		ddl_transaction_state.is_global_ddl = false;
+		bool increment_done = false;
+		bool is_silent_altering = false;
+		if (has_write)
+		{
+			const YbDdlMode mode = YbCatalogModificationAspectsToDdlMode(
+				ddl_transaction_state.catalog_modification_aspects.applied);
 
-		const bool increment_done =
-			is_catalog_version_increment &&
-			YBCPgHasWriteOperationsInDdlTxnMode() &&
-			YbIncrementMasterCatalogVersionTableEntry(
-					is_breaking_catalog_change, is_global_ddl);
+			increment_done =
+				(mode & YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT) &&
+				YbIncrementMasterCatalogVersionTableEntry(
+					mode & YB_SYS_CAT_MOD_ASPECT_BREAKING_CHANGE,
+					ddl_transaction_state.is_global_ddl);
 
-		HandleYBStatus(YBCPgExitSeparateDdlTxnMode());
+			is_silent_altering = (mode == YB_DDL_MODE_SILENT_ALTERING);
+		}
+
+		ddl_transaction_state = (DdlTransactionState) {};
+
+		HandleYBStatus(YBCPgExitSeparateDdlTxnMode(
+			MyDatabaseId, is_silent_altering));
 
 		/*
 		 * Optimization to avoid redundant cache refresh on the current session
@@ -1558,21 +1650,27 @@ GetActualStmtNode(PlannedStmt *pstmt)
 	return pstmt->utilityStmt;
 }
 
-bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
-								 bool *is_catalog_version_increment,
-								 bool *is_breaking_catalog_change,
-								 ProcessUtilityContext context)
+YbDdlModeOptional YbGetDdlMode(
+	PlannedStmt *pstmt, ProcessUtilityContext context)
 {
+	bool is_ddl = true;
+	bool is_version_increment = true;
+	bool is_breaking_change = true;
+	bool is_altering_existing_data = false;
+
 	Node *parsetree = GetActualStmtNode(pstmt);
 	NodeTag node_tag = nodeTag(parsetree);
 
+	/*
+	 * Note: REFRESH MATVIEW (CONCURRENTLY) executes subcommands using SPI.
+	 * So, if the context is PROCESS_UTILITY_QUERY (command triggered using
+	 * SPI), and the current original node tag is T_RefreshMatViewStmt, do
+	 * not update the original node tag.
+	 */
 	if (context == PROCESS_UTILITY_TOPLEVEL ||
-		context == PROCESS_UTILITY_QUERY)
+		(context == PROCESS_UTILITY_QUERY &&
+		 ddl_transaction_state.original_node_tag != T_RefreshMatViewStmt))
 	{
-		/* Assume the worst. */
-		*is_catalog_version_increment = true;
-		*is_breaking_catalog_change = true;
-
 		/*
 		 * The node tag from the top-level or atomic process utility must
 		 * be persisted so that DDL commands with multiple nested
@@ -1584,13 +1682,14 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 	else
 	{
 		Assert(context == PROCESS_UTILITY_SUBCOMMAND ||
-			   context == PROCESS_UTILITY_QUERY_NONATOMIC);
+			   context == PROCESS_UTILITY_QUERY_NONATOMIC ||
+			   (context == PROCESS_UTILITY_QUERY &&
+				ddl_transaction_state.original_node_tag ==
+				T_RefreshMatViewStmt));
 
-		*is_catalog_version_increment = false;
-		*is_breaking_catalog_change = false;
+		is_version_increment = false;
+		is_breaking_change = false;
 	}
-
-	bool is_ddl = true;
 
 	switch (node_tag) {
 		// The lists of tags here have been generated using e.g.:
@@ -1603,21 +1702,20 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 		case T_CreatedbStmt:
 		case T_DefineStmt: // CREATE OPERATOR/AGGREGATE/COLLATION/etc
 		case T_CommentStmt: // COMMENT (create new comment)
-		case T_DiscardStmt: // DISCARD ALL/SEQUENCES/TEMP affects only objects of current connection
 		case T_RuleStmt: // CREATE RULE
 		case T_TruncateStmt: // TRUNCATE changes system catalog in case of non-YB (i.e. TEMP) tables
 		case T_YbCreateProfileStmt:
-		{
 			/*
 			 * Simple add objects are not breaking changes, and they do not even require
 			 * a version increment because we do not do any negative caching for them.
 			 */
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
+			is_breaking_change = false;
 			break;
-		}
+
 		case T_ViewStmt: // CREATE VIEW
-		{
+			is_breaking_change = false;
+
 			/*
 			 * For system catalog additions we need to force cache refresh
 			 * because of negative caching of pg_class and pg_type
@@ -1626,15 +1724,11 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 */
 			if (IsYsqlUpgrade &&
 				YbIsSystemNamespaceByName(castNode(ViewStmt, parsetree)->view->schemaname))
-			{
-				*is_breaking_catalog_change = false;
 				break;
-			}
 
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
 			break;
-		}
+
 		case T_CompositeTypeStmt: // Create (composite) type
 		case T_CreateAmStmt:
 		case T_CreateCastStmt:
@@ -1654,14 +1748,12 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 		case T_CreatePublicationStmt:
 		case T_CreateRangeStmt: // Create (range) type
 		case T_CreateReplicationSlotCmd:
-		case T_CreateRoleStmt:
 		case T_CreateSchemaStmt:
 		case T_CreateStatsStmt:
 		case T_CreateSubscriptionStmt:
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
 		case T_CreateUserMappingStmt:
-		{
 			/*
 			 * Add objects that may reference/alter other objects so we need to increment the
 			 * catalog version to ensure the other objects' metadata is refreshed.
@@ -1672,40 +1764,45 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 *		- objects where we have negative caching enabled in
 			 *		  order to correctly invalidate negative cache entries
 			 */
-			*is_breaking_catalog_change = false;
-			if (node_tag == T_CreateRoleStmt) {
-				/*
-				 * If a create role statement does not reference another existing
-				 * role there is no need to increment catalog version.
-				 */
-				CreateRoleStmt *stmt = castNode(CreateRoleStmt, parsetree);
-				int nopts = list_length(stmt->options);
-				if (nopts == 0)
-					*is_catalog_version_increment = false;
-				else
+			is_breaking_change = false;
+			break;
+
+		case T_CreateRoleStmt:
+		{
+			is_breaking_change = false;
+			/*
+			 * If a create role statement does not reference another existing
+			 * role there is no need to increment catalog version.
+			 */
+			CreateRoleStmt *stmt = castNode(CreateRoleStmt, parsetree);
+			int nopts = list_length(stmt->options);
+			if (nopts == 0)
+				is_version_increment = false;
+			else
+			{
+				bool reference_other_role = false;
+				ListCell   *lc;
+				foreach(lc, stmt->options)
 				{
-					bool reference_other_role = false;
-					ListCell   *lc;
-					foreach(lc, stmt->options)
+					DefElem *def = (DefElem *) lfirst(lc);
+					if (strcmp(def->defname, "rolemembers") == 0 ||
+						strcmp(def->defname, "adminmembers") == 0 ||
+						strcmp(def->defname, "addroleto") == 0)
 					{
-						DefElem *def = (DefElem *) lfirst(lc);
-						if (strcmp(def->defname, "rolemembers") == 0 ||
-							strcmp(def->defname, "adminmembers") == 0 ||
-							strcmp(def->defname, "addroleto") == 0)
-						{
-							reference_other_role = true;
-							break;
-						}
+						reference_other_role = true;
+						break;
 					}
-					if (!reference_other_role)
-						*is_catalog_version_increment = false;
 				}
+				if (!reference_other_role)
+					is_version_increment = false;
 			}
 			break;
 		}
+
 		case T_CreateStmt:
 		{
 			CreateStmt *stmt = castNode(CreateStmt, parsetree);
+			is_breaking_change = false;
 			/*
 			 * If a partition table is being created, this means pg_inherits
 			 * table that is being cached should be invalidated. If the cache
@@ -1715,10 +1812,8 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 * snapshot isolation guarantees, transactions that are already
 			 * underway need not abort.
 			 */
-			if (stmt->partbound != NULL) {
-				*is_breaking_catalog_change = false;
+			if (stmt->partbound)
 				break;
-			}
 
 			/*
 			 * For system catalog additions we need to force cache refresh
@@ -1728,50 +1823,47 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 */
 			if (IsYsqlUpgrade &&
 				YbIsSystemNamespaceByName(stmt->relation->schemaname))
-			{
-				*is_breaking_catalog_change = false;
 				break;
-			}
 
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
 			break;
 		}
+
 		/*
 		 * Create Table As Select need not include the same checks as Create Table as complex tables
 		 * (eg: partitions) cannot be created using this statement.
 		*/
 		case T_CreateTableAsStmt:
-		{
 			/*
 			 * Simple add objects are not breaking changes, and they do not even require
 			 * a version increment because we do not do any negative caching for them.
 			 */
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
+			is_breaking_change = false;
 			break;
-		}
+
 		case T_CreateSeqStmt:
-		{
-			CreateSeqStmt *stmt = castNode(CreateSeqStmt, parsetree);
+			is_breaking_change = false;
 			/* Need to increment if owner is set to ensure its dependency cache is updated. */
-			*is_breaking_catalog_change = false;
-			if (stmt->ownerId == InvalidOid)
-			{
-				*is_catalog_version_increment = false;
-			}
+			if (!OidIsValid(castNode(CreateSeqStmt, parsetree)->ownerId))
+				is_version_increment = false;
 			break;
-		}
+
 		case T_CreateFunctionStmt:
-		{
-			CreateFunctionStmt *stmt = castNode(CreateFunctionStmt, parsetree);
-			*is_breaking_catalog_change = false;
-			if (!stmt->replace)
-			{
-				*is_catalog_version_increment = false;
-			}
+			is_breaking_change = false;
+			if (!castNode(CreateFunctionStmt, parsetree)->replace)
+				is_version_increment = false;
 			break;
-		}
+
+		case T_DiscardStmt: // DISCARD ALL/SEQUENCES/TEMP
+			/*
+			 * This command alters existing data. But this update affects only
+			 * objects of current connection. No version increment is required.
+			 */
+			is_breaking_change = false;
+			is_version_increment = false;
+			is_altering_existing_data = true;
+			break;
 
 		// All T_Drop... tags from nodes.h:
 		case T_DropOwnedStmt:
@@ -1783,8 +1875,20 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			break;
 
 		case T_DropStmt:
+		{
+			/*
+			 * If this is a DROP statement that is being executed as part of
+			 * REFRESH MATVIEW (CONCURRENTLY), we are only dropping temporary
+			 * tables, and do not need to increment catalog version.
+			 */
+			if (ddl_transaction_state.original_node_tag ==
+				T_RefreshMatViewStmt)
+				is_version_increment = false;
+			is_breaking_change = false;
+			break;
+		}
 		case T_YbDropProfileStmt:
-			*is_breaking_catalog_change = false;
+			is_breaking_change = false;
 			break;
 
 		case T_DropdbStmt:
@@ -1792,7 +1896,7 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 * We already invalidate all connections to that DB by dropping it
 			 * so nothing to do on the cache side.
 			 */
-			*is_breaking_catalog_change = false;
+			is_breaking_change = false;
 			/*
 			 * In per-database catalog version mode, we do not need to rely on
 			 * catalog cache refresh to check that the database exists. We
@@ -1803,7 +1907,7 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 * catalog version mode.
 			 */
 			if (YBIsDBCatalogVersionMode())
-				*is_catalog_version_increment = false;
+				is_version_increment = false;
 			break;
 
 		// All T_Alter... tags from nodes.h:
@@ -1858,16 +1962,15 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 				DefElem *def = (DefElem *) linitial(stmt->options);
 				if (strcmp(def->defname, "password") == 0)
 				{
-					*is_breaking_catalog_change = false;
-					*is_catalog_version_increment = false;
+					is_breaking_change = false;
+					is_version_increment = false;
 				}
 			}
 			break;
 		}
 
 		case T_AlterTableStmt:
-		{
-			*is_breaking_catalog_change = false;
+			is_breaking_change = false;
 			/*
 			 * Must increment catalog version when creating table with foreign
 			 * key reference and refresh PG cache on ongoing transactions.
@@ -1885,29 +1988,23 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 					if (IsA(cmd->def, Constraint) &&
 						((Constraint *) cmd->def)->contype == CONSTR_FOREIGN)
 					{
-						*is_catalog_version_increment = true;
+						is_version_increment = true;
 						break;
 					}
 				}
 			}
 			break;
-		}
 
 		// T_Grant...
 		case T_GrantStmt:
-		{
 			/* Grant (add permission) is not a breaking change, but revoke is. */
-			GrantStmt *stmt = castNode(GrantStmt, parsetree);
-			*is_breaking_catalog_change = !stmt->is_grant;
+			is_breaking_change = !castNode(GrantStmt, parsetree)->is_grant;
 			break;
-		}
+
 		case T_GrantRoleStmt:
-		{
 			/* Grant (add permission) is not a breaking change, but revoke is. */
-			GrantRoleStmt *stmt = castNode(GrantRoleStmt, parsetree);
-			*is_breaking_catalog_change = !stmt->is_grant;
+			is_breaking_change = !castNode(GrantRoleStmt, parsetree)->is_grant;
 			break;
-		}
 
 		// T_Index...
 		case T_IndexStmt:
@@ -1916,19 +2013,40 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 * For (new) concurrent backfill the backfill process should wait for ongoing
 			 * transactions so we don't have to force a transaction abort on PG side.
 			 */
-			*is_breaking_catalog_change = false;
+			is_breaking_change = false;
 			break;
 
 		case T_VacuumStmt:
 			/* Vacuum with analyze updates relation and attribute statistics */
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
+			is_breaking_change = false;
 			is_ddl = castNode(VacuumStmt, parsetree)->options & VACOPT_ANALYZE;
 			break;
 
 		case T_RefreshMatViewStmt:
+		{
+			RefreshMatViewStmt *stmt = castNode(RefreshMatViewStmt, parsetree);
+			is_breaking_change = false;
+			if (stmt->concurrent)
+				/*
+				 * REFRESH MATERIALIZED VIEW CONCURRENTLY does not need
+				 * a catalog version increment as it does not alter any
+				 * metadata. The command only performs data changes.
+				 */
+				is_version_increment = false;
+			else
+				/*
+				 * REFRESH MATERIALIZED VIEW NONCONCURRENTLY needs a catalog
+				 * version increment as it alters the metadata of the
+				 * materialized view (pg_class.relfilenode). It does not need
+				 * to be a breaking change as materialized views are read-only,
+				 * so there is no risk of lost writes. Concurrent SELECTs may
+				 * read stale data from the old matview, or fail if the old
+				 * matview is dropped.
+				 */
+				is_version_increment = true;
 			break;
-
+		}
 		case T_ReindexStmt:
 			/*
 			 * Does not need catalog version increment since only data changes,
@@ -1939,59 +2057,85 @@ bool IsTransactionalDdlStatement(PlannedStmt *pstmt,
 			 * corruption, manual intervention is already needed, so might as
 			 * well let the user deal with refreshing clients.
 			 */
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
+			is_version_increment = false;
+			is_breaking_change = false;
 			break;
 
 		default:
 			/* Not a DDL operation. */
-			*is_catalog_version_increment = false;
-			*is_breaking_catalog_change = false;
 			is_ddl = false;
 			break;
 	}
+
+	if (!is_ddl)
+		return (YbDdlModeOptional){};
 
 	/*
 	 * If yb_make_next_ddl_statement_nonbreaking is true, then no DDL statement
 	 * will cause a breaking catalog change.
 	 */
 	if (yb_make_next_ddl_statement_nonbreaking)
-		*is_breaking_catalog_change = false;
+		is_breaking_change = false;
 
-	/*
-	 * For DDL, it does not make sense to get breaking catalog change without
-	 * catalog version increment.
-	 */
-	Assert(!(is_ddl &&
-			 *is_breaking_catalog_change &&
-			 !*is_catalog_version_increment));
+	is_altering_existing_data |= is_version_increment;
 
-	return is_ddl;
+	uint64_t aspects = 0;
+	if (is_altering_existing_data)
+		aspects |= YB_SYS_CAT_MOD_ASPECT_ALTERING_EXISTING_DATA;
+
+	if (is_version_increment)
+		aspects |= YB_SYS_CAT_MOD_ASPECT_VERSION_INCREMENT;
+
+	if (is_breaking_change)
+		aspects |= YB_SYS_CAT_MOD_ASPECT_BREAKING_CHANGE;
+
+	return (YbDdlModeOptional){
+		.has_value = true,
+		.value = YbCatalogModificationAspectsToDdlMode(aspects)
+	};
 }
 
-static void YBTxnDdlProcessUtility(
-		PlannedStmt *pstmt,
-		const char *queryString,
-		ProcessUtilityContext context,
-		ParamListInfo params,
-		QueryEnvironment *queryEnv,
-		DestReceiver *dest,
-		char *completionTag) {
+static void
+YBTxnDdlProcessUtility(
+	PlannedStmt *pstmt,
+	const char *queryString,
+	ProcessUtilityContext context,
+	ParamListInfo params,
+	QueryEnvironment *queryEnv,
+	DestReceiver *dest,
+	char *completionTag)
+{
 
-	/* Assuming this is a breaking change by default. */
-	bool is_catalog_version_increment = true;
-	bool is_breaking_catalog_change = true;
-	bool is_txn_ddl = IsTransactionalDdlStatement(pstmt,
-												  &is_catalog_version_increment,
-												  &is_breaking_catalog_change,
-												  context);
+	const YbDdlModeOptional ddl_mode = YbGetDdlMode(pstmt, context);
 
-	if (is_txn_ddl) {
-		YBIncrementDdlNestingLevel(is_catalog_version_increment,
-								   is_breaking_catalog_change);
-	}
+	const bool is_ddl = ddl_mode.has_value;
+
 	PG_TRY();
 	{
+		if (is_ddl)
+		{
+			if (YBIsDBCatalogVersionMode())
+				/*
+				 * In order to support concurrent non-global-impact DDLs
+				 * across different databases, call YbInitPinnedCacheIfNeeded
+				 * now which triggers a scan of pg_shdepend and pg_depend.
+				 * This ensure that the scan is done without using a read time
+				 * of the DDL transaction so that yb-master can retry read
+				 * restarts automatically. Otherwise, a read restart error is
+				 * returned to the PG backend the DDL statement will fail
+				 * because DDLs cannot be restarted.
+				 *
+				 * YB NOTE: this implies a performance hit for DDL statements
+				 * that do not need to call YbInitPinnedCacheIfNeeded.
+				 *
+				 * TODO(myang): we can optimize to only read pg_shdepend here
+				 * to reduce its performance penalty.
+				 */
+				YbInitPinnedCacheIfNeeded();
+
+			YBIncrementDdlNestingLevel(ddl_mode.value);
+		}
+
 		if (prev_ProcessUtility)
 			prev_ProcessUtility(pstmt, queryString,
 								context, params, queryEnv,
@@ -2000,10 +2144,14 @@ static void YBTxnDdlProcessUtility(
 			standard_ProcessUtility(pstmt, queryString,
 									context, params, queryEnv,
 									dest, completionTag);
+
+		if (is_ddl)
+			YBDecrementDdlNestingLevel();
 	}
 	PG_CATCH();
 	{
-		if (is_txn_ddl) {
+		if (is_ddl)
+		{
 			/*
 			 * It is possible that nesting_level has wrong value due to error.
 			 * Ddl transaction state should be reset.
@@ -2013,9 +2161,6 @@ static void YBTxnDdlProcessUtility(
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (is_txn_ddl) {
-		YBDecrementDdlNestingLevel();
-	}
 }
 
 static void YBCInstallTxnDdlHook() {
@@ -2063,13 +2208,14 @@ int32_t YBFollowerReadStalenessMs() {
 	return yb_follower_read_staleness_ms;
 }
 
-YBCPgYBTupleIdDescriptor* YBCCreateYBTupleIdDescriptor(Oid db_oid, Oid table_oid, int nattrs) {
+YBCPgYBTupleIdDescriptor* YBCCreateYBTupleIdDescriptor(Oid db_oid, Oid table_relfilenode_oid,
+	int nattrs) {
 	void* mem = palloc(sizeof(YBCPgYBTupleIdDescriptor) + nattrs * sizeof(YBCPgAttrValueDescriptor));
 	YBCPgYBTupleIdDescriptor* result = mem;
 	result->nattrs = nattrs;
 	result->attrs = mem + sizeof(YBCPgYBTupleIdDescriptor);
 	result->database_oid = db_oid;
-	result->table_oid = table_oid;
+	result->table_relfilenode_oid = table_relfilenode_oid;
 	return result;
 }
 
@@ -2250,10 +2396,10 @@ YbGetTablePropertiesCommon(Relation rel)
 	}
 
 	Oid dbid          = YBCGetDatabaseOid(rel);
-	Oid storage_relid = YbGetStorageRelid(rel);
+	Oid relfileNodeId = YbGetRelfileNodeId(rel);
 
 	YBCPgTableDesc desc = NULL;
-	YBCStatus status = YBCPgGetTableDesc(dbid, storage_relid, &desc);
+	YBCStatus status = YBCPgGetTableDesc(dbid, relfileNodeId, &desc);
 	if (status)
 		return status;
 
@@ -2286,6 +2432,27 @@ YbTryGetTableProperties(Relation rel)
 	bool not_found = false;
 	HandleYBStatusIgnoreNotFound(YbGetTablePropertiesCommon(rel), &not_found);
 	return not_found ? NULL : rel->yb_table_properties;
+}
+
+YbTableDistribution
+YbGetTableDistribution(Oid relid)
+{
+	YbTableDistribution result;
+	Relation relation = RelationIdGetRelation(relid);
+	if (IsSystemRelation(relation))
+		result = YB_SYSTEM;
+	else
+	{
+		HandleYBStatus(YbGetTablePropertiesCommon(relation));
+		if (relation->yb_table_properties->is_colocated)
+			result = YB_COLOCATED;
+		else if (relation->yb_table_properties->num_hash_key_columns > 0)
+			result = YB_HASH_SHARDED;
+		else
+			result = YB_RANGE_SHARDED;
+	}
+	RelationClose(relation);
+	return result;
 }
 
 Datum
@@ -2383,13 +2550,13 @@ yb_table_properties(PG_FUNCTION_ARGS)
 
 	Relation	rel = relation_open(relid, AccessShareLock);
 	Oid dbid		= YBCGetDatabaseOid(rel);
-	Oid storage_relid = YbGetStorageRelid(rel);
+	Oid relfileNodeId = YbGetRelfileNodeId(rel);
 
 	YBCPgTableDesc yb_tabledesc = NULL;
 	YbTablePropertiesData yb_table_properties;
 	bool not_found = false;
 	HandleYBStatusIgnoreNotFound(
-		YBCPgGetTableDesc(dbid, storage_relid, &yb_tabledesc), &not_found);
+		YBCPgGetTableDesc(dbid, relfileNodeId, &yb_tabledesc), &not_found);
 	if (!not_found)
 		HandleYBStatusIgnoreNotFound(
 			YBCPgGetTableProperties(yb_tabledesc, &yb_table_properties),
@@ -2833,15 +3000,25 @@ yb_get_range_split_clause(PG_FUNCTION_ARGS)
 	YbTablePropertiesData yb_table_properties;
 	StringInfoData str;
 	char	   *range_split_clause = NULL;
+	Relation	relation = RelationIdGetRelation(relid);
+	Oid			relfileNodeId;
 
-	HandleYBStatus(YBCPgTableExists(MyDatabaseId, relid, &exists_in_yb));
+	if (relation)
+	{
+		relfileNodeId = YbGetRelfileNodeId(relation);
+		RelationClose(relation);
+		HandleYBStatus(YBCPgTableExists(MyDatabaseId, relfileNodeId,
+			&exists_in_yb));
+	}
+
 	if (!exists_in_yb)
 	{
 		elog(NOTICE, "relation with oid %u is not backed by YB", relid);
 		PG_RETURN_NULL();
 	}
 
-	HandleYBStatus(YBCPgGetTableDesc(MyDatabaseId, relid, &yb_tabledesc));
+	HandleYBStatus(YBCPgGetTableDesc(MyDatabaseId, relfileNodeId,
+		&yb_tabledesc));
 	HandleYBStatus(YBCPgGetTableProperties(yb_tabledesc, &yb_table_properties));
 
 	if (yb_table_properties.num_hash_key_columns > 0)
@@ -3353,7 +3530,7 @@ bool IsYbFdwUser(Oid member) {
 
 void YBSetParentDeathSignal()
 {
-#ifdef __linux__
+#ifdef HAVE_SYS_PRCTL_H
 	char* pdeathsig_str = getenv("YB_PG_PDEATHSIG");
 	if (pdeathsig_str)
 	{
@@ -3385,12 +3562,18 @@ void YBSetParentDeathSignal()
 #endif
 }
 
-Oid YbGetStorageRelid(Relation relation) {
-	if (relation->rd_rel->relkind == RELKIND_MATVIEW &&
-		relation->rd_rel->relfilenode != InvalidOid) {
+Oid YbGetRelfileNodeId(Relation relation) {
+	if (relation->rd_rel->relfilenode != InvalidOid) {
 		return relation->rd_rel->relfilenode;
 	}
 	return RelationGetRelid(relation);
+}
+
+Oid YbGetRelfileNodeIdFromRelId(Oid relationId) {
+	Relation rel = RelationIdGetRelation(relationId);
+	Oid relfileNodeId = YbGetRelfileNodeId(rel);
+	RelationClose(rel);
+	return relfileNodeId;
 }
 
 bool IsYbDbAdminUser(Oid member) {
@@ -3577,18 +3760,92 @@ void assign_yb_xcluster_consistency_level(const char* newval, void* extra) {
 }
 
 bool
+parse_yb_read_time(const char *value, unsigned long long *result, bool* is_ht_unit)
+{
+	unsigned long long	val;
+	char	           *endptr;
+
+	if (is_ht_unit)
+	{
+		*is_ht_unit = false;
+	}
+
+	/* To suppress compiler warnings, always set output params */
+	if (result)
+		*result = 0;
+
+	errno = 0;
+	val = strtoull(value, &endptr, 0);
+
+	if (endptr == value || errno == ERANGE)
+		return false;
+
+	/* allow whitespace between integer and unit */
+	while (isspace((unsigned char) *endptr))
+		endptr++;
+
+	/* Handle possible unit */
+	if (*endptr != '\0')
+	{
+		char		unit[2 + 1];
+		int			unitlen;
+		bool		converted = false;
+
+		unitlen = 0;
+		while (*endptr != '\0' && !isspace((unsigned char) *endptr) &&
+			   unitlen < 2)
+			unit[unitlen++] = *(endptr++);
+		unit[unitlen] = '\0';
+		/* allow whitespace after unit */
+		while (isspace((unsigned char) *endptr))
+			endptr++;
+
+		if (*endptr == '\0')
+			converted = (strcmp(unit, "ht") == 0);
+		if (!converted)
+			return false;
+		else if (is_ht_unit)
+			*is_ht_unit = true;
+	}
+
+	if (result)
+		*result = val;
+	return true;
+}
+
+bool
 check_yb_read_time(char **newval, void **extra, GucSource source)
 {
 	/* Read time should be convertable to unsigned long long */
-	unsigned long long read_time_ull = strtoull(*newval, NULL, 0);
-	char read_time_string[23];
-	sprintf(read_time_string, "%llu", read_time_ull);
-	if (strcmp(*newval, read_time_string))
+	unsigned long long read_time_ull;
+	unsigned long long value_ull;
+	bool is_ht_unit;
+	if(!parse_yb_read_time(*newval, &value_ull, &is_ht_unit))
 	{
-		GUC_check_errdetail("Accepted value is Unix timestamp in microseconds."
-							" i.e. 1694673026673528");
 		return false;
 	}
+
+	if (is_ht_unit)
+	{
+		/*
+		 * Right shift by 12 bits to get physical time in micros from HybridTime
+		 * See src/yb/common/hybrid_time.h (GetPhysicalValueMicros)
+		 */
+		read_time_ull = value_ull >> 12;
+	}
+	else
+	{
+		read_time_ull = value_ull;
+		char read_time_string[23];
+		sprintf(read_time_string, "%llu", read_time_ull);
+		if (strcmp(*newval, read_time_string))
+		{
+			GUC_check_errdetail("Accepted value is Unix timestamp in microseconds."
+								" i.e. 1694673026673528");
+			return false;
+		}
+	}
+
 	/* Read time should not be set to a timestamp in the future */
 	struct timeval now_tv;
 	gettimeofday(&now_tv, NULL);
@@ -3602,15 +3859,31 @@ check_yb_read_time(char **newval, void **extra, GucSource source)
 }
 
 void
-assign_yb_read_time(const char* newval, void *extra) 
+assign_yb_read_time(const char* newval, void *extra)
 {
-	yb_read_time = strtoull(newval, NULL, 0);
+	unsigned long long value_ull;
+	bool is_ht_unit;
+	parse_yb_read_time(newval, &value_ull, &is_ht_unit);
+	yb_read_time = value_ull;
+	yb_is_read_time_ht = is_ht_unit;
 	ereport(NOTICE,
 			(errmsg("yb_read_time should be set with caution."),
 			 errdetail("No DDL operations should be performed while it is set and "
 			 		   "it should not be set to a timestamp before a DDL "
 					   "operation has been performed. It doesn't have well defined semantics"
 					   " for normal transactions and is only to be used after consultation")));
+}
+
+void
+yb_assign_max_replication_slots(int newval, void *extra)
+{
+	ereport(NOTICE,
+		(errmsg("max_replication_slots should be controlled using the Gflag"
+				" \"max_replication_slots\" on the YB-Master process"),
+		 errdetail("In Yugabyte clusters, the replication slots are managed by"
+		 		   " the YB-Master globally. Hence limits on the number of"
+				   " replication slots should be controlled using Gflags and"
+				   " not session-level GUC variables.")));
 }
 
 void YBCheckServerAccessIsAllowed() {
@@ -3629,32 +3902,38 @@ aggregateStats(YbInstrumentation *instr, const YBCPgExecStats *exec_stats)
 	instr->tbl_reads.count += exec_stats->tables.reads;
 	instr->tbl_reads.wait_time += exec_stats->tables.read_wait;
 	instr->tbl_writes += exec_stats->tables.writes;
+	instr->tbl_reads.rows_scanned += exec_stats->tables.rows_scanned;
 
 	/* Secondary Index stats */
 	instr->index_reads.count += exec_stats->indices.reads;
 	instr->index_reads.wait_time += exec_stats->indices.read_wait;
 	instr->index_writes += exec_stats->indices.writes;
+	instr->index_reads.rows_scanned += exec_stats->indices.rows_scanned;
 
 	/* System Catalog stats */
 	instr->catalog_reads.count += exec_stats->catalog.reads;
 	instr->catalog_reads.wait_time += exec_stats->catalog.read_wait;
 	instr->catalog_writes += exec_stats->catalog.writes;
+	instr->catalog_reads.rows_scanned += exec_stats->catalog.rows_scanned;
 
 	/* Flush stats */
 	instr->write_flushes.count += exec_stats->num_flushes;
 	instr->write_flushes.wait_time += exec_stats->flush_wait;
 
-	for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i) {
-		instr->storage_gauge_metrics[i] += exec_stats->storage_gauge_metrics[i];
-	}
-	for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i) {
-		instr->storage_counter_metrics[i] += exec_stats->storage_counter_metrics[i];
-	}
-	for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i) {
-		YbPgEventMetric* agg = &instr->storage_event_metrics[i];
-		const YBCPgExecEventMetric* val = &exec_stats->storage_event_metrics[i];
-		agg->sum += val->sum;
-		agg->count += val->count;
+	if (exec_stats->storage_metrics_version != instr->storage_metrics_version) {
+		instr->storage_metrics_version = exec_stats->storage_metrics_version;
+		for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i) {
+			instr->storage_gauge_metrics[i] += exec_stats->storage_gauge_metrics[i];
+		}
+		for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i) {
+			instr->storage_counter_metrics[i] += exec_stats->storage_counter_metrics[i];
+		}
+		for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i) {
+			YbPgEventMetric* agg = &instr->storage_event_metrics[i];
+			const YBCPgExecEventMetric* val = &exec_stats->storage_event_metrics[i];
+			agg->sum += val->sum;
+			agg->count += val->count;
+		}
 	}
 }
 
@@ -3662,9 +3941,13 @@ static YBCPgExecReadWriteStats
 getDiffReadWriteStats(const YBCPgExecReadWriteStats *current,
 					  const YBCPgExecReadWriteStats *old)
 {
-	return (YBCPgExecReadWriteStats){current->reads - old->reads,
-									 current->writes - old->writes,
-									 current->read_wait - old->read_wait};
+	return (YBCPgExecReadWriteStats)
+	{
+		current->reads - old->reads,
+		current->writes - old->writes,
+		current->read_wait - old->read_wait,
+		current->rows_scanned - old->rows_scanned
+	};
 }
 
 static void
@@ -3680,20 +3963,23 @@ calculateExecStatsDiff(const YbSessionStats *stats, YBCPgExecStats *result)
 	result->num_flushes = current->num_flushes - old->num_flushes;
 	result->flush_wait = current->flush_wait - old->flush_wait;
 
-	for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i) {
-		result->storage_gauge_metrics[i] =
-				current->storage_gauge_metrics[i] - old->storage_gauge_metrics[i];
-	}
-	for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i) {
-		result->storage_counter_metrics[i] =
-				current->storage_counter_metrics[i] - old->storage_counter_metrics[i];
-	}
-	for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i) {
-		YBCPgExecEventMetric* result_metric = &result->storage_event_metrics[i];
-		const YBCPgExecEventMetric* current_metric = &current->storage_event_metrics[i];
-		const YBCPgExecEventMetric* old_metric = &old->storage_event_metrics[i];
-		result_metric->sum = current_metric->sum - old_metric->sum;
-		result_metric->count = current_metric->count - old_metric->count;
+	result->storage_metrics_version = current->storage_metrics_version;
+	if (old->storage_metrics_version != current->storage_metrics_version) {
+		for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i) {
+			result->storage_gauge_metrics[i] =
+					current->storage_gauge_metrics[i] - old->storage_gauge_metrics[i];
+		}
+		for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i) {
+			result->storage_counter_metrics[i] =
+					current->storage_counter_metrics[i] - old->storage_counter_metrics[i];
+		}
+		for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i) {
+			YBCPgExecEventMetric* result_metric = &result->storage_event_metrics[i];
+			const YBCPgExecEventMetric* current_metric = &current->storage_event_metrics[i];
+			const YBCPgExecEventMetric* old_metric = &old->storage_event_metrics[i];
+			result_metric->sum = current_metric->sum - old_metric->sum;
+			result_metric->count = current_metric->count - old_metric->count;
+		}
 	}
 }
 
@@ -3713,6 +3999,7 @@ refreshExecStats(YbSessionStats *stats, bool include_catalog_stats)
 		old->catalog = current->catalog;
 
 	if (yb_session_stats.current_state.metrics_capture) {
+		old->storage_metrics_version = current->storage_metrics_version;
 		for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i) {
 			old->storage_gauge_metrics[i] = current->storage_gauge_metrics[i];
 		}
@@ -3859,6 +4146,13 @@ uint32_t YbGetNumberOfDatabases()
 	return num_databases;
 }
 
+bool YbCatalogVersionTableInPerdbMode()
+{
+	bool perdb_mode = false;
+	HandleYBStatus(YBCCatalogVersionTableInPerdbMode(&perdb_mode));
+	return perdb_mode;
+}
+
 static bool yb_is_batched_execution = false;
 
 bool YbIsBatchedExecution()
@@ -3874,6 +4168,9 @@ void YbSetIsBatchedExecution(bool value)
 OptSplit *
 YbGetSplitOptions(Relation rel)
 {
+	if (rel->yb_table_properties->is_colocated)
+		return NULL;
+
 	OptSplit *split_options = makeNode(OptSplit);
 	/*
 	 * The split type is NUM_TABLETS when the relation has hash key columns
@@ -3895,7 +4192,7 @@ YbGetSplitOptions(Relation rel)
 	{
 		YBCPgTableDesc yb_desc = NULL;
 		HandleYBStatus(YBCPgGetTableDesc(MyDatabaseId,
-						RelationGetRelid(rel), &yb_desc));
+						YbGetRelfileNodeId(rel), &yb_desc));
 		getRangeSplitPointsList(RelationGetRelid(rel), yb_desc,
 								rel->yb_table_properties,
 								&split_options->split_points);
@@ -3924,13 +4221,13 @@ bool YbIsColumnPartOfKey(Relation rel, const char *column_name)
 }
 
 /*
- * ```yb_committed_sticky_object_count``` is the count of the database objects
+ * ```ysql_conn_mgr_sticky_object_count``` is the count of the database objects
  * that requires the sticky connection
  * These objects are
  * 1. WITH HOLD CURSORS
  * 2. TEMP TABLE
  */
-int yb_committed_sticky_object_count = 0;
+int ysql_conn_mgr_sticky_object_count = 0;
 
 /*
  * ```YbIsStickyConnection(int *change)``` updates the number of objects that requires a sticky
@@ -3940,10 +4237,10 @@ int yb_committed_sticky_object_count = 0;
  */
 bool YbIsStickyConnection(int *change)
 {
-	yb_committed_sticky_object_count += *change;
+	ysql_conn_mgr_sticky_object_count += *change;
 	*change = 0; /* Since it is updated it will be set to 0 */
-	elog(DEBUG5, "Number of sticky objects: %d", yb_committed_sticky_object_count);
-	return (yb_committed_sticky_object_count > 0);
+	elog(DEBUG5, "Number of sticky objects: %d", ysql_conn_mgr_sticky_object_count);
+	return (ysql_conn_mgr_sticky_object_count > 0);
 }
 
 void**
@@ -4019,4 +4316,223 @@ YbReadWholeFile(const char *filename, int* length, int elevel)
 
 	buf[*length] = '\0';
 	return buf;
+}
+
+/*
+ * Needed to support the guc variable yb_use_tserver_key_auth, which is
+ * processed before authentication i.e. before setting this variable.
+ */
+bool yb_use_tserver_key_auth;
+
+bool
+yb_use_tserver_key_auth_check_hook(bool *newval, void **extra, GucSource source)
+{
+	/* Allow setting yb_use_tserver_key_auth to false */
+	if (!(*newval))
+		return true;
+
+	/*
+	 * yb_use_tserver_key_auth can only be set for client connections made on
+	 * unix socket.
+	 */
+	if (!IS_AF_UNIX(MyProcPort->raddr.addr.ss_family))
+		ereport(FATAL,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("yb_use_tserver_key_auth can only be set if the "
+						"connection is made over unix domain socket")));
+
+	/*
+	 * If yb_use_tserver_key_auth is set, authentication method used
+	 * is yb_tserver_key. The auth method is decided even before setting the
+	 * yb_use_tserver_key GUC variable in hba_getauthmethod (present in hba.c).
+	 */
+	Assert(MyProcPort->yb_is_tserver_auth_method);
+
+	return true;
+}
+
+/*
+ * Copies the primary key of a relation to a create stmt intended to clone that
+ * relation.
+ */
+void
+YbATCopyPrimaryKeyToCreateStmt(Relation rel, Relation pg_constraint,
+							   CreateStmt *create_stmt)
+{
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId,
+							  true /* indexOK */, NULL /* snapshot */,
+							  1 /* nkeys */, &key);
+
+	bool pk_copied = false;
+	while (!pk_copied && HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_constraint con_form = (Form_pg_constraint) GETSTRUCT(tuple);
+		switch (con_form->contype)
+		{
+			case CONSTRAINT_PRIMARY:
+			{
+				/*
+				 * We don't actually need to map attributes here since there
+				 * isn't a new relation yet, but we still need a map to
+				 * generate an index stmt.
+				 */
+				AttrNumber *att_map = convert_tuples_by_name_map(
+					RelationGetDescr(rel), RelationGetDescr(rel),
+					gettext_noop("could not convert row type"),
+					false /* yb_ignore_type_mismatch */);
+
+				Relation idx_rel =
+					index_open(con_form->conindid, AccessShareLock);
+				IndexStmt *index_stmt = generateClonedIndexStmt(
+					NULL, RelationGetRelid(rel), idx_rel, att_map,
+					RelationGetDescr(rel)->natts, NULL);
+
+				Constraint *pk_constr = makeNode(Constraint);
+				pk_constr->contype = CONSTR_PRIMARY;
+				pk_constr->conname = index_stmt->idxname;
+				pk_constr->options = index_stmt->options;
+				pk_constr->indexspace = index_stmt->tableSpace;
+
+				ListCell *cell;
+				foreach(cell, index_stmt->indexParams)
+				{
+					IndexElem *ielem = lfirst(cell);
+					pk_constr->keys =
+						lappend(pk_constr->keys, makeString(ielem->name));
+					pk_constr->yb_index_params =
+						lappend(pk_constr->yb_index_params, ielem);
+				}
+				create_stmt->constraints =
+					lappend(create_stmt->constraints, pk_constr);
+
+				index_close(idx_rel, AccessShareLock);
+				pk_copied = true;
+				break;
+			}
+			case CONSTRAINT_CHECK:
+			case CONSTRAINT_FOREIGN:
+			case CONSTRAINT_UNIQUE:
+			case CONSTRAINT_TRIGGER:
+			case CONSTRAINT_EXCLUSION:
+				break;
+			default:
+				elog(ERROR, "invalid constraint type \"%c\"",
+					 con_form->contype);
+				break;
+		}
+	}
+	systable_endscan(scan);
+}
+
+/*
+ * In YB, a "relfilenode" corresponds to a DocDB table.
+ * This function creates a new DocDB table for the given index,
+ * with UUID corresponding to the given relfileNodeId. It is used when a
+ * user index is re-indexed.
+ */
+void
+YbIndexSetNewRelfileNode(Relation indexRel, Oid newRelfileNodeId,
+						 bool yb_copy_split_options)
+{
+	bool		isNull;
+	HeapTuple	tuple;
+	Datum		reloptions = (Datum) 0;
+	Relation	indexedRel;
+	IndexInfo	*indexInfo;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(
+		RelationGetRelid(indexRel)));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for index %u",
+				RelationGetRelid(indexRel));
+
+	reloptions = SysCacheGetAttr(RELOID, tuple,
+		Anum_pg_class_reloptions, &isNull);
+	ReleaseSysCache(tuple);
+	reloptions = ybExcludeNonPersistentReloptions(reloptions);
+	indexedRel = heap_open(
+		IndexGetRelation(RelationGetRelid(indexRel), false), ShareLock);
+	indexInfo = BuildIndexInfo(indexRel);
+
+	YbGetTableProperties(indexRel);
+	YBCCreateIndex(RelationGetRelationName(indexRel),
+				   indexInfo,
+				   RelationGetDescr(indexRel),
+				   indexRel->rd_indoption,
+				   reloptions,
+				   newRelfileNodeId,
+				   indexedRel,
+				   yb_copy_split_options ? YbGetSplitOptions(indexRel) : NULL,
+				   true /* skip_index_backfill */,
+				   indexRel->yb_table_properties->is_colocated,
+				   indexRel->yb_table_properties->tablegroup_oid,
+				   InvalidOid /* colocation ID */,
+				   indexRel->rd_rel->reltablespace,
+				   RelationGetRelid(indexRel),
+				   YbGetRelfileNodeId(indexRel));
+
+	heap_close(indexedRel, ShareLock);
+
+	if (yb_test_fail_table_rewrite_after_creation)
+		elog(ERROR, "Injecting error.");
+}
+
+SortByDir
+YbSortOrdering(SortByDir ordering, bool is_colocated, bool is_tablegroup,
+			   bool is_first_key)
+{
+	switch (ordering)
+	{
+		case SORTBY_DEFAULT:
+			/*
+				 * In Yugabyte, use HASH as the default for the first column of
+				 * non-colocated tables
+			 */
+			if (IsYugaByteEnabled() && yb_use_hash_splitting_by_default &&
+				is_first_key && !is_colocated && !is_tablegroup)
+				return SORTBY_HASH;
+
+			return SORTBY_ASC;
+
+		case SORTBY_ASC:
+		case SORTBY_DESC:
+			break;
+
+		case SORTBY_USING:
+			ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				errmsg("USING is not allowed in an index")));
+			break;
+
+		case SORTBY_HASH:
+			if (is_tablegroup && !MyDatabaseColocated)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("cannot create a hash partitioned index in a TABLEGROUP")));
+			else if (is_colocated)
+				ereport(ERROR, (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("cannot colocate hash partitioned index")));
+			break;
+
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("unsupported column sort order: %d", ordering)));
+			break;
+	}
+
+	return ordering;
+}
+
+void
+YbGetRedactedQueryString(const char* query, int query_len,
+						 const char** redacted_query, int* redacted_query_len)
+{
+	*redacted_query = pnstrdup(query, query_len);
+	*redacted_query = RedactPasswordIfExists(*redacted_query);
+	*redacted_query_len = strlen(*redacted_query);
 }

@@ -57,6 +57,8 @@ using dockv::ValueEntryTypeAsChar;
 
 namespace {
 
+constexpr char kPostApplyMetadataMarker = 0;
+
 // Slice parts with the number of slices fixed at compile time.
 template <int N>
 struct FixedSliceParts {
@@ -159,6 +161,15 @@ void HandleExternalRecord(
   ++(*write_id);
 }
 
+[[nodiscard]] dockv::ReadIntentTypeSets GetIntentTypesForRead(
+    IsolationLevel level, RowMarkType row_mark, bool read_is_for_write_op) {
+  auto result = dockv::GetIntentTypesForRead(level, row_mark);
+  if (read_is_for_write_op) {
+    result.read.Set(dockv::IntentType::kStrongRead);
+  }
+  return result;
+}
+
 }  // namespace
 
 NonTransactionalWriter::NonTransactionalWriter(
@@ -209,6 +220,8 @@ TransactionalWriter::TransactionalWriter(
 //   TxnId -> status tablet id + isolation level
 // Reverse index by txn id
 //   TxnId + HybridTime -> Main intent data key
+// Post-apply transaction metadata
+//   TxnId + kPostApplyMetadataMarker -> apply op id
 //
 // Where prefix is just a single byte prefix. TxnId, IntentType, HybridTime all prefixed with
 // appropriate value type.
@@ -256,12 +269,14 @@ Status TransactionalWriter::Apply(rocksdb::DirectWriteHandler* handler) {
   if (!put_batch_.read_pairs().empty()) {
     RETURN_NOT_OK(EnumerateIntents(
         put_batch_.read_pairs(),
-        [this, intent_types = dockv::GetIntentTypesForRead(isolation_level_, row_mark_)](
-            auto ancestor_doc_key, auto full_doc_key,
-            const auto& value, auto* key, auto last_key, auto is_row_lock) {
+        [this, intent_types = GetIntentTypesForRead(
+                   isolation_level_, row_mark_,
+                   !put_batch_.write_pairs().empty() /* read_is_for_write_op */)](
+            auto ancestor_doc_key, auto full_doc_key, const auto& value, auto* key, auto last_key,
+            auto is_row_lock) {
           return (*this)(
-              dockv::GetIntentTypes(intent_types, is_row_lock), ancestor_doc_key,
-              full_doc_key, value, key, last_key);
+              dockv::GetIntentTypes(intent_types, is_row_lock), ancestor_doc_key, full_doc_key,
+              value, key, last_key);
         },
         partial_range_key_intents_));
   }
@@ -273,6 +288,7 @@ Status TransactionalWriter::Apply(rocksdb::DirectWriteHandler* handler) {
 Status TransactionalWriter::operator()(
     dockv::IntentTypeSet intent_types, dockv::AncestorDocKey ancestor_doc_key, dockv::FullDocKey,
     Slice intent_value, dockv::KeyBytes* key, dockv::LastKey last_key) {
+  RSTATUS_DCHECK(intent_types.Any(), IllegalState, "Intent type set should not be empty");
   if (ancestor_doc_key) {
     weak_intents_[key->data()] |= MakeWeak(intent_types);
     return Status::OK();
@@ -386,6 +402,31 @@ Status TransactionalWriter::AddWeakIntent(
   return Status::OK();
 }
 
+PostApplyMetadataWriter::PostApplyMetadataWriter(
+    std::span<const PostApplyTransactionMetadata> metadatas)
+    : metadatas_{metadatas} {
+}
+
+Status PostApplyMetadataWriter::Apply(rocksdb::DirectWriteHandler* handler) {
+  ThreadSafeArena arena;
+  for (const auto& metadata : metadatas_) {
+    std::array<Slice, 3> metadata_key = {{
+        Slice(&KeyEntryTypeAsChar::kTransactionId, 1),
+        metadata.transaction_id.AsSlice(),
+        Slice(&kPostApplyMetadataMarker, 1),
+    }};
+
+    LWPostApplyTransactionMetadataPB data(&arena);
+    metadata.ToPB(&data);
+
+    auto value = data.SerializeAsString();
+    Slice value_slice{value};
+    handler->Put(metadata_key, SliceParts(&value_slice, 1));
+  }
+
+  return Status::OK();
+}
+
 DocHybridTimeBuffer::DocHybridTimeBuffer() {
   buffer_[0] = KeyEntryTypeAsChar::kHybridTime;
 }
@@ -427,7 +468,10 @@ Status IntentsWriter::Apply(rocksdb::DirectWriteHandler* handler) {
 
     auto reverse_index_value = reverse_index_iter_.value();
 
-    bool metadata = key_slice.size() == 1 + TransactionId::StaticSize();
+    // Check if they key is transaction metadata (1 byte prefix + transaction id) or
+    // post-apply transaction metadata (1 byte prefix + transaction id + 1 byte suffix).
+    bool metadata = key_slice.size() == 1 + TransactionId::StaticSize() ||
+                    key_slice.size() == 2 + TransactionId::StaticSize();
     // At this point, txn_reverse_index_prefix is a prefix of key_slice. If key_slice is equal to
     // txn_reverse_index_prefix in size, then they are identical, and we are seeked to transaction
     // metadata. Otherwise, we're seeked to an intent entry in the index which we may process.
@@ -720,11 +764,12 @@ Result<ExternalTxnApplyState> ProcessApplyExternalTransactions(
     auto aborted_subtransactions =
         VERIFY_RESULT(SubtxnSet::FromPB(apply.aborted_subtransactions().set()));
     result.emplace(
-        txn_id,
-        ExternalTxnApplyStateData{
-            .commit_ht = commit_ht,
-            .aborted_subtransactions = aborted_subtransactions,
-        });
+        txn_id, ExternalTxnApplyStateData{
+                    .commit_ht = commit_ht,
+                    .aborted_subtransactions = aborted_subtransactions,
+                    // If filter keys are not specified then default to full key range.
+                    .filter_range = {apply.filter_start_key(), apply.filter_end_key()},
+                });
   }
 
   return result;
@@ -732,9 +777,10 @@ Result<ExternalTxnApplyState> ProcessApplyExternalTransactions(
 
 }  // namespace
 
-Status ExternalIntentsBatchWriter::PrepareApplyExternalIntentsBatch(
+Result<bool> ExternalIntentsBatchWriter::PrepareApplyExternalIntentsBatch(
     const Slice& original_input_value, ExternalTxnApplyStateData* apply_data,
     rocksdb::DirectWriteHandler* regular_write_handler) {
+  bool can_delete_entire_batch = true;
   auto input_value = original_input_value;
   DocHybridTimeBuffer doc_ht_buffer;
   RETURN_NOT_OK(input_value.consume_byte(KeyEntryTypeAsChar::kUuid));
@@ -756,7 +802,7 @@ Status ExternalIntentsBatchWriter::PrepareApplyExternalIntentsBatch(
   }
   if (apply_data->aborted_subtransactions.Test(subtransaction_id)) {
     // Skip applying provisional writes that belong to subtransactions that got aborted.
-    return Status::OK();
+    return can_delete_entire_batch;
   }
   for (;;) {
     auto key_size = VERIFY_RESULT(FastDecodeUnsignedVarInt(&input_value));
@@ -774,6 +820,20 @@ Status ExternalIntentsBatchWriter::PrepareApplyExternalIntentsBatch(
     }
     auto output_value = input_value.Prefix(value_size);
     input_value.remove_prefix(value_size);
+
+    // Remove the key entry prefix byte(s) and verify the key is valid.
+    auto output_key_value = output_key;
+    auto output_key_value_byte = dockv::ConsumeKeyEntryType(&output_key_value);
+    SCHECK_NE(output_key_value_byte, KeyEntryType::kInvalid, Corruption, "Wrong first byte");
+    if (!apply_data->filter_range.IsWithinBounds(output_key_value)) {
+      // Skip this entry. Ensure that we don't delete this batch, as another apply will need this
+      // skipped intent.
+      can_delete_entire_batch = false;
+      continue;
+    }
+    // Since external intents only contain one key since D24185, this should be all or nothing.
+    DCHECK(can_delete_entire_batch);
+
     std::array<Slice, 2> key_parts = {{
         output_key,
         doc_ht_buffer.EncodeWithValueType(apply_data->commit_ht, apply_data->write_id),
@@ -788,7 +848,7 @@ Status ExternalIntentsBatchWriter::PrepareApplyExternalIntentsBatch(
     RETURN_NOT_OK(UpdateSchemaVersion(output_key, output_value));
   }
 
-  return Status::OK();
+  return can_delete_entire_batch;
 }
 
 // Reads all stored external intents for provided transactions and prepares batches that will apply
@@ -815,10 +875,14 @@ Status ExternalIntentsBatchWriter::PrepareApplyExternalIntents(
         break;
       }
 
-      RETURN_NOT_OK(
+      // Returns whether or not we filtered out any intents, if we did then do not delete as a later
+      // apply (with a different filter) might still need it.
+      bool can_delete_entire_batch = VERIFY_RESULT(
           PrepareApplyExternalIntentsBatch(intents_db_iter_.value(), &apply_data, handler));
 
-      intents_write_batch_->SingleDelete(input_key);
+      if (can_delete_entire_batch) {
+        intents_write_batch_->SingleDelete(input_key);
+      }
 
       intents_db_iter_.Next();
     }

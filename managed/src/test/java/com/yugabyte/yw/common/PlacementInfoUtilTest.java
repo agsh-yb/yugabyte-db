@@ -378,6 +378,71 @@ public class PlacementInfoUtilTest extends FakeDBApplication {
   }
 
   @Test
+  public void testExpandRRWithRF() {
+    Customer customer = ModelFactory.testCustomer("Test Customer");
+    Provider provider = ModelFactory.newProvider(customer, aws);
+
+    Universe universe = createFromConfig(provider, "Existing", "r1-az1-1-1;r1-az2-1-1;r1-az3-1-1");
+    Region region = Region.getByCode(provider, "r1");
+
+    UniverseDefinitionTaskParams params = universe.getUniverseDetails();
+    params.setUniverseUUID(universe.getUniverseUUID());
+    params.currentClusterType = ClusterType.ASYNC;
+    params.clusters = new ArrayList<>(universe.getUniverseDetails().clusters);
+    params.nodeDetailsSet = new HashSet<>(universe.getUniverseDetails().nodeDetailsSet);
+
+    UserIntent rrIntent = new UserIntent();
+    rrIntent.replicationFactor = 1;
+    rrIntent.numNodes = 1;
+    rrIntent.universeName = universe.getName();
+    rrIntent.provider = provider.getUuid().toString();
+    rrIntent.regionList = Collections.singletonList(region.getUuid());
+    rrIntent.instanceType = ApiUtils.UTIL_INST_TYPE;
+
+    UniverseDefinitionTaskParams.Cluster asyncCluster =
+        new UniverseDefinitionTaskParams.Cluster(
+            UniverseDefinitionTaskParams.ClusterType.ASYNC, rrIntent);
+    params.clusters.add(asyncCluster);
+
+    PlacementInfoUtil.updateUniverseDefinition(params, customer.getId(), asyncCluster.uuid, CREATE);
+
+    universe =
+        Universe.saveDetails(
+            universe.getUniverseUUID(),
+            u -> {
+              u.setUniverseDetails(params);
+              params.nodeDetailsSet.forEach(n -> n.state = Live);
+            });
+
+    UniverseDefinitionTaskParams taskParams = universe.getUniverseDetails();
+    taskParams.setUniverseUUID(universe.getUniverseUUID());
+    taskParams.currentClusterType = ClusterType.ASYNC;
+    taskParams.getReadOnlyClusters().get(0).userIntent.numNodes += 1;
+
+    PlacementInfoUtil.updateUniverseDefinition(
+        taskParams, customer.getId(), asyncCluster.uuid, EDIT);
+
+    taskParams.getReadOnlyClusters().get(0).userIntent.replicationFactor += 1;
+    PlacementInfoUtil.updateUniverseDefinition(
+        taskParams, customer.getId(), asyncCluster.uuid, EDIT);
+
+    Set<NodeDetails> nodesInAsync =
+        params.nodeDetailsSet.stream()
+            .filter(n -> n.isInPlacement(asyncCluster.uuid))
+            .collect(Collectors.toSet());
+
+    assertEquals(
+        1l,
+        nodesInAsync.stream()
+            .filter(n -> n.state == Live)
+            .count()); // Verify that current Live node is untouched
+
+    Set<UUID> azs = nodesInAsync.stream().map(n -> n.getAzUuid()).collect(Collectors.toSet());
+    // Check that now we have 2 azs
+    assertEquals(2, azs.size());
+  }
+
+  @Test
   public void testEditPlacement() {
     for (TestData t : testData) {
       Universe universe = t.universe;
@@ -1026,7 +1091,8 @@ public class PlacementInfoUtilTest extends FakeDBApplication {
     "aws, 0, 10, i3.instance, m3.medium, false", // ephemeral instance type
     "aws, 0, 10, c5d.instance, m3.medium, false", // ephemeral instance type
     "gcp, 0, 10, scratch, m3.medium, false", // ephemeral instance type
-    "aws, 0, 10, m3.medium, c5d.instance, true" // changing to ephemeral is OK
+    "aws, 0, 10, m3.medium, c5d.instance, true", // changing to ephemeral is OK
+    "aws, -1, 0, m3.medium, m3.medium, false", // decrease num of volumes
   })
   @Test
   public void testResizeNodeAvailable(

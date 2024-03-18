@@ -49,11 +49,14 @@ export const hasDefaultNTPServers = (providerCode: ProviderCode) =>
 
 // TODO: API should return the YBA host as part of the hostInfo response.
 export const getYBAHost = (hostInfo: HostInfo) => {
-  if (!(typeof hostInfo.gcp === 'string' || hostInfo.gcp instanceof String)) {
+  if (typeof hostInfo?.gcp !== 'string') {
     return YBAHost.GCP;
   }
-  if (!(typeof hostInfo.aws === 'string' || hostInfo.aws instanceof String)) {
+  if (typeof hostInfo?.aws !== 'string') {
     return YBAHost.AWS;
+  }
+  if (typeof hostInfo?.azu !== 'string') {
+    return YBAHost.AZU;
   }
   return YBAHost.SELF_HOSTED;
 };
@@ -61,7 +64,7 @@ export const getYBAHost = (hostInfo: HostInfo) => {
 export const getInfraProviderTab = (providerConfig: YBProvider) => {
   // Kubernetes providers are handled as a special case here because the UI
   // exposes 3 tabs for kubernetes providers.
-  // - VMWare Tanzu
+  // - VMware Tanzu
   // - Red Hat OpenShift
   // - Managed Kubernetes
   // Moreover, the deprecated kubernetes provider types are not given their own
@@ -99,6 +102,47 @@ export const getLinkedUniverses = (providerUUID: string, universes: Universe[]) 
     }
     return linkedUniverses;
   }, []);
+
+/**
+ * Returns a region code to availability zone mapping which captures all zones in which linked universes
+ * have deployed instances.
+ *
+ * Assumptions:
+ * - The universes are all created using the same provider.
+ */
+export const getRegionToInUseAz = (
+  providerUuid: string,
+  linkedUniverses: UniverseItem[]
+): Map<string, Set<string>> => {
+  const regionToInUseAz = new Map<string, Set<string>>();
+  linkedUniverses.forEach((linkedUniverse) =>
+    linkedUniverse.linkedClusters.forEach((linkedCluster) =>
+      linkedCluster.placementInfo.cloudList
+        .find((provider) => provider.uuid === providerUuid)
+        ?.regionList.forEach((region) => {
+          const azNames = regionToInUseAz.get(region.code);
+          if (azNames === undefined) {
+            regionToInUseAz.set(
+              region.code,
+              new Set<string>(region.azList.map((zone) => zone.name))
+            );
+          } else {
+            region.azList.forEach((zone) => azNames.add(zone.name));
+          }
+        })
+    )
+  );
+  return regionToInUseAz;
+};
+
+export const getInUseAzs = (
+  providerUuid: string,
+  linkedUniverses: UniverseItem[],
+  regionCode: string | undefined
+) => {
+  const regionToInUseAz = getRegionToInUseAz(providerUuid, linkedUniverses);
+  return (regionCode !== undefined && regionToInUseAz.get(regionCode)) || new Set<string>();
+};
 
 export const getLatestAccessKey = (accessKeys: AccessKey[]) =>
   accessKeys.reduce((latestAccessKey: null | AccessKey, currentAccessKey) => {
@@ -167,7 +211,7 @@ export const getDeletedZones = <
 
   return existingZones
     ? existingZones
-        .filter((zone) => !persistedZoneCodes.includes(zone.code))
-        .map((zone) => deleteZone(zone))
+      .filter((zone) => !persistedZoneCodes.includes(zone.code))
+      .map((zone) => deleteZone(zone))
     : [];
 };

@@ -51,21 +51,21 @@
 /* DocDB row decode and process cost */
 #define YB_DEFAULT_DOCDB_MERGE_CPU_CYCLES 50
 
-/* DocDB Remote filter cost */
-#define YB_DEFAULT_DOCDB_REMOTE_FILTER_OVERHEAD_CYCLES 50
+/* DocDB storage filter cost */
+#define YB_DEFAULT_DOCDB_REMOTE_FILTER_OVERHEAD_CYCLES 20
 
 /* Network transfer cost */
-#define YB_DEFAULT_LOCAL_LATENCY_COST 10.0
-#define YB_DEFAULT_LOCAL_THROUGHPUT_COST 10.0
+#define YB_DEFAULT_LOCAL_LATENCY_COST 180.0
+#define YB_DEFAULT_LOCAL_THROUGHPUT_COST 80000.0
 
-/* 
- * TODO : Since we cannot currently estimate the number of key value pairs per 
- * tuple, we use a constant heuristic value of 3. 
+/*
+ * TODO : Since we cannot currently estimate the number of key value pairs per
+ * tuple, we use a constant heuristic value of 3.
  */
 #define YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE 3
-/* 
- * TODO : Since we cannot currently estimate the number of SST files per 
- * table, we use a constant heuristic value of 3. 
+/*
+ * TODO : Since we cannot currently estimate the number of SST files per
+ * table, we use a constant heuristic value of 3.
  */
 #define YB_DEFAULT_NUM_SST_FILES_PER_TABLE 3
 
@@ -87,7 +87,6 @@ extern PGDLLIMPORT double seq_page_cost;
 extern PGDLLIMPORT double random_page_cost;
 
 extern PGDLLIMPORT double yb_network_fetch_cost;
-
 extern PGDLLIMPORT double yb_intercloud_cost;
 extern PGDLLIMPORT double yb_interregion_cost;
 extern PGDLLIMPORT double yb_interzone_cost;
@@ -150,6 +149,9 @@ extern void yb_cost_index(IndexPath *path, PlannerInfo *root,
 extern void cost_index(IndexPath *path, PlannerInfo *root,
 		   double loop_count, bool partial_path);
 extern void cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+					  ParamPathInfo *param_info,
+					  Path *bitmapqual, double loop_count);
+extern void cost_yb_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 					  ParamPathInfo *param_info,
 					  Path *bitmapqual, double loop_count);
 extern void cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root);

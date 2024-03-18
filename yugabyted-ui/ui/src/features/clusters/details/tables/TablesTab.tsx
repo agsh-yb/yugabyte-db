@@ -89,7 +89,7 @@ export const TablesTab: FC<{ dbApi: GetClusterTablesApiEnum }> = ({ dbApi }) => 
     );
 
   const { refetch: refetchTablets } = useGetClusterTabletsQuery({ query: { enabled: false }});
-  const { refetch: refetchNodes } = useGetClusterNodesQuery({ query: { enabled: false }});
+  const { refetch: refetchNodes } = useGetClusterNodesQuery({}, { query: { enabled: false }});
   const { refetch: refetchHealth } = useGetClusterHealthCheckQuery({ query: { enabled: false }});
 
   const refetchData = () => {
@@ -209,7 +209,7 @@ export const TablesTab: FC<{ dbApi: GetClusterTablesApiEnum }> = ({ dbApi }) => 
               className={classes.dropdown}
             >
               <Box className={classes.dropdownHeader}>{t('clusterDetail.databases.table')}</Box>
-              {tableList.filter(table => !table.isIndexTable).map(item => (
+              {tableList.map(item => (
                 <MenuItem
                   key={`keyspaces-${item.name.replace(' ', '-')}`}
                   selected={item.uuid === selectedTable.uuid}

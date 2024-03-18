@@ -1,8 +1,10 @@
 import { useContext } from 'react';
 import _ from 'lodash';
-import { useSelector } from 'react-redux';
+import { useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { Box, Typography, useMediaQuery } from '@material-ui/core';
+import { useQuery } from 'react-query';
+
 import {
   DefaultRegionField,
   MasterPlacementField,
@@ -15,12 +17,18 @@ import {
 } from '../../fields';
 import { UniverseFormContext } from '../../../UniverseFormContainer';
 import { getPrimaryCluster } from '../../../utils/helpers';
+import { RuntimeConfigKey } from '../../../../../../helpers/constants';
+import { PROVIDER_FIELD } from '../../../utils/constants';
+import { api, runtimeConfigQueryKey } from '../../../../../../helpers/api';
+
 import {
   ClusterModes,
   ClusterType,
   RunTimeConfigEntry,
   UniverseFormConfigurationProps
 } from '../../../utils/dto';
+import { YBProvider } from '../../../../../../../components/configRedesign/providerRedesign/types';
+
 import { useSectionStyles } from '../../../universeMainStyle';
 
 export const CloudConfiguration = ({ runtimeConfigs }: UniverseFormConfigurationProps) => {
@@ -28,23 +36,33 @@ export const CloudConfiguration = ({ runtimeConfigs }: UniverseFormConfiguration
   const { t } = useTranslation();
   const isLargeDevice = useMediaQuery('(min-width:1400px)');
 
-  //feature flagging
-  const featureFlags = useSelector((state: any) => state.featureFlags);
+  const provider: YBProvider = useWatch({ name: PROVIDER_FIELD });
+
+  const providerRuntimeConfigQuery = useQuery(
+    runtimeConfigQueryKey.providerScope(provider?.uuid),
+    () => api.fetchRuntimeConfigs(provider?.uuid),
+    { enabled: !!provider?.uuid }
+  );
+
   const isGeoPartitionEnabled =
-    featureFlags.test.enableGeoPartitioning || featureFlags.released.enableGeoPartitioning;
+    providerRuntimeConfigQuery.data?.configEntries?.find(
+      (c: RunTimeConfigEntry) => c.key === RuntimeConfigKey.GEO_PARTITIONING_UI_FEATURE_FLAG
+    )?.value === 'true';
 
   // Value of runtime config key
   const enableDedicatedNodesObject = runtimeConfigs?.configEntries?.find(
-    (c: RunTimeConfigEntry) => c.key === 'yb.ui.enable_dedicated_nodes'
+    (c: RunTimeConfigEntry) => c.key === RuntimeConfigKey.ENABLE_DEDICATED_NODES
   );
   const useK8CustomResourcesObject = runtimeConfigs?.configEntries?.find(
-    (c: RunTimeConfigEntry) => c.key === 'yb.use_k8s_custom_resources'
+    (c: RunTimeConfigEntry) => c.key === RuntimeConfigKey.USE_K8_CUSTOM_RESOURCES_FEATURE_FLAG
   );
   const useK8CustomResources = !!(useK8CustomResourcesObject?.value === 'true');
   const isDedicatedNodesEnabled = !!(enableDedicatedNodesObject?.value === 'true');
 
   //form context
-  const { clusterType, mode, universeConfigureTemplate } = useContext(UniverseFormContext)[0];
+  const { clusterType, mode, universeConfigureTemplate, isViewMode } = useContext(
+    UniverseFormContext
+  )[0];
   const isPrimary = clusterType === ClusterType.PRIMARY;
   const isEditMode = mode === ClusterModes.EDIT; //Form is in edit mode
   const isEditPrimary = isEditMode && isPrimary; //Editing Primary Cluster
@@ -76,31 +94,32 @@ export const CloudConfiguration = ({ runtimeConfigs }: UniverseFormConfiguration
           />
         </Box>
         <Box mt={2}>
-          <RegionsField disabled={false} />
+          <RegionsField disabled={isViewMode} />
         </Box>
         {isDedicatedNodesEnabled && (
           <Box mt={isPrimary ? 2 : 0}>
             <MasterPlacementField
               isPrimary={isPrimary}
               useK8CustomResources={useK8CustomResources}
+              disabled={isViewMode}
             />
           </Box>
         )}
         <Box mt={2}>
-          <TotalNodesField disabled={false} />
+          <TotalNodesField disabled={isViewMode} />
         </Box>
         <Box mt={2}>
-          <ReplicationFactor disabled={isEditMode} isPrimary={isPrimary} />
+          <ReplicationFactor disabled={isEditMode} isPrimary={isPrimary} isViewMode={isViewMode} />
         </Box>
         {isPrimary && isGeoPartitionEnabled && (
           <Box mt={2} display="flex" flexDirection="column">
-            <DefaultRegionField disabled={isEditPrimary} />
+            <DefaultRegionField disabled={isEditPrimary || isViewMode} />
           </Box>
         )}
       </Box>
       <Box mt={isLargeDevice ? 0 : 4}>
         <PlacementsField
-          disabled={false}
+          disabled={isViewMode}
           isPrimary={isPrimary}
           isGeoPartitionEnabled={isGeoPartitionEnabled}
           isEditMode={isEditMode}

@@ -34,6 +34,8 @@
 #include "utils/typcache.h"
 #include "utils/tqual.h"
 
+/* YB includes. */
+#include "catalog/pg_yb_catalog_version_d.h"
 
 /*
  * Setup a ScanKey for a search in the relation 'rel' for a tuple 'key' that
@@ -558,7 +560,25 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 
 	/* If relation has replica identity we are always good. */
 	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		OidIsValid(RelationGetReplicaIndex(rel)))
+		OidIsValid(RelationGetReplicaIndex(rel)) ||
+		(IsYugaByteEnabled() && rel->rd_rel->relreplident == YB_REPLICA_IDENTITY_CHANGE))
+		return;
+
+	/*
+	 * In per-database catalog version mode at the end of a global-impact
+	 * DDL statement, we internally call yb_increment_all_db_catalog_versions
+	 * which sets yb_non_ddl_txn_for_sys_tables_allowed to true in order to
+	 * update pg_yb_catalog_version table. More generally, a user may want
+	 * to manually set yb_non_ddl_txn_for_sys_tables_allowed to true and then
+	 * perform an update on pg_yb_catalog_version table to force catalog cache
+	 * refresh.
+	 * NOTE: we may need to allow more system tables in YB context.
+	 *
+	 * TODO(#20143): Revisit if and when we introduce support for replica
+	 * identity, to identify how REPLICA_IDENTITY_NOTHING is handled here.
+	 */
+	if (IsYugaByteEnabled() &&
+		yb_non_ddl_txn_for_sys_tables_allowed)
 		return;
 
 	/*

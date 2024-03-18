@@ -48,12 +48,7 @@ TAG_FLAG(log_ysql_catalog_versions, hidden);
 
 DEPRECATE_FLAG(bool, disable_hybrid_scan, "11_2022");
 
-#ifdef NDEBUG
-constexpr bool kEnableWaitOnConflict = false;
-#else
-constexpr bool kEnableWaitOnConflict = true;
-#endif
-DEFINE_NON_RUNTIME_bool(enable_wait_queues, kEnableWaitOnConflict,
+DEFINE_NON_RUNTIME_bool(enable_wait_queues, true,
     "If true, enable wait queues that help provide Wait-on-Conflict behavior during conflict "
     "resolution whenever required. Enabling this flag enables deadlock detection as well.");
 TAG_FLAG(enable_wait_queues, advanced);
@@ -68,14 +63,16 @@ DEFINE_NON_RUNTIME_bool(disable_deadlock_detection, false,
 TAG_FLAG(disable_deadlock_detection, advanced);
 TAG_FLAG(disable_deadlock_detection, hidden);
 
-DEFINE_RUNTIME_PG_PREVIEW_FLAG(bool, ddl_rollback_enabled, false,
+DEFINE_RUNTIME_PG_PREVIEW_FLAG(bool, yb_ddl_rollback_enabled, false,
     "If true, upon failure of a YSQL DDL transaction that affects the DocDB syscatalog, the "
     "YB-Master will rollback the changes made to the DocDB syscatalog.");
 
-DEFINE_NON_RUNTIME_PREVIEW_bool(ysql_enable_db_catalog_version_mode, false,
+DEFINE_NON_RUNTIME_bool(ysql_enable_db_catalog_version_mode, true,
     "Enable the per database catalog version mode, a DDL statement that only "
     "affects the current database will only increment catalog version for "
     "the current database.");
+TAG_FLAG(ysql_enable_db_catalog_version_mode, advanced);
+TAG_FLAG(ysql_enable_db_catalog_version_mode, hidden);
 
 DEFINE_RUNTIME_uint32(wait_for_ysql_backends_catalog_version_client_master_rpc_margin_ms, 5000,
     "For a WaitForYsqlBackendsCatalogVersion client-to-master RPC, the amount of time to reserve"
@@ -84,6 +81,13 @@ DEFINE_RUNTIME_uint32(wait_for_ysql_backends_catalog_version_client_master_rpc_m
     " processing and RPC time for the response. It should be lower than"
     " wait_for_ysql_backends_catalog_version_client_master_rpc_timeout_ms.");
 TAG_FLAG(wait_for_ysql_backends_catalog_version_client_master_rpc_margin_ms, advanced);
+
+// TODO(#13369): use this flag in tserver.
+DEFINE_NON_RUNTIME_uint32(master_ts_ysql_catalog_lease_ms, 10000, // 10s
+    "Lease period between master and tserver that guarantees YSQL system catalog is not stale."
+    " Must be higher than --heartbeat_interval_ms, preferrably many times higher.");
+TAG_FLAG(master_ts_ysql_catalog_lease_ms, advanced);
+TAG_FLAG(master_ts_ysql_catalog_lease_ms, hidden);
 
 // We expect that consensus_max_batch_size_bytes + 1_KB would be less than rpc_max_message_size.
 // Otherwise such batch would be rejected by RPC layer.
@@ -102,6 +106,30 @@ DEFINE_NON_RUNTIME_bool(ysql_enable_pg_per_database_oid_allocator, true,
 TAG_FLAG(ysql_enable_pg_per_database_oid_allocator, advanced);
 TAG_FLAG(ysql_enable_pg_per_database_oid_allocator, hidden);
 
+DEFINE_RUNTIME_PREVIEW_bool(yb_enable_cdc_consistent_snapshot_streams, false,
+                            "Enable support for CDC Consistent Snapshot Streams");
+
+DEFINE_RUNTIME_PG_FLAG(bool, TEST_enable_replication_slot_consumption, false,
+                       "Enable consumption of changes via replication slots."
+                       "Requires yb_enable_replication_commands to be true.");
+TAG_FLAG(ysql_TEST_enable_replication_slot_consumption, unsafe);
+TAG_FLAG(ysql_TEST_enable_replication_slot_consumption, hidden);
+
+// The following flags related to the cloud, region and availability zone that an instance is
+// started in. These are passed in from whatever provisioning mechanics start the servers. They
+// are used for generic placement policies on table creation and tablet load balancing, to
+// either constrain data to a certain location (table A should only live in aws.us-west2.a), or to
+// define the required level of fault tolerance expected (table B should have N replicas, across
+// two regions of AWS and one of GCE).
+//
+// These are currently for use in a cloud-based deployment, but could be retrofitted to work for
+// an on-premise deployment as well, with datacenter, cluster and rack levels, for example.
+DEFINE_NON_RUNTIME_string(placement_cloud, "cloud1",
+              "The cloud in which this instance is started.");
+DEFINE_NON_RUNTIME_string(placement_region, "datacenter1",
+              "The cloud region in which this instance is started.");
+DEFINE_NON_RUNTIME_string(placement_zone, "rack1",
+              "The cloud availability zone in which this instance is started.");
 namespace {
 
 constexpr const auto kMinRpcThrottleThresholdBytes = 16;
@@ -136,6 +164,9 @@ void RpcThrottleThresholdBytesValidator() {
 // after all the flags have been parsed.
 REGISTER_CALLBACK(rpc_throttle_threshold_bytes, "RpcThrottleThresholdBytesValidator",
     &RpcThrottleThresholdBytesValidator);
+
+DEFINE_RUNTIME_AUTO_bool(enable_xcluster_auto_flag_validation, kLocalPersisted, false, true,
+    "Enables validation of AutoFlags between the xcluster universes");
 
 namespace yb {
 

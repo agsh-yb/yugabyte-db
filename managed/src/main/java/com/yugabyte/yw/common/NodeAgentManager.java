@@ -42,7 +42,6 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import javax.annotation.Nullable;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.Builder;
@@ -175,7 +174,9 @@ public class NodeAgentManager {
     try {
       Map<String, Integer> sans =
           ImmutableMap.<String, Integer>builder()
-              .put(nodeAgent.getIp(), GeneralName.iPAddress)
+              .put(
+                  nodeAgent.getIp(),
+                  Util.isIpAddress(nodeAgent.getIp()) ? GeneralName.iPAddress : GeneralName.dNSName)
               .build();
 
       // Add the security provider in case createSignedCertificate was never called.
@@ -298,16 +299,16 @@ public class NodeAgentManager {
    * @param nodeAgentUuid node agent UUID.
    * @return the JWT for sending request to the node agent.
    */
+  @VisibleForTesting
   public String getClientToken(UUID nodeAgentUuid, UUID userUuid) {
     PrivateKey privateKey = getNodeAgentPrivateKey(nodeAgentUuid);
     return Jwts.builder()
         .setIssuer("https://www.yugabyte.com")
         .setSubject(ClientType.NODE_AGENT.name())
-        .setIssuedAt(Date.from(Instant.now()))
         .setExpiration(Date.from(Instant.now().plusSeconds(NODE_AGENT_JWT_EXPIRY_SECS)))
         .claim(JWTVerifier.CLIENT_ID_CLAIM.toString(), nodeAgentUuid.toString())
         .claim(JWTVerifier.USER_ID_CLAIM.toString(), userUuid.toString())
-        .signWith(SignatureAlgorithm.RS256, privateKey)
+        .signWith(privateKey, SignatureAlgorithm.RS256)
         .compact();
   }
 
@@ -360,7 +361,7 @@ public class NodeAgentManager {
                   osType.name().toLowerCase(),
                   archType.name().toLowerCase()));
       // Search for a pattern like node_agent-2.15.3.0*-linux-amd64.tar.gz.
-      FileFilter fileFilter = new WildcardFileFilter(pkgFileFilter);
+      FileFilter fileFilter = WildcardFileFilter.builder().setWildcards(pkgFileFilter).get();
       File[] files = releasesPath.toFile().listFiles(fileFilter);
       if (files != null) {
         for (File file : files) {
@@ -369,7 +370,7 @@ public class NodeAgentManager {
             // Extract the version with build number e.g. 2.15.3.0-b1372.
             String version = matcher.group(1);
             // Compare the full versions. The comparison ignores non-numeric build numbers.
-            if (Util.compareYbVersions(softwareVersion, version, true) == 0) {
+            if (Util.areYbVersionsEqual(softwareVersion, version, true)) {
               return file.toPath();
             }
           }
@@ -393,7 +394,7 @@ public class NodeAgentManager {
         new TarArchiveInputStream(
             new GzipCompressorInputStream(new FileInputStream(filepath.toFile())))) {
       TarArchiveEntry currEntry;
-      while ((currEntry = tarInput.getNextTarEntry()) != null) {
+      while ((currEntry = tarInput.getNextEntry()) != null) {
         if (!currEntry.isFile() || !currEntry.getName().endsWith(NODE_AGENT_INSTALLER_FILE)) {
           continue;
         }
@@ -447,18 +448,14 @@ public class NodeAgentManager {
    * The files may be copied via node agent RPC for upgrade or over SSH/SCP for installation.
    *
    * @param nodeAgent nodeAgent the node agent record.
-   * @param baseTargetDir Optional base directory on the target node. If it is null, the relative
-   *     path is generated.
+   * @param nodeAgentDirPath path to the node agent directory.
    * @return the installer files.
    */
-  public InstallerFiles getInstallerFiles(NodeAgent nodeAgent, @Nullable Path baseTargetDir) {
+  public InstallerFiles getInstallerFiles(NodeAgent nodeAgent, Path nodeAgentDirPath) {
     InstallerFiles.InstallerFilesBuilder builder = InstallerFiles.builder();
     // Package tgz file to be copied.
     Path packagePath = getNodeAgentPackagePath(nodeAgent.getOsType(), nodeAgent.getArchType());
-    Path targetPackagePath = Paths.get("node-agent", "release", "node-agent.tgz");
-    if (baseTargetDir != null) {
-      targetPackagePath = baseTargetDir.resolve(targetPackagePath);
-    }
+    Path targetPackagePath = nodeAgentDirPath.resolve(Paths.get("release", "node-agent.tgz"));
     builder.packagePath(targetPackagePath);
     builder.copyFileInfo(new CopyFileInfo(packagePath, targetPackagePath));
 
@@ -474,10 +471,7 @@ public class NodeAgentManager {
     builder.certDir(targetCertDir);
 
     // Cert file to be copied.
-    Path targetCertDirPath = Paths.get("node-agent", "cert", targetCertDir);
-    if (baseTargetDir != null) {
-      targetCertDirPath = baseTargetDir.resolve(targetCertDirPath);
-    }
+    Path targetCertDirPath = nodeAgentDirPath.resolve(Paths.get("cert", targetCertDir));
     builder.createDir(targetCertDirPath);
     Path caCertPath = certDirPath.resolve(NodeAgent.SERVER_CERT_NAME);
     Path targetCaCertPath = targetCertDirPath.resolve("node_agent.crt");

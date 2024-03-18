@@ -1,4 +1,6 @@
-import { XClusterConfig } from '../dtos';
+import { PitrConfig } from '../../../redesign/helpers/dtos';
+import { XClusterConfigStatus } from '../constants';
+import { XClusterTableDetails } from '../dtos';
 
 /**
  * Models the data object provided from YBA API.
@@ -11,7 +13,25 @@ export interface DrConfig {
   createTime: string;
   modifyTime: string;
   state: DrConfigState;
-  xClusterConfig: XClusterConfig;
+  bootstrapParams: BootstrapParams;
+
+  // Replication Participants
+  drReplicaUniverseActive: boolean;
+  drReplicaUniverseState?: TargetUniverseDrState;
+  drReplicaUniverseUuid?: string;
+  primaryUniverseActive: boolean;
+  primaryUniverseState?: SourceUniverseDrState;
+  primaryUniverseUuid?: string;
+
+  // Replication Fields
+  paused: boolean;
+  pitrConfigs: PitrConfig[];
+  replicationGroupName: string;
+  status: XClusterConfigStatus;
+  tableDetails: XClusterTableDetails[];
+  tables: string[];
+  xclusterConfigUuid: string;
+  xclusterConfigsUuid: string[]; // Internal API field for now.
 }
 
 // ---------------------------------------------------------------------------
@@ -36,7 +56,8 @@ export const DrConfigState = {
   REPLICATING: 'Replicating',
   SWITCHOVER_IN_PROGRESS: 'Switchover in Progress',
   FAILOVER_IN_PROGRESS: 'Failover in Progress',
-  HALTED: 'Halted'
+  HALTED: 'Halted',
+  ERROR: 'Error'
 } as const;
 export type DrConfigState = typeof DrConfigState[keyof typeof DrConfigState];
 
@@ -86,5 +107,13 @@ export interface DrConfigSafetimeResponse {
     safetimeEpochUs: number;
     safetimeLagUs: number;
     safetimeSkewUs: number;
+    estimatedDataLossMs: number;
   }[];
+}
+
+export interface BootstrapParams {
+  backupRequestParams: {
+    storageConfigUUID: string;
+    parallelism?: number;
+  };
 }

@@ -8,12 +8,14 @@ import static com.yugabyte.yw.common.TableManager.CommandSubType.DELETE;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.BACKUP_PREFIX_LENGTH;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.BACKUP_SCRIPT;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.EMR_MULTIPLE;
+import static com.yugabyte.yw.common.backuprestore.BackupUtil.FULL_BACKUP_PREFIX;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.K8S_CERT_PATH;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.REGION_LOCATIONS;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.REGION_NAME;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.TS_FMT_LENGTH;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.UNIV_PREFIX_LENGTH;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.UUID_LENGTH;
+import static com.yugabyte.yw.common.backuprestore.BackupUtil.UUID_WITHOUT_HYPHENS_LENGTH;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.VM_CERT_DIR;
 import static com.yugabyte.yw.common.backuprestore.BackupUtil.YB_CLOUD_COMMAND_TYPE;
 import static com.yugabyte.yw.models.helpers.CustomerConfigConsts.BACKUP_LOCATION_FIELDNAME;
@@ -300,17 +302,16 @@ public class TableManager extends DevopsBase {
         commandArgs.add("--keyspace");
         commandArgs.add(taskParams.getKeyspace());
         BulkImportParams bulkImportParams = (BulkImportParams) taskParams;
-        ReleaseManager.ReleaseMetadata metadata =
-            releaseManager.getReleaseByVersion(userIntent.ybSoftwareVersion);
-        if (metadata == null) {
+        ReleaseContainer release = releaseManager.getReleaseByVersion(userIntent.ybSoftwareVersion);
+        if (release == null) {
           throw new RuntimeException(
               "Unable to fetch yugabyte release for version: " + userIntent.ybSoftwareVersion);
         }
         String ybServerPackage;
         if (arch != null) {
-          ybServerPackage = metadata.getFilePath(arch);
+          ybServerPackage = release.getFilePath(arch);
         } else {
-          ybServerPackage = metadata.getFilePath(region);
+          ybServerPackage = release.getFilePath(region);
         }
         if (bulkImportParams.instanceCount == 0) {
           bulkImportParams.instanceCount = userIntent.numNodes * EMR_MULTIPLE;
@@ -375,14 +376,33 @@ public class TableManager extends DevopsBase {
       // /table-keyspace.table_name.table_uuid
       // After receiving the storageLocation in above format we will be extracting the tsformat
       // timestamp of length 19 by removing "/univ-", "<univ-UUID>", "/backup-".
-      String backupCreationTime =
-          storageLocation
-              .replaceFirst(storageLocationPrefix, "")
-              .substring(
-                  UNIV_PREFIX_LENGTH + UUID_LENGTH + BACKUP_PREFIX_LENGTH,
-                  UNIV_PREFIX_LENGTH + UUID_LENGTH + BACKUP_PREFIX_LENGTH + TS_FMT_LENGTH);
-      long backupCreationTimeMicroUnix =
-          Util.microUnixTimeFromDateString(backupCreationTime, "yyyy-MM-dd'T'HH:mm:ss");
+      String backupCreationTime = null;
+      long backupCreationTimeMicroUnix;
+      int patternCharCount = 0;
+      try {
+        patternCharCount = UNIV_PREFIX_LENGTH + UUID_LENGTH + BACKUP_PREFIX_LENGTH;
+        backupCreationTime =
+            storageLocation
+                .replaceFirst(storageLocationPrefix, "")
+                .substring(patternCharCount, patternCharCount + TS_FMT_LENGTH);
+        backupCreationTimeMicroUnix =
+            Util.microUnixTimeFromDateString(backupCreationTime, "yyyy-MM-dd'T'HH:mm:ss");
+      } catch (ParseException e) {
+        // Try with pattern of backup location
+        // "/univ-", "<univ-UUID>", "/backup-", "<backup-UUID-No-Hyphens>", "/full/"
+        patternCharCount =
+            UNIV_PREFIX_LENGTH
+                + UUID_LENGTH
+                + BACKUP_PREFIX_LENGTH
+                + UUID_WITHOUT_HYPHENS_LENGTH
+                + FULL_BACKUP_PREFIX;
+        backupCreationTime =
+            storageLocation
+                .replaceFirst(storageLocationPrefix, "")
+                .substring(patternCharCount, patternCharCount + TS_FMT_LENGTH);
+        backupCreationTimeMicroUnix =
+            Util.microUnixTimeFromDateString(backupCreationTime, "yyyy-MM-dd'T'HH:mm:ss");
+      }
 
       // Currently, we cannot validate input restoreTimeStamp with the desired backup's restore time
       // lower_bound limit.

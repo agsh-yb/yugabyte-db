@@ -476,6 +476,10 @@ Settings related to managing geo-distributed clusters:
 
 The name of the availability zone, or rack, where this instance is deployed.
 
+{{<tip title="Rack awareness">}}
+For on-premises deployments, consider racks as zones to treat them as fault domains.
+{{</tip>}}
+
 Default: `rack1`
 
 ##### --placement_region
@@ -608,12 +612,12 @@ Deprecated. Use `--ysql_pg_conf_csv` instead.
 
 ##### --ysql_pg_conf_csv
 
-Comma-separated list of PostgreSQL server configuration parameters that is appended to the `postgresql.conf` file.
+Comma-separated list of PostgreSQL server configuration parameters that is appended to the `postgresql.conf` file. If internal quotation marks are required, surround each configuration pair having single quotation marks with double quotation marks.
 
 For example:
 
 ```sh
---ysql_pg_conf_csv="suppress_nonpg_logs=true,log_connections=on"
+--ysql_pg_conf_csv="log_line_prefix='%m [%p %l %c] %q[%C %R %Z %H] [%r %a %u %d] '","pgaudit.log='all, -misc'",pgaudit.log_parameter=on,pgaudit.log_relation=on,pgaudit.log_catalog=off,suppress_nonpg_logs=on
 ```
 
 For information on available PostgreSQL server configuration parameters, refer to [Server Configuration](https://www.postgresql.org/docs/11/runtime-config.html) in the PostgreSQL documentation.
@@ -642,7 +646,7 @@ Any active, idle in transaction, or idle in session connection counts toward the
 
 Some connections are reserved for superusers. The total number of superuser connections is determined by the `superuser_reserved_connections` [PostgreSQL server parameter](#postgresql-server-options). Connections available to non-superusers is equal to `ysql_max_connections` - `superuser_reserved_connections`.
 
-Default: If ysql_max_connections is not set, the database startup process will determine the highest number of connections the system can support, from a minimum of 50 to a maximum of 300 (per node).
+Default: If `ysql_max_connections` is not set, the database startup process will determine the highest number of connections the system can support, from a minimum of 50 to a maximum of 300 (per node).
 
 ##### --ysql_default_transaction_isolation
 
@@ -650,9 +654,9 @@ Specifies the default transaction isolation level.
 
 Valid values: `SERIALIZABLE`, `REPEATABLE READ`, `READ COMMITTED`, and `READ UNCOMMITTED`.
 
-Default: `READ COMMITTED`<sup>$</sup>
+Default: `READ COMMITTED` {{<badge/tp>}}
 
-<sup>$</sup> Read Committed support is currently in [Tech Preview](/preview/releases/versioning/#feature-availability). Read Committed Isolation is supported only if the YB-TServer flag `yb_enable_read_committed_isolation` is set to `true`. By default this flag is `false` and in this case the Read Committed isolation level of the YugabyteDB transactional layer falls back to the stricter Snapshot Isolation (in which case `READ COMMITTED` and `READ UNCOMMITTED` of YSQL also in turn use Snapshot Isolation).
+Read Committed support is currently in [Tech Preview](/preview/releases/versioning/#feature-availability). Read Committed Isolation is supported only if the YB-TServer flag `yb_enable_read_committed_isolation` is set to `true`. By default this flag is `false` and in this case the Read Committed isolation level of the YugabyteDB transactional layer falls back to the stricter Snapshot Isolation (in which case `READ COMMITTED` and `READ UNCOMMITTED` of YSQL also in turn use Snapshot Isolation).
 
 ##### --ysql_disable_index_backfill
 
@@ -875,6 +879,19 @@ When the flag [remote_bootstrap_from_leader_only](#remote-bootstrap-from-leader-
 
 Default: `5`
 
+##### --db_block_cache_num_shard_bits
+
+Number of bits to use for sharding the block cache. The maximum permissible value is 19.
+
+Default: `-1` (indicates a dynamic scheme that evaluates to 4 if number of cores is less than or equal to 16, 5 for 17-32 cores, 6 for 33-64 cores, and so on.)
+
+{{< note title="Note" >}}
+
+Starting from version 2.18, the default is `-1`. Previously it was `4`.
+
+{{< /note >}}
+
+
 ## Network compression flags
 
 Use the following two flags to configure RPC compression:
@@ -1006,7 +1023,7 @@ To specify a _minimum_ TLS version of 1.2, for example, the flag needs to be set
 In addition, as this setting does not propagate to PostgreSQL, it is recommended that you specify the minimum TLS version (`ssl_min_protocol_version`) for PostgreSQL by setting the [`ysql_pg_conf_csv`](#ysql-pg-conf-csv) flag as follows:
 
 ```sh
---ysql_pg_conf_csv="ssl_min_protocol_version=TLSv1.2"
+--ysql_pg_conf_csv="ssl_min_protocol_version='TLSv1.2'"
 ```
 
 ## Packed row flags
@@ -1191,6 +1208,49 @@ Default: `false`
 Use of this flag can potentially result in expiration of live data. Use at your discretion.
 {{< /warning >}}
 
+## Concurrency control flags
+
+To learn about Wait-on-Conflict concurrency control, see [Concurrency control](../../../architecture/transactions/concurrency-control/).
+
+##### --enable_wait_queues
+
+When set to true, enables in-memory wait queues, deadlock detection, and wait-on-conflict semantics in all YSQL traffic.
+
+Default: `true`
+
+##### --disable_deadlock_detection
+
+When set to true, disables deadlock detection. If `enable_wait_queues=false`, this flag has no effect as deadlock detection is not running anyways.
+
+Default: `false`
+
+{{< warning title="Warning">}}
+Use of this flag can potentially result in deadlocks that can't be resolved by YSQL. Use this flag only if the application layer can guarantee deadlock avoidance.
+{{< /warning >}}
+
+##### --wait_queue_poll_interval_ms
+
+If `enable_wait_queues=true`, this controls the rate at which each tablet's wait queue polls transaction coordinators for the status of transactions which are blocking contentious resources.
+
+Default: `100`
+
+## Metric export flags
+
+##### --export_help_and_type_in_prometheus_metrics
+
+YB-TServer metrics are available in Prometheus format at
+`http://localhost:9000/prometheus-metrics`.  This flag controls whether
+#TYPE and #HELP information is included as part of the Prometheus
+metrics output by default.
+
+To override this flag on a per-scrape basis, set the URL parameter
+`show_help` to `true` to include or to `false` to not include type and
+help information.  For example, querying
+`http://localhost:9000/prometheus-metrics?show_help=true` will return
+type and help information regardless of the setting of this flag.
+
+Default: `true`
+
 ## PostgreSQL server options
 
 YugabyteDB uses PostgreSQL server configuration parameters to apply server configuration settings to new server instances.
@@ -1231,6 +1291,20 @@ You can modify these parameters in the following ways:
     SET LOCAL temp_file_limit=-1;
     ```
 
+- To specify the minimum age of a transaction (in seconds) before its locks are included in the results returned from querying the [pg_locks](../../../explore/observability/pg-locks/) view, use [yb_locks_min_txn_age](../../../explore/observability/pg-locks/#yb-locks-min-txn-age):
+
+    ```sql
+    --- To change the minimum transaction age to 5 seconds:
+    SET session yb_locks_min_txn_age = 5000;
+    ```
+
+- To set the maximum number of transactions for which lock information is displayed when you query the [pg_locks](../../../explore/observability/pg-locks/) view, use [yb_locks_max_transactions](../../../explore/observability/pg-locks/#yb-locks-max-transactions):
+
+    ```sql
+    --- To change the maximum number of transactions to display to 10:
+    SET session yb_locks_max_transactions = 10;
+    ```
+
 For information on available PostgreSQL server configuration parameters, refer to [Server Configuration](https://www.postgresql.org/docs/11/runtime-config.html) in the PostgreSQL documentation.
 
 The server configuration parameters for YugabyteDB are the same as for PostgreSQL, with the following exceptions and additions.
@@ -1265,6 +1339,34 @@ You can remove the limit (set the size to unlimited) using `temp_file_limit=-1`.
 Valid values are `-1` (unlimited), `integer` (in kilobytes), `nMB` (in megabytes), and `nGB` (in gigabytes) (where 'n' is an integer).
 
 Default: `1GB`
+
+##### default_transaction_isolation
+
+Specifies the default isolation level of each new transaction. Every transaction has an isolation level of `read uncommitted`, `read committed`, `repeatable read`, or `serializable`.
+
+See [transaction isolation levels](../../../architecture/transactions/isolation-levels) for reference.
+
+Default: `read committed`
+
+## Advanced flags
+
+##### backfill_index_client_rpc_timeout_ms
+
+Timeout (in milliseconds) for the backfill stage of a concurrent CREATE INDEX.
+
+Default: 86400000 (1 day)
+
+##### backfill_index_timeout_grace_margin_ms
+
+The time to exclude from the YB-Master flag [ysql_index_backfill_rpc_timeout_ms](../yb-master/#ysql-index-backfill-rpc-timeout-ms) in order to return results to YB-Master in the specified deadline. Should be set to at least the amount of time each batch would require, and less than `ysql_index_backfill_rpc_timeout_ms`.
+
+Default: -1, where the system automatically calculates the value to be approximately 1 second.
+
+##### backfill_index_write_batch_size
+
+The number of table rows to backfill at a time. In case of [GIN indexes](../../../explore/ysql-language-features/indexes-constraints/gin/), the number can include more index rows.
+
+Default: 128
 
 ## Admin UI
 

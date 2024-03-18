@@ -33,6 +33,7 @@
 #include "yb/tools/yb-admin_client.h"
 
 #include <sstream>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -45,11 +46,13 @@
 #include <gtest/gtest.h>
 
 #include "yb/cdc/cdc_service.h"
+#include "yb/cdc/xcluster_util.h"
 #include "yb/client/client.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/table_alterer.h"
 #include "yb/client/table_info.h"
+#include "yb/client/xcluster_client.h"
 
 #include "yb/common/colocated_util.h"
 #include "yb/common/json_util.h"
@@ -69,11 +72,12 @@
 #include "yb/master/master_client.proxy.h"
 #include "yb/master/master_cluster.proxy.h"
 #include "yb/master/master_ddl.proxy.h"
+#include "yb/master/master_defaults.h"
 #include "yb/master/master_encryption.proxy.h"
 #include "yb/master/master_error.h"
 #include "yb/master/master_replication.proxy.h"
 #include "yb/master/master_test.proxy.h"
-#include "yb/master/master_defaults.h"
+#include "yb/master/master_types.pb.h"
 #include "yb/master/master_util.h"
 #include "yb/master/sys_catalog.h"
 
@@ -81,13 +85,14 @@
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/secure_stream.h"
 
-#include "yb/server/secure.h"
+#include "yb/rpc/secure.h"
 #include "yb/tools/yb-admin_util.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/encryption/encryption_util.h"
 
+#include "yb/util/debug-util.h"
 #include "yb/util/format.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/protobuf_util.h"
@@ -99,17 +104,17 @@
 #include "yb/util/flags.h"
 #include "yb/util/tostring.h"
 
-DEFINE_UNKNOWN_bool(wait_if_no_leader_master, false,
+DEFINE_NON_RUNTIME_bool(wait_if_no_leader_master, false,
             "When yb-admin connects to the cluster and no leader master is present, "
             "this flag determines if yb-admin should wait for the entire duration of timeout or"
             "in case a leader master appears in that duration or return error immediately.");
 
-DEFINE_UNKNOWN_string(certs_dir_name, "",
+DEFINE_NON_RUNTIME_string(certs_dir_name, "",
               "Directory with certificates to use for secure server connection.");
 
-DEFINE_UNKNOWN_string(client_node_name, "", "Client node name.");
+DEFINE_NON_RUNTIME_string(client_node_name, "", "Client node name.");
 
-DEFINE_UNKNOWN_bool(disable_graceful_transition, false,
+DEFINE_NON_RUNTIME_bool(disable_graceful_transition, false,
     "During a leader stepdown, disable graceful leadership transfer "
     "to an up to date peer");
 
@@ -159,13 +164,13 @@ using consensus::RaftPeerPB;
 using consensus::RunLeaderElectionRequestPB;
 using consensus::RunLeaderElectionResponsePB;
 
+using master::AbortSnapshotRestoreRequestPB;
+using master::AbortSnapshotRestoreResponsePB;
 using master::BackupRowEntryPB;
 using master::CreateSnapshotRequestPB;
 using master::CreateSnapshotResponsePB;
 using master::DeleteSnapshotRequestPB;
 using master::DeleteSnapshotResponsePB;
-using master::AbortSnapshotRestoreRequestPB;
-using master::AbortSnapshotRestoreResponsePB;
 using master::IdPairPB;
 using master::ImportSnapshotMetaRequestPB;
 using master::ImportSnapshotMetaResponsePB;
@@ -610,9 +615,9 @@ Status ClusterAdminClient::Init() {
   if (!FLAGS_certs_dir_name.empty()) {
     LOG(INFO) << "Built secure client using certs dir " << FLAGS_certs_dir_name;
     const auto& cert_name = FLAGS_client_node_name;
-    secure_context_ = VERIFY_RESULT(server::CreateSecureContext(
-        FLAGS_certs_dir_name, server::UseClientCerts(!cert_name.empty()), cert_name));
-    server::ApplySecureContext(secure_context_.get(), &messenger_builder);
+    secure_context_ = VERIFY_RESULT(rpc::CreateSecureContext(
+        FLAGS_certs_dir_name, rpc::UseClientCerts(!cert_name.empty()), cert_name));
+    rpc::ApplySecureContext(secure_context_.get(), &messenger_builder);
   }
 
   messenger_ = VERIFY_RESULT(messenger_builder.Build());
@@ -778,6 +783,22 @@ Status ClusterAdminClient::GetWalRetentionSecs(const YBTableName& table_name) {
   return Status::OK();
 }
 
+Status ClusterAdminClient::GetAutoFlagsConfig() {
+  master::GetAutoFlagsConfigRequestPB req;
+  master::GetAutoFlagsConfigResponsePB resp;
+  rpc::RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(master_cluster_proxy_->GetAutoFlagsConfig(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  std::cout << "AutoFlags config:" << std::endl;
+  std::cout << resp.config().DebugString() << std::endl;
+
+  return Status::OK();
+}
+
 Status ClusterAdminClient::PromoteAutoFlags(
     const string& max_flag_class, const bool promote_non_runtime_flags, const bool force) {
   master::PromoteAutoFlagsRequestPB req;
@@ -849,10 +870,10 @@ Status ClusterAdminClient::PromoteSingleAutoFlag(
      return StatusFromPB(resp.error().status());
     }
     if (!resp.flag_promoted()) {
-     std::cout << "AutoFlag " << flag_name << " from process " << process_name
-               << " was not promoted. Check the logs for more information" << std::endl;
-     std::cout << "Current config version: " << resp.new_config_version() << std::endl;
-     return Status::OK();
+      std::cout << "Failed to promote AutoFlag " << flag_name << " from process " << process_name
+                << ". Check the logs for more information" << std::endl;
+      std::cout << "Current config version: " << resp.new_config_version() << std::endl;
+      return Status::OK();
     }
 
     std::cout << "AutoFlag " << flag_name << " from process " << process_name
@@ -880,11 +901,10 @@ Status ClusterAdminClient::DemoteSingleAutoFlag(
      return StatusFromPB(resp.error().status());
     }
     if (!resp.flag_demoted()) {
-     std::cout << "AutoFlag " << flag_name << " from process " << process_name
-               << " was not demoted. Either the flag does not exist or it is not promoted"
-               << std::endl;
-     std::cout << "Current config version: " << resp.new_config_version() << std::endl;
-     return Status::OK();
+      std::cout << "Unable to demote AutoFlag " << flag_name << " from process " << process_name
+                << " because the flag is not in promoted state" << std::endl;
+      std::cout << "Current config version: " << resp.new_config_version() << std::endl;
+      return Status::OK();
     }
 
     std::cout << "AutoFlag " << flag_name << " from process " << process_name
@@ -1673,9 +1693,9 @@ Status ClusterAdminClient::DeleteIndexById(const TableId& table_id) {
   return Status::OK();
 }
 
-Status ClusterAdminClient::ListAllNamespaces() {
+Status ClusterAdminClient::ListAllNamespaces(bool include_nonrunning) {
   cout << "name | UUID | language | state | colocated" << endl << endl;
-  const auto namespaces = VERIFY_RESULT_REF(GetNamespaceMap());
+  const auto namespaces = VERIFY_RESULT_REF(GetNamespaceMap(include_nonrunning));
   const auto list_namespaces = [&] (bool for_system_namespace) -> void {
     cout << (for_system_namespace ? "System Namespaces:" : "User Namespaces:") << endl;
     for (const auto& namespace_info_pair : namespaces) {
@@ -2332,7 +2352,7 @@ Status ClusterAdminClient::ChangeBlacklist(const std::vector<HostPort>& servers,
 
 Result<const master::NamespaceIdentifierPB&> ClusterAdminClient::GetNamespaceInfo(
     YQLDatabase db_type, const std::string& namespace_name) {
-  LOG(INFO) << Format(
+  VLOG(1) << Format(
       "Resolving namespace id for '$0' of type '$1'", namespace_name, DatabasePrefix(db_type));
   for (const auto& item : VERIFY_RESULT_REF(GetNamespaceMap())) {
     const auto& namespace_info = item.second;
@@ -2434,9 +2454,11 @@ Result<Response> ClusterAdminClient::InvokeRpc(
       VERIFY_RESULT(InvokeRpcNoResponseCheck(func, obj, req, error_message, timeout)));
 }
 
-Result<const ClusterAdminClient::NamespaceMap&> ClusterAdminClient::GetNamespaceMap() {
+Result<const ClusterAdminClient::NamespaceMap&> ClusterAdminClient::GetNamespaceMap(
+    bool include_nonrunning) {
   if (namespace_map_.empty()) {
-    auto v = VERIFY_RESULT(yb_client_->ListNamespaces());
+    auto v = VERIFY_RESULT(
+        yb_client_->ListNamespaces(client::IncludeNonrunningNamespaces(include_nonrunning)));
     for (auto& ns : v) {
       auto ns_id = ns.id.id();
       namespace_map_.emplace(std::move(ns_id), std::move(ns));
@@ -2821,17 +2843,17 @@ Result<rapidjson::Document> ClusterAdminClient::RestoreSnapshotSchedule(
 
   Status s = master_backup_proxy_->RestoreSnapshotSchedule(req, &resp, &rpc);
   if (!s.ok()) {
-        if (s.IsRemoteError() &&
-            rpc.error_response()->code() == rpc::ErrorStatusPB::ERROR_NO_SUCH_METHOD) {
+    if (s.IsRemoteError() &&
+        rpc.error_response()->code() == rpc::ErrorStatusPB::ERROR_NO_SUCH_METHOD) {
       cout << "WARNING: fallback to RestoreSnapshotScheduleDeprecated." << endl;
       return RestoreSnapshotScheduleDeprecated(schedule_id, restore_at);
-        }
-        RETURN_NOT_OK_PREPEND(
-            s, Format("Failed to restore snapshot from schedule: $0", schedule_id.ToString()));
+    }
+    RETURN_NOT_OK_PREPEND(
+        s, Format("Failed to restore snapshot from schedule: $0", schedule_id.ToString()));
   }
 
   if (resp.has_error()) {
-        return StatusFromPB(resp.error().status());
+    return StatusFromPB(resp.error().status());
   }
 
   auto snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(resp.snapshot_id()));
@@ -2843,6 +2865,68 @@ Result<rapidjson::Document> ClusterAdminClient::RestoreSnapshotSchedule(
   AddStringField("snapshot_id", snapshot_id.ToString(), &document, &document.GetAllocator());
   AddStringField("restoration_id", restoration_id.ToString(), &document, &document.GetAllocator());
 
+  return document;
+}
+
+Result<rapidjson::Document> ClusterAdminClient::CloneNamespace(
+    const TypedNamespaceName& source_namespace, const string& target_namespace_name,
+    HybridTime restore_at) {
+  auto deadline = CoarseMonoClock::now() + timeout_;
+
+  RpcController rpc;
+  rpc.set_deadline(deadline);
+  master::CloneNamespaceRequestPB req;
+  master::CloneNamespaceResponsePB resp;
+  master::NamespaceIdentifierPB source_namespace_identifier;
+  source_namespace_identifier.set_name(source_namespace.name);
+  source_namespace_identifier.set_database_type(source_namespace.db_type);
+  *req.mutable_source_namespace() = source_namespace_identifier;
+  req.set_target_namespace_name(target_namespace_name);
+  req.set_restore_ht(restore_at.ToUint64());
+
+  Status s = master_backup_proxy_->CloneNamespace(req, &resp, &rpc);
+  if (!s.ok()) {
+    RETURN_NOT_OK_PREPEND(
+        s, Format("Failed to clone namespace $0", source_namespace.name));
+  }
+
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  rapidjson::Document document;
+  document.SetObject();
+  AddStringField(
+      "source_namespace_id", resp.source_namespace_id(), &document, &document.GetAllocator());
+  AddStringField("seq_no", std::to_string(resp.seq_no()), &document, &document.GetAllocator());
+  return document;
+}
+
+Result<rapidjson::Document> ClusterAdminClient::IsCloneDone(
+    const NamespaceId& source_namespace_id, uint32_t seq_no) {
+  auto deadline = CoarseMonoClock::now() + timeout_;
+
+  RpcController rpc;
+  rpc.set_deadline(deadline);
+  master::IsCloneDoneRequestPB req;
+  master::IsCloneDoneResponsePB resp;
+  req.set_source_namespace_id(source_namespace_id);
+  req.set_seq_no(seq_no);
+
+  Status s = master_backup_proxy_->IsCloneDone(req, &resp, &rpc);
+  if (!s.ok()) {
+    RETURN_NOT_OK_PREPEND(
+        s, Format("Failed to get clone status for namespace $0 and seq_no $1", source_namespace_id,
+        seq_no));
+  }
+
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  rapidjson::Document document;
+  document.SetObject();
+  AddStringField("is_done", resp.is_done() ? "true" : "false", &document, &document.GetAllocator());
   return document;
 }
 
@@ -3729,7 +3813,8 @@ Status ClusterAdminClient::WriteUniverseKeyToFile(
 
 Status ClusterAdminClient::CreateCDCSDKDBStream(
     const TypedNamespaceName& ns, const std::string& checkpoint_type,
-    const std::string& record_type) {
+    const cdc::CDCRecordType record_type,
+    const std::string& consistent_snapshot_option) {
   HostPort ts_addr = VERIFY_RESULT(GetFirstRpcAddressForTS());
   auto cdc_proxy = std::make_unique<cdc::CDCServiceProxy>(proxy_cache_.get(), ts_addr);
 
@@ -3738,15 +3823,7 @@ Status ClusterAdminClient::CreateCDCSDKDBStream(
 
   req.set_namespace_name(ns.name);
   req.set_db_type(ns.db_type);
-  if (record_type == yb::ToString("ALL")) {
-    req.set_record_type(cdc::CDCRecordType::ALL);
-  } else if (record_type == yb::ToString("FULL_ROW_NEW_IMAGE")) {
-    req.set_record_type(cdc::CDCRecordType::FULL_ROW_NEW_IMAGE);
-  } else if (record_type == yb::ToString("MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES")) {
-    req.set_record_type(cdc::CDCRecordType::MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES);
-  } else {
-    req.set_record_type(cdc::CDCRecordType::CHANGE);
-  }
+  req.set_record_type(record_type);
 
   req.set_record_format(cdc::CDCRecordFormat::PROTO);
   req.set_source_type(cdc::CDCRequestSource::CDCSDK);
@@ -3754,6 +3831,12 @@ Status ClusterAdminClient::CreateCDCSDKDBStream(
         req.set_checkpoint_type(cdc::CDCCheckpointType::EXPLICIT);
   } else {
         req.set_checkpoint_type(cdc::CDCCheckpointType::IMPLICIT);
+  }
+
+  if (consistent_snapshot_option == "USE_SNAPSHOT") {
+    req.set_cdcsdk_consistent_snapshot_option(CDCSDKSnapshotOption::USE_SNAPSHOT);
+  } else {
+    req.set_cdcsdk_consistent_snapshot_option(CDCSDKSnapshotOption::NOEXPORT_SNAPSHOT);
   }
 
   RpcController rpc;
@@ -3903,10 +3986,31 @@ Status ClusterAdminClient::GetCDCDBStreamInfo(const std::string& db_stream_id) {
   return Status::OK();
 }
 
+Status ClusterAdminClient::YsqlBackfillReplicationSlotNameToCDCSDKStream(
+    const std::string& stream_id, const std::string& replication_slot_name) {
+  master::YsqlBackfillReplicationSlotNameToCDCSDKStreamRequestPB req;
+  master::YsqlBackfillReplicationSlotNameToCDCSDKStreamResponsePB resp;
+  req.set_stream_id(stream_id);
+  req.set_cdcsdk_ysql_replication_slot_name(replication_slot_name);
+
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(
+      master_replication_proxy_->YsqlBackfillReplicationSlotNameToCDCSDKStream(req, &resp, &rpc));
+
+  if (resp.has_error()) {
+        cout << "Error CDC stream with replication slot: " << resp.error().status().message()
+             << endl;
+        return StatusFromPB(resp.error().status());
+  }
+
+  return Status::OK();
+}
+
 Status ClusterAdminClient::WaitForSetupUniverseReplicationToFinish(
     const string& replication_group_id) {
   master::IsSetupUniverseReplicationDoneRequestPB req;
-  req.set_producer_id(replication_group_id);
+  req.set_replication_group_id(replication_group_id);
   for (;;) {
         master::IsSetupUniverseReplicationDoneResponsePB resp;
         RpcController rpc;
@@ -4039,7 +4143,7 @@ Status ClusterAdminClient::SetupUniverseReplication(
     bool transactional) {
   master::SetupUniverseReplicationRequestPB req;
   master::SetupUniverseReplicationResponsePB resp;
-  req.set_producer_id(replication_group_id);
+  req.set_replication_group_id(replication_group_id);
   req.set_transactional(transactional);
 
   req.mutable_producer_master_addresses()->Reserve(narrow_cast<int>(producer_addresses.size()));
@@ -4084,10 +4188,10 @@ Status ClusterAdminClient::SetupUniverseReplication(
 }
 
 Status ClusterAdminClient::DeleteUniverseReplication(
-    const std::string& producer_id, bool ignore_errors) {
+    const std::string& replication_group_id, bool ignore_errors) {
   master::DeleteUniverseReplicationRequestPB req;
   master::DeleteUniverseReplicationResponsePB resp;
-  req.set_producer_id(producer_id);
+  req.set_replication_group_id(replication_group_id);
   req.set_ignore_errors(ignore_errors);
 
   RpcController rpc;
@@ -4112,16 +4216,13 @@ Status ClusterAdminClient::DeleteUniverseReplication(
 }
 
 Status ClusterAdminClient::AlterUniverseReplication(
-    const std::string& replication_group_id,
-    const std::vector<std::string>& producer_addresses,
-    const std::vector<TableId>& add_tables,
-    const std::vector<TableId>& remove_tables,
+    const std::string& replication_group_id, const std::vector<std::string>& producer_addresses,
+    const std::vector<TableId>& add_tables, const std::vector<TableId>& remove_tables,
     const std::vector<std::string>& producer_bootstrap_ids_to_add,
-    const std::string& new_producer_universe_id,
-    bool remove_table_ignore_errors) {
+    const std::string& new_replication_group_id, bool remove_table_ignore_errors) {
   master::AlterUniverseReplicationRequestPB req;
   master::AlterUniverseReplicationResponsePB resp;
-  req.set_producer_id(replication_group_id);
+  req.set_replication_group_id(replication_group_id);
   req.set_remove_table_ignore_errors(remove_table_ignore_errors);
 
   if (!producer_addresses.empty()) {
@@ -4163,8 +4264,8 @@ Status ClusterAdminClient::AlterUniverseReplication(
         }
   }
 
-  if (!new_producer_universe_id.empty()) {
-        req.set_new_producer_universe_id(new_producer_universe_id);
+  if (!new_replication_group_id.empty()) {
+    req.set_new_replication_group_id(new_replication_group_id);
   }
 
   RpcController rpc;
@@ -4180,7 +4281,8 @@ Status ClusterAdminClient::AlterUniverseReplication(
         // If we are adding tables, then wait for the altered producer to be deleted (this happens
         // once it is merged with the original).
         RETURN_NOT_OK(WaitForSetupUniverseReplicationToFinish(
-            cdc::GetAlterReplicationGroupId(replication_group_id).ToString()));
+            xcluster::GetAlterReplicationGroupId(xcluster::ReplicationGroupId(replication_group_id))
+                .ToString()));
   }
 
   cout << "Replication altered successfully" << endl;
@@ -4206,10 +4308,10 @@ Status ClusterAdminClient::ChangeXClusterRole(cdc::XClusterRole role) {
 }
 
 Status ClusterAdminClient::SetUniverseReplicationEnabled(
-    const std::string& producer_id, bool is_enabled) {
+    const std::string& replication_group_id, bool is_enabled) {
   master::SetUniverseReplicationEnabledRequestPB req;
   master::SetUniverseReplicationEnabledResponsePB resp;
-  req.set_producer_id(producer_id);
+  req.set_replication_group_id(replication_group_id);
   req.set_is_enabled(is_enabled);
   const string toggle = (is_enabled ? "enabl" : "disabl");
 
@@ -4354,7 +4456,7 @@ Status ClusterAdminClient::SetupNSUniverseReplication(
 
   master::SetupNSUniverseReplicationRequestPB req;
   master::SetupNSUniverseReplicationResponsePB resp;
-  req.set_producer_id(replication_group_id);
+  req.set_replication_group_id(replication_group_id);
   req.set_producer_ns_name(producer_namespace.name);
   req.set_producer_ns_type(producer_namespace.db_type);
 
@@ -4378,12 +4480,12 @@ Status ClusterAdminClient::SetupNSUniverseReplication(
   return Status::OK();
 }
 
-Status ClusterAdminClient::GetReplicationInfo(const std::string& universe_uuid) {
+Status ClusterAdminClient::GetReplicationInfo(const std::string& replication_group_id) {
   master::GetReplicationStatusRequestPB req;
   master::GetReplicationStatusResponsePB resp;
 
-  if (!universe_uuid.empty()) {
-        req.set_universe_id(universe_uuid);
+  if (!replication_group_id.empty()) {
+        req.set_replication_group_id(replication_group_id);
   }
 
   RpcController rpc;
@@ -4442,6 +4544,58 @@ Result<rapidjson::Document> ClusterAdminClient::GetXClusterSafeTime(bool include
   }
 
   return document;
+}
+
+Result<std::vector<NamespaceId>> ClusterAdminClient::CheckpointXClusterReplication(
+    const xcluster::ReplicationGroupId& replication_group_id,
+    const std::vector<NamespaceName> databases) {
+  SCHECK(!replication_group_id.empty(), InvalidArgument, "Replication group id is empty");
+
+  return XClusterClient().XClusterCreateOutboundReplicationGroup(replication_group_id, databases);
+}
+
+Result<bool> ClusterAdminClient::IsXClusterBootstrapRequired(
+    const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId namespace_id) {
+  SCHECK(!replication_group_id.empty(), InvalidArgument, "Replication group id is empty");
+
+  auto deadline = CoarseMonoClock::now() + timeout_;
+  auto promise = std::promise<Result<bool>>();
+  RETURN_NOT_OK(XClusterClient().IsXClusterBootstrapRequired(
+      deadline, replication_group_id, namespace_id,
+      [&promise](Result<bool> result) { promise.set_value(std::move(result)); }));
+  return promise.get_future().get();
+}
+
+Status ClusterAdminClient::CreateXClusterReplication(
+    const xcluster::ReplicationGroupId& replication_group_id,
+    const std::string& target_master_addresses) {
+  return XClusterClient().CreateXClusterReplication(replication_group_id, target_master_addresses);
+}
+
+Status ClusterAdminClient::WaitForCreateXClusterReplication(
+    const xcluster::ReplicationGroupId& replication_group_id,
+    const std::string& target_master_addresses) {
+  SCHECK(!replication_group_id.empty(), InvalidArgument, "Replication group id is empty");
+
+  for (;;) {
+    if (VERIFY_RESULT(XClusterClient().IsCreateXClusterReplicationDone(
+            replication_group_id, target_master_addresses))) {
+      return Status::OK();
+    }
+
+    std::this_thread::sleep_for(100ms);
+  }
+}
+
+Status ClusterAdminClient::DeleteXClusterOutboundReplicationGroup(
+    const xcluster::ReplicationGroupId& replication_group_id) {
+  SCHECK(!replication_group_id.empty(), InvalidArgument, "Replication group id is empty");
+
+  return XClusterClient().XClusterDeleteOutboundReplicationGroup(replication_group_id);
+}
+
+client::XClusterClient ClusterAdminClient::XClusterClient() {
+  return client::XClusterClient(*yb_client_);
 }
 
 string RightPadToUuidWidth(const string &s) {

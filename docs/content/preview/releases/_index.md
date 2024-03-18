@@ -1,8 +1,8 @@
 ---
-title: YugabyteDB releases
+title: Releases in YugabyteDB
 headerTitle: Releases
 linkTitle: Releases
-description: An overview of the preview and current stable YugabyteDB database releases, and upcoming releases.
+description: Release support policy, versioning, and feature availability for YugabyteDB.
 image: /images/section_icons/index/quick_start.png
 aliases:
   - /preview/releases/releases-overview/
@@ -23,7 +23,7 @@ This section describes the release support policy, versioning, and feature avail
 
 <ul class="nav yb-pills">
   <li>
-    <a href="release-notes/">
+    <a href="ybdb-releases/">
         <img src="/icons/database.svg" alt="Server Icon"><span>YugabyteDB -></span>
     </a>
   </li>
@@ -70,7 +70,7 @@ For information on key features planned for the upcoming releases, visit [Curren
 
 | Release series | Planned release |
 | :------------- | :-------------- |
-| v2.20 (LTS)    | Late 2023       |
+| Next STS    | Mid 2024       |
 
 ## Recommended release series for projects
 
@@ -78,7 +78,7 @@ To ensure that your production go-live uses the most up-to-date stable release, 
 
 | Production go-live | Recommended release series |
 | :----------------- | :------------------------- |
-| Less than 3 months | [{{<yb-version version="stable" format="displayName">}}](release-notes/{{<yb-version version="stable" format="series">}}/) |
-| More than 3 months | [{{<yb-version version="preview" format="displayName">}}](release-notes/{{<yb-version version="preview" format="series">}}/) |
+| Less than 3 months | [{{<yb-version version="stable" format="displayName">}}](ybdb-releases/{{<yb-version version="stable" format="series">}}/) |
+| More than 3 months | [{{<yb-version version="preview" format="displayName">}}](ybdb-releases/{{<yb-version version="preview" format="series">}}/) |
 
 If your production go-live is more than three months from now, start your development and testing with the preview release series. By the time your production is ready to go live, the current stable release series (which is based on the preview release series you used for development and testing) will be available. By following this guideline, you ensure that your application is developed with the latest available features, enhancements, and fixes.

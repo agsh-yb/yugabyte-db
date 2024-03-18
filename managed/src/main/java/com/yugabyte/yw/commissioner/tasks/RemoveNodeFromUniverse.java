@@ -10,21 +10,15 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.NodeActionType;
-import com.yugabyte.yw.common.NodeUIApiHelper;
 import com.yugabyte.yw.common.PlacementInfoUtil;
-import com.yugabyte.yw.common.RetryTaskUntilCondition;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
-import com.yugabyte.yw.common.nodeui.DumpEntitiesResponse;
 import com.yugabyte.yw.forms.NodeActionFormData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
@@ -39,12 +33,10 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.util.TabletServerInfo;
-import play.libs.Json;
 
 // Allows the removal of a node from a universe. Ensures the task waits for the right set of
 // server data move primitives. And stops using the underlying instance, though YW still owns it.
@@ -53,15 +45,11 @@ import play.libs.Json;
 @Retryable
 public class RemoveNodeFromUniverse extends UniverseDefinitionTaskBase {
 
-  private final ApiHelper apiHelper;
-
   public static final String DUMP_ENTITIES_URL_SUFFIX = "/dump-entities";
 
   @Inject
-  protected RemoveNodeFromUniverse(
-      BaseTaskDependencies baseTaskDependencies, NodeUIApiHelper apiHelper) {
+  protected RemoveNodeFromUniverse(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.apiHelper = apiHelper;
   }
 
   @Override
@@ -78,22 +66,52 @@ public class RemoveNodeFromUniverse extends UniverseDefinitionTaskBase {
     return null;
   }
 
+  private void runBasicChecks(Universe universe) {
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+
+    if (isFirstTry()) {
+      currentNode.validateActionOnState(NodeActionType.REMOVE);
+    }
+  }
+
+  @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    runBasicChecks(getUniverse());
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    // Check again after locking.
+    runBasicChecks(getUniverse());
+    boolean alwaysWaitForDataMove =
+        confGetter.getConfForScope(getUniverse(), UniverseConfKeys.alwaysWaitForDataMove);
+    if (alwaysWaitForDataMove) {
+      performPrecheck();
+    }
+    addBasicPrecheckTasks();
+  }
+
   @Override
   public void run() {
-    try {
-      checkUniverseVersion();
-      boolean alwaysWaitForDataMove =
-          confGetter.getConfForScope(getUniverse(), UniverseConfKeys.alwaysWaitForDataMove);
+    log.info(
+        "Started {} task for node {} in univ uuid={}",
+        getName(),
+        taskParams().nodeName,
+        taskParams().getUniverseUUID());
+    checkUniverseVersion();
+    boolean alwaysWaitForDataMove =
+        confGetter.getConfForScope(getUniverse(), UniverseConfKeys.alwaysWaitForDataMove);
 
-      lockUniverseForFreezeAndUpdate(taskParams().expectedUniverseVersion);
-
-      if (alwaysWaitForDataMove) {
-        performPrecheck();
-      }
-
-      Consumer<Universe> universeFreezeConsumer =
-          u -> {
-            if (isFirstTry()) {
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(
+            taskParams().expectedUniverseVersion,
+            u -> {
               NodeDetails node = u.getNode(taskParams().nodeName);
               if (node == null) {
                 String msg =
@@ -108,38 +126,15 @@ public class RemoveNodeFromUniverse extends UniverseDefinitionTaskBase {
                 }
                 node.masterState = MasterState.ToStop;
               }
-            }
-          };
-
-      Universe universe = freezeUniverse(universeFreezeConsumer);
-
-      log.info(
-          "Started {} task for node {} in univ uuid={}",
-          getName(),
-          taskParams().nodeName,
-          taskParams().getUniverseUUID());
-      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
-      if (currentNode == null) {
-        String msg =
-            "No node " + taskParams().nodeName + " found in universe " + universe.getName();
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
-      if (isFirstTry()) {
-        currentNode.validateActionOnState(NodeActionType.REMOVE);
-      }
-
+            });
+    try {
       preTaskActions();
-
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
       taskParams().azUuid = currentNode.azUuid;
       taskParams().placementUuid = currentNode.placementUuid;
 
       Cluster currCluster =
           universe.getUniverseDetails().getClusterByUuid(taskParams().placementUuid);
-      UserIntent userIntent = currCluster.userIntent;
-      PlacementInfo pi = currCluster.placementInfo;
-
       boolean masterReachable = false;
       // Update Node State to being removed.
       createSetNodeStateTask(currentNode, NodeState.Removing)
@@ -179,7 +174,8 @@ public class RemoveNodeFromUniverse extends UniverseDefinitionTaskBase {
           universe,
           currentNode,
           () -> findNewMasterIfApplicable(universe, currentNode),
-          masterReachable);
+          masterReachable,
+          true /* ignore stop error */);
 
       // Update the DNS entry for this universe.
       createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, universe)
@@ -298,39 +294,5 @@ public class RemoveNodeFromUniverse extends UniverseDefinitionTaskBase {
       }
     }
     log.debug("Pre-check succeeded");
-  }
-
-  private Set<String> getTserverTablets(Universe universe, NodeDetails currentNode) {
-    // Wait for a maximum of 10 seconds for url to succeed.
-    NodeDetails masterLeaderNode = universe.getMasterLeaderNode();
-    HostAndPort masterLeaderHostPort =
-        HostAndPort.fromParts(
-            masterLeaderNode.cloudInfo.private_ip, masterLeaderNode.masterHttpPort);
-    String masterLeaderUrl =
-        String.format("http://%s%s", masterLeaderHostPort.toString(), DUMP_ENTITIES_URL_SUFFIX);
-
-    RetryTaskUntilCondition<DumpEntitiesResponse> waitForCheck =
-        new RetryTaskUntilCondition<>(
-            () -> {
-              log.debug("Making url request to endpoint: {}", masterLeaderUrl);
-              JsonNode masterLeaderDumpJson = apiHelper.getRequest(masterLeaderUrl);
-              DumpEntitiesResponse dumpEntities =
-                  Json.fromJson(masterLeaderDumpJson, DumpEntitiesResponse.class);
-              return dumpEntities;
-            },
-            (d) -> {
-              if (d.getError() != null) {
-                log.warn("Url request to {} failed with error {}", masterLeaderUrl, d.getError());
-                return false;
-              }
-              return true;
-            });
-
-    DumpEntitiesResponse dumpEntitiesResponse = waitForCheck.retryWithBackoff(1, 2, 10);
-
-    HostAndPort currentNodeHP =
-        HostAndPort.fromParts(currentNode.cloudInfo.private_ip, currentNode.tserverRpcPort);
-
-    return dumpEntitiesResponse.getTabletsByTserverAddress(currentNodeHP);
   }
 }

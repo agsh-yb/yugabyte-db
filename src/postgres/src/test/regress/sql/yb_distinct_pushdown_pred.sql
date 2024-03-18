@@ -193,6 +193,7 @@ SELECT DISTINCT r1 FROM th;
 -- Avoid classifying hash columns as sortable.
 -- Guard rails meant to prevent DISTINCT logic from
 -- marking hash columns as sortable.
+SET yb_explain_hide_non_deterministic_fields = true;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT DISTINCT h1 FROM th ORDER BY h1;
 SELECT DISTINCT h1 FROM th ORDER BY h1;
 -- Once all the hash columns are set, range columns are returned in sorted order as usual.
@@ -298,3 +299,12 @@ SELECT DISTINCT r1 FROM t t1 JOIN t t2 USING (r1, r2);
 SELECT DISTINCT r1 FROM t t1 JOIN t t2 USING (r1) WHERE t2.r1 = 1 AND t2.r2 = 1 AND t2.r3 = 1;
 
 DROP TABLE t;
+
+CREATE TABLE sample(a int, b int, primary key(a asc, b asc));
+INSERT INTO sample VALUES (1,1), (1,2);
+DELETE FROM sample where b = 1;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT DISTINCT a FROM sample WHERE a > 0;
+SELECT DISTINCT a FROM sample WHERE a > 0;
+
+DROP TABLE sample;

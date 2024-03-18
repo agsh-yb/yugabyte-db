@@ -37,10 +37,10 @@
 #include <memory>
 #include <vector>
 
+#include "yb/master/master_auto_flags_manager.h"
 #include "yb/util/logging.h"
 
-#include "yb/client/auto_flags_manager.h"
-#include "yb/client/async_initializer.h"
+#include "yb/server/async_client_initializer.h"
 #include "yb/client/client.h"
 
 #include "yb/common/pg_catversions.h"
@@ -50,13 +50,11 @@
 
 #include "yb/gutil/bind.h"
 
-#include "yb/master/auto_flags_orchestrator.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/flush_manager.h"
 #include "yb/master/master-path-handlers.h"
 #include "yb/master/master_backup.service.h"
-#include "yb/master/master_backup_service.h"
 #include "yb/master/master_cluster.proxy.h"
 #include "yb/master/master_service.h"
 #include "yb/master/master_tablet_service.h"
@@ -72,7 +70,7 @@
 #include "yb/rpc/yb_rpc.h"
 
 #include "yb/server/rpc_server.h"
-#include "yb/server/secure.h"
+#include "yb/rpc/secure.h"
 #include "yb/server/hybrid_clock.h"
 
 
@@ -105,7 +103,7 @@ DEFINE_NON_RUNTIME_int32(master_backup_svc_queue_length, 50,
              "RPC queue length for master backup service");
 TAG_FLAG(master_backup_svc_queue_length, advanced);
 
-DECLARE_string(cert_node_filename);
+DECLARE_bool(master_join_existing_universe);
 
 METRIC_DEFINE_entity(cluster);
 
@@ -165,12 +163,14 @@ namespace master {
 Master::Master(const MasterOptions& opts)
     : DbServerBase("Master", opts, "yb.master", server::CreateMemTrackerForServer()),
       state_(kStopped),
-      auto_flags_manager_(new AutoFlagsManager("yb-master", fs_manager_.get())),
       ts_manager_(new TSManager()),
       catalog_manager_(new CatalogManager(this)),
+      auto_flags_manager_(
+          new MasterAutoFlagsManager(clock(), fs_manager_.get(), catalog_manager_impl())),
       ysql_backends_manager_(new YsqlBackendsManager(this, catalog_manager_->AsyncTaskPool())),
       path_handlers_(new MasterPathHandlers(this)),
       flush_manager_(new FlushManager(this, catalog_manager())),
+      tablet_health_manager_(new TabletHealthManager(this, catalog_manager())),
       test_async_rpc_manager_(new TestAsyncRpcManager(this, catalog_manager())),
       init_future_(init_status_.get_future()),
       opts_(opts),
@@ -213,7 +213,7 @@ Status Master::Init() {
     shared_object().SetHostEndpoint(bound_addresses.front(), get_hostname());
   }
 
-  cdc_state_client_init_ = std::make_unique<client::AsyncClientInitialiser>(
+  cdc_state_client_init_ = std::make_unique<client::AsyncClientInitializer>(
       "cdc_state_client",
       default_client_timeout(),
       "" /* tserver_uuid */,
@@ -234,18 +234,16 @@ Status Master::Init() {
 }
 
 Status Master::InitAutoFlags() {
-  if (!VERIFY_RESULT(auto_flags_manager_->LoadFromFile())) {
-    if (fs_manager_->LookupTablet(kSysCatalogTabletId)) {
-      // Pre-existing cluster
-      RETURN_NOT_OK(CreateEmptyAutoFlagsConfig(auto_flags_manager_.get()));
-    } else if (!opts().AreMasterAddressesProvided()) {
-      // New master in Shell mode
-      LOG(INFO) << "AutoFlags initialization delayed as master is in Shell mode.";
-    } else {
-      // New cluster
-      RETURN_NOT_OK(CreateAutoFlagsConfigForNewCluster(auto_flags_manager_.get()));
-    }
-  }
+  // Will we be in shell mode if we dont have a sys catalog yet?
+  bool is_shell_mode_if_new =
+      FLAGS_master_join_existing_universe || !opts().AreMasterAddressesProvided();
+
+  RETURN_NOT_OK(auto_flags_manager_->Init(
+      options_.HostsString(),
+      [this]() {
+        return fs_manager_->LookupTablet(kSysCatalogTabletId);
+      } /* has_sys_catalog_func */,
+      is_shell_mode_if_new));
 
   return RpcAndWebServerBase::InitAutoFlags();
 }
@@ -259,8 +257,7 @@ Status Master::InitAutoFlagsFromMasterLeader(const HostPort& leader_address) {
       opts().IsShellMode(), IllegalState,
       "Cannot load AutoFlags from another master when not in shell mode.");
 
-  return auto_flags_manager_->LoadFromMaster(
-      options_.HostsString(), {{leader_address}}, ApplyNonRuntimeAutoFlags::kTrue);
+  return auto_flags_manager_->LoadFromMasterLeader(options_.HostsString(), {{leader_address}});
 }
 
 MonoDelta Master::default_client_timeout() {
@@ -268,11 +265,10 @@ MonoDelta Master::default_client_timeout() {
 }
 
 const std::string& Master::permanent_uuid() const {
-  static std::string empty_uuid;
-  return empty_uuid;
+  return fs_manager_->uuid();
 }
 
-void Master::SetupAsyncClientInit(client::AsyncClientInitialiser* async_client_init) {
+void Master::SetupAsyncClientInit(client::AsyncClientInitializer* async_client_init) {
   async_client_init->builder()
       .set_master_address_flag_name("master_addresses")
       .default_admin_operation_timeout(MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms))
@@ -295,10 +291,8 @@ Status Master::RegisterServices() {
   });
 #endif
 
-  RETURN_NOT_OK(RegisterService(
-      FLAGS_master_backup_svc_queue_length, std::make_shared<MasterBackupServiceImpl>(this)));
-
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterAdminService(this)));
+  RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterBackupService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterClientService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterClusterService(this)));
   RETURN_NOT_OK(RegisterService(FLAGS_master_svc_queue_length, MakeMasterDclService(this)));
@@ -328,7 +322,7 @@ Status Master::RegisterServices() {
       std::make_shared<tserver::PgClientServiceImpl>(
           *master_tablet_server_, client_future(), clock(),
           std::bind(&Master::TransactionPool, this), mem_tracker(), metric_entity(),
-          &messenger()->scheduler(), std::nullopt /* xcluster_context */)));
+          messenger(), fs_manager_->uuid(), &options(), std::nullopt /* xcluster_context */)));
 
   return Status::OK();
 }
@@ -631,7 +625,20 @@ uint32_t Master::GetAutoFlagConfigVersion() const {
   return auto_flags_manager_->GetConfigVersion();
 }
 
+CloneStateManager* Master::clone_state_manager() const {
+  return catalog_manager_->clone_state_manager();
+}
+
+
 AutoFlagsConfigPB Master::GetAutoFlagsConfig() const { return auto_flags_manager_->GetConfig(); }
+
+const std::shared_future<client::YBClient*>& Master::client_future() const {
+  return async_client_init_->get_client_future();
+}
+
+const std::shared_future<client::YBClient*>& Master::cdc_state_client_future() const {
+  return cdc_state_client_init_->get_client_future();
+}
 
 Status Master::get_ysql_db_oid_to_cat_version_info_map(
     const tserver::GetTserverCatalogVersionInfoRequestPB& req,
@@ -685,8 +692,8 @@ Status Master::get_ysql_db_oid_to_cat_version_info_map(
 Status Master::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   RETURN_NOT_OK(DbServerBase::SetupMessengerBuilder(builder));
 
-  secure_context_ = VERIFY_RESULT(
-      server::SetupInternalSecureContext(options_.HostsString(), *fs_manager_, builder));
+  secure_context_ = VERIFY_RESULT(rpc::SetupInternalSecureContext(
+      options_.HostsString(), fs_manager_->GetDefaultRootDir(), builder));
 
   return Status::OK();
 }
@@ -696,17 +703,21 @@ Status Master::ReloadKeysAndCertificates() {
     return Status::OK();
   }
 
-  return server::ReloadSecureContextKeysAndCertificates(
-        secure_context_.get(),
-        fs_manager_->GetDefaultRootDir(),
-        server::SecureContextType::kInternal,
-        options_.HostsString());
+  return rpc::ReloadSecureContextKeysAndCertificates(
+      secure_context_.get(), fs_manager_->GetDefaultRootDir(), rpc::SecureContextType::kInternal,
+      options_.HostsString());
 }
 
 std::string Master::GetCertificateDetails() {
   if(!secure_context_) return "";
 
   return secure_context_.get()->GetCertificateDetails();
+}
+
+void Master::WriteServerMetaCacheAsJson(JsonWriter *writer) {
+  writer->StartObject();
+  tserver::DbServerBase::WriteMainMetaCacheAsJson(writer);
+  writer->EndObject();
 }
 
 } // namespace master

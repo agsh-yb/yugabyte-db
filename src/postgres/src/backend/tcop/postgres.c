@@ -3191,6 +3191,9 @@ ProcessInterrupts(void)
 
 	if (ParallelMessagePending)
 		HandleParallelMessages();
+
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
 }
 
 
@@ -4175,54 +4178,22 @@ yb_is_restart_possible(const ErrorData* edata,
 	elog(DEBUG1, "Error details: edata->message=%s edata->filename=%s edata->lineno=%d",
 			 edata->message, edata->filename, edata->lineno);
 	bool is_read_restart_error = YBCIsRestartReadError(edata->yb_txn_errcode);
-	bool is_conflict_error     = YBCIsTxnConflictError(edata->yb_txn_errcode);
-	bool is_deadlock_error	   = YBCIsTxnDeadlockError(edata->yb_txn_errcode);
+	bool is_conflict_error = YBCIsTxnConflictError(edata->yb_txn_errcode);
+	bool is_deadlock_error = YBCIsTxnDeadlockError(edata->yb_txn_errcode);
+
 	if (!is_read_restart_error && !is_conflict_error && !is_deadlock_error)
 	{
 		if (yb_debug_log_internal_restarts)
-			elog(LOG, "Restart isn't possible, code %d isn't a read restart/conflict/deadlock error",
-			          edata->yb_txn_errcode);
+			elog(
+					LOG, "Restart isn't possible, code %d isn't a read restart/conflict/deadlock error",
+					edata->yb_txn_errcode);
 		return false;
 	}
 
-	/*
-	 * In case of READ COMMITTED, retries for kConflict are performed indefinitely until statement
-	 * timeout is hit.
-	 */
-	if (!IsYBReadCommitted() &&
-			(is_conflict_error && attempt >= *YBCGetGFlags()->ysql_max_write_restart_attempts))
+	if (attempt >= yb_max_query_layer_retries)
 	{
 		if (yb_debug_log_internal_restarts)
-			elog(LOG, "Restart isn't possible, we're out of write restart attempts (%d)",
-			          attempt);
-		*retries_exhausted = true;
-		return false;
-	}
-
-	/*
-	 * Retries for kReadRestart are performed indefinitely in case the true READ COMMITTED isolation
-	 * level implementation is used.
-	 */
-	if (!IsYBReadCommitted() &&
-			(is_read_restart_error && attempt >= *YBCGetGFlags()->ysql_max_read_restart_attempts))
-	{
-		if (yb_debug_log_internal_restarts)
-			elog(LOG, "Restart isn't possible, we're out of read restart attempts (%d)",
-			          attempt);
-		*retries_exhausted = true;
-		return false;
-	}
-
-	/*
-	 * For isolation levels other than READ COMMITTED, retries on deadlock are capped at
-	 * ysql_max_write_restart_attempts, given that no data has been sent as part of the transaction.
-	 */
-	if (!IsYBReadCommitted() && is_deadlock_error &&
-			attempt >= *YBCGetGFlags()->ysql_max_write_restart_attempts)
-	{
-		if (yb_debug_log_internal_restarts)
-			elog(LOG, "Restart isn't possible, we're out of read/write restart attempts (%d) on deadlock",
-			          attempt);
+			elog(LOG, "Query layer is out of retries, retry limit is %d", yb_max_query_layer_retries);
 		*retries_exhausted = true;
 		return false;
 	}
@@ -4256,14 +4227,35 @@ yb_is_restart_possible(const ErrorData* edata,
 		return false;
 	}
 
-	// We can perform kReadRestart retries in READ COMMITTED isolation level even if data has been
-	// sent as part of the txn, but not as part of the current query. This is because we just have to
-	// retry the query and not the whole transaction.
+	/*
+	 * In REPEATABLE READ and SERIALIZABLE isolation levels, retrying involves restarting the whole
+	 * transaction. So, we can only retry if no data has been sent to the external client as part of
+	 * the current transaction.
+	 *
+	 * In READ COMMITTED, we can perform retries even if data has been sent as part of the txn, but
+	 * not if data has been sent as part of the current query. This is because in RC, we just have
+	 * to retry the query, and not the whole transaction.
+	 */
 	if ((!IsYBReadCommitted() && YBIsDataSent()) ||
 			(IsYBReadCommitted() && YBIsDataSentForCurrQuery()))
 	{
 		elog(LOG, "Restart isn't possible, data was already sent. Txn error code=%d",
 							edata->yb_txn_errcode);
+		return false;
+	}
+
+	/*
+	 * In batch processing using the extended query protocol, YBIsDataSent() /
+	 * YBIsDataSentForCurrQuery() can be false even if earlier mutation statements have been
+	 * processed. Unless it's the first statement of the batch, we cannot retry the current
+	 * statement. If we do, we will lose the mutations from earlier statements (this is true
+	 * irrespective of whether the retry is done by restarting the whole transaaction in RR/SR
+	 * isolation, or by rolling back to the previous internal savepoint in RC).
+	 */
+	if (YbIsBatchedExecution() && (GetCurrentCommandId(false) > FirstCommandId))
+	{
+		elog(LOG, "Restart isn't possible: executing non-first statement in batch, will be unable "
+				  "to replay earlier commands. Txn error code=%d", edata->yb_txn_errcode);
 		return false;
 	}
 
@@ -5011,7 +5003,7 @@ PostgresMain(int argc, char *argv[],
 	 * it inside InitPostgres() instead.  In particular, anything that
 	 * involves database access should be there, not here.
 	 */
-	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, false);
+	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, NULL, false);
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
@@ -5853,6 +5845,7 @@ PostgresMain(int argc, char *argv[],
 					char *db_name = MyProcPort->database_name;
 					char *user_name = MyProcPort->user_name;
 					char *host = MyProcPort->remote_host;
+					sa_family_t conn_type = MyProcPort->raddr.addr.ss_family;
 
 					/* Update the Port details with the new context. */
 					MyProcPort->user_name =
@@ -5861,6 +5854,11 @@ PostgresMain(int argc, char *argv[],
 						(char *) pq_getmsgstring(&input_message);
 					MyProcPort->remote_host =
 						(char *) pq_getmsgstring(&input_message);
+					// HARD Code connection type between client and ysql_conn_mgr to AF_INET (only supported)
+					// for authentication
+					MyProcPort->raddr.addr.ss_family = AF_INET;
+					MyProcPort->yb_is_ssl_enabled_in_logical_conn = 
+						pq_getmsgbyte(&input_message) == 'E' ? true : false;
 
 					/* Update the `remote_host` */
 					struct sockaddr_in *ip_address_1;
@@ -5877,9 +5875,11 @@ PostgresMain(int argc, char *argv[],
 
 					/* Place back the old context */
 					MyProcPort->yb_is_auth_passthrough_req = false;
+					MyProcPort->yb_is_ssl_enabled_in_logical_conn = false;
 					MyProcPort->user_name = user_name;
 					MyProcPort->database_name = db_name;
 					MyProcPort->remote_host = host;
+					MyProcPort->raddr.addr.ss_family = conn_type;
 					inet_pton(AF_INET, MyProcPort->remote_host,
 							  &(ip_address_1->sin_addr));
 

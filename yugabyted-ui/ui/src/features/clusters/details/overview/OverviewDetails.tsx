@@ -79,7 +79,7 @@ export const OverviewDetails: FC = () => {
     });
   };
 
-  const { refetch: refetchNodes } = useGetClusterNodesQuery({ query: { enabled: false } });
+  const { refetch: refetchNodes } = useGetClusterNodesQuery({}, { query: { enabled: false } });
   const { refetch: refetchCluster } = useGetClusterQuery({ query: { enabled: false } });
   const { refetch: refetchTablets } = useGetClusterTabletsQuery({ query: { enabled: false } });
   const { refetch: refetchHealth } = useGetClusterHealthCheckQuery({ query: { enabled: false } });
@@ -90,7 +90,9 @@ export const OverviewDetails: FC = () => {
     { activities: "INDEX_BACKFILL", status: "IN_PROGRESS" },
     { query: { enabled: false } }
   );
-  const { refetch: refetchAlerts } = useGetClusterAlertsQuery({ query: { enabled: false } });
+  const { refetch: refetchAlerts } = useGetClusterAlertsQuery(
+    { node_address: "" },
+    { query: { enabled: false } });
   const [ refreshChartController, setRefreshChartController ] = useQueryParam<boolean | undefined>("refreshChartController");
 
   const refetch = () => {

@@ -250,18 +250,21 @@ interface AWSCloudInfoBase {
   awsAccessKeyID?: string;
   awsAccessKeySecret?: string;
   awsHostedZoneId?: string;
+  useIMDSv2: boolean;
 }
 type AWSCloudInfoMutation = AWSCloudInfoBase;
 interface AWSCloudInfo extends AWSCloudInfoBase {
   awsAccessKeyID: string;
   awsAccessKeySecret: string;
   awsHostedZoneName: string;
+  // VPCSetupType.HOST_INSTANCE is used only as part of the
+  // client form and doesn't exst in the Java enum.
   vpcType: Exclude<VPCSetupType, typeof VPCSetupType.HOST_INSTANCE>;
 }
 
 interface AZUCloudInfoBase {
   azuClientId: string;
-  azuClientSecret: string;
+  azuClientSecret?: string;
   azuRG: string; // azure resource group
   azuNetworkRG?: string;
   azuSubscriptionId: string;
@@ -272,6 +275,8 @@ interface AZUCloudInfoBase {
 }
 type AZUCloudInfoMutation = AZUCloudInfoBase;
 interface AZUCloudInfo extends AZUCloudInfoBase {
+  // VPCSetupType.HOST_INSTANCE is used only as part of the
+  // client form and doesn't exst in the Java enum.
   vpcType: Exclude<VPCSetupType, typeof VPCSetupType.HOST_INSTANCE>;
 }
 
@@ -281,12 +286,15 @@ interface GCPCloudInfoBase {
 
   ybFirewallTags?: string;
   gceProject?: string;
+  sharedVPCProject?: string;
   destVpcId?: string;
 }
 interface GCPCloudInfoMutation extends GCPCloudInfoBase {
   gceApplicationCredentials?: {};
 }
 interface GCPCloudInfo extends GCPCloudInfoBase {
+  // VPCSetupType.HOST_INSTANCE is used only as part of the
+  // client form and doesn't exst in the Java enum.
   vpcType: Exclude<VPCSetupType, typeof VPCSetupType.HOST_INSTANCE>;
 
   // gcpApplicationCredentials is undefined when the user chooses to use

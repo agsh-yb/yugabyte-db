@@ -12,16 +12,17 @@ menu:
 type: docs
 ---
 
-Using the Raft distributed consensus protocol, DocDB automatically replicates data synchronously across the primary cluster in order to survive failures while maintaining data consistency and avoiding operator intervention.
+Using the [Raft distributed consensus protocol](https://raft.github.io/), DocDB automatically replicates data synchronously across the primary cluster in order to survive failures while maintaining data consistency and avoiding operator intervention.
 
 ## Concepts
 
-A number of concepts are central to replication.
+The following concepts are central to understanding replication.
 
 ### Fault domains
 
 A fault domain comprises a group of nodes that are prone to correlated failures. The following are examples of fault domains:
 
+* Nodes or VMs
 * Zones or racks
 * Regions or datacenters
 * Cloud providers
@@ -30,11 +31,19 @@ Data is typically replicated across fault domains to be resilient to the outage 
 
 ### Fault tolerance
 
-The fault tolerance (FT) of a YugabyteDB universe is the maximum number of node failures it can survive while continuing to preserve correctness of data.
+The fault tolerance (FT) of a YugabyteDB cluster is the maximum number of fault domain failures it can survive while continuing to preserve correctness of data.
 
 ### Replication factor
 
-YugabyteDB replicates data across nodes (or fault domains) in order to tolerate faults. The replication factor (RF) is the number of copies of data in a YugabyteDB universe. FT and RF are correlated. To achieve a FT of `k` nodes, the universe has to be configured with a RF of (2k + 1).
+YugabyteDB replicates data across fault domains (which, depending on the deployment, could be nodes, availability zones, racks, or regions) in order to tolerate faults. The replication factor (RF) is the number of copies of data in a YugabyteDB cluster. FT and RF are correlated as follows:
+
+* To achieve a FT of `f` fault domains, the primary cluster has to be configured with a RF of (2f + 1).
+
+The following diagram shows a cluster with FT 1. Data is replicated across 3 nodes, and the cluster can survive the failure of one fault domain. To make the cluster able to survive the failure of a zone or region, you would place the nodes in different zones or regions.
+
+![RAFT group](/images/architecture/replication/raft-group.png)
+
+To survive the outage of 2 fault domains, a cluster needs 2 * 2 + 1 fault domains (RF = 5). While the 2 fault domains are offline, the remaining 3 fault domains can continue to serve reads and writes without interruption. Clusters with an RF of 1 can tolerate 0 faults.
 
 ## Tablet peers
 
@@ -70,15 +79,19 @@ As a part of the Raft replication, each tablet peer first elects a tablet leader
 
 ![Tablet leader placement](/images/architecture/replication/optimal-tablet-leader-placement.png)
 
+{{<note>}}
+Tablet leaders are balanced across **zones** and the **nodes** within a zone.
+{{</note>}}
+
 ### Tolerating a zone outage
 
-As soon as a zone outage occurs, YugabyteDB assumes that all nodes in that zone become unavailable simultaneously. This results in one-third of the tablets (which have their tablet leaders in the zone that just failed) not being able to serve any requests. The other two-thirds of the tablets are not affected. The following illustration shows the tablet peers in the zone that failed:
-
-![Tablet peers in a failed zone](/images/architecture/replication/tablet-leaders-vs-followers-zone-outage.png)
-
-For the affected one-third, YugabyteDB automatically performs a failover to instances in the other two zones. Once again, the tablets being failed over are distributed across the two remaining zones evenly, as per the following diagram:
+As soon as a zone outage occurs, YugabyteDB assumes that all nodes in that zone become unavailable simultaneously. This results in one-third of the tablets (which have their tablet leaders in the zone that just failed) not being able to serve any requests. The other two-thirds of the tablets are not affected. For the affected one-third, YugabyteDB automatically performs a failover to instances in the other two zones. Once again, the tablets being failed over are distributed across the two remaining zones evenly, as per the following diagram:
 
 ![Automatic failover](/images/architecture/replication/automatic-failover-zone-outage.png)
+
+{{<note>}}
+Failure of **followers** has no impact on reads and writes. Only the tablet **leaders** serve reads and writes.
+{{</note>}}
 
 ### RPO and RTO on zone outage
 

@@ -91,7 +91,8 @@ DEFINE_UNKNOWN_uint64(io_thread_pool_size, 4, "Size of allocated IO Thread Pool.
 
 DEFINE_UNKNOWN_int64(outbound_rpc_memory_limit, 0, "Outbound RPC memory limit");
 
-DEFINE_NON_RUNTIME_int32(rpc_queue_limit, 10000, "Queue limit for rpc server");
+DEPRECATE_FLAG(int32, rpc_queue_limit, "03_2024");
+
 DEFINE_NON_RUNTIME_int32(rpc_workers_limit, 1024, "Workers limit for rpc server");
 
 DEFINE_UNKNOWN_int32(socket_receive_buffer_size, 0, "Socket receive buffer size, 0 to use default");
@@ -485,6 +486,11 @@ void Messenger::Handle(InboundCallPtr call, Queue queue) {
     call->RespondFailure(ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, MoveStatus(op));
     return;
   }
+
+  if (call->IsLocalCall()) {
+    local_call_tracker_.Enqueue(call);
+  }
+
   auto it = rpc_endpoints_.find(call->serialized_remote_method());
   if (it == rpc_endpoints_.end()) {
     auto remote_method = ParseRemoteMethod(call->serialized_remote_method());
@@ -621,9 +627,14 @@ Status Messenger::Init(const MessengerBuilder &bld) {
 
 Status Messenger::DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
                                   DumpRunningRpcsResponsePB* resp) {
-  PerCpuRwSharedLock guard(lock_);
-  for (const auto& reactor : reactors_) {
-    RETURN_NOT_OK(reactor->DumpRunningRpcs(req, resp));
+  {
+    PerCpuRwSharedLock guard(lock_);
+    for (const auto& reactor : reactors_) {
+      RETURN_NOT_OK(reactor->DumpRunningRpcs(req, resp));
+    }
+  }
+  if (req.get_local_calls()) {
+    RETURN_NOT_OK(local_call_tracker_.DumpRunningRpcs(req, resp));
   }
   return Status::OK();
 }

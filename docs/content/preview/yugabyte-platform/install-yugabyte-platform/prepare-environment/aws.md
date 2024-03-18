@@ -63,8 +63,8 @@ type: docs
 In order to access YugabyteDB Anywhere from outside the AWS environment, you would need to enable access by assigning an appropriate security group to the server hosting YugabyteDB Anywhere. At a minimum, you need to be able to do the following:
 
 - Access the YugabyteDB Anywhere instance over SSH (port `tcp:22`).
-- Check, manage, and upgrade YugabyteDB Anywhere (port `tcp:8800`).
-- View the YugabyteDB Anywhere UI (port `tcp:80`).
+- Check, manage, and upgrade YugabyteDB Anywhere (port `tcp:8800`) (Replicated installations only).
+- View the YugabyteDB Anywhere UI (port `tcp:80` or `tcp:443`).
 
 If you are using your own Virtual Private Cloud (VPC) as a self-managed configuration, the following additional TCP ports must be accessible: 7000, 7100, 9000, 9100, 18018, 11000, 12000, 13000, 9300, 9042, 5433, 6379, 54422. For more information on ports used by YugabyteDB, refer to [Default ports](../../../../reference/configuration/default-ports).
 
@@ -76,7 +76,7 @@ To create a security group that enables these, use the Amazon console to navigat
 
 - Add the appropriate IP addresses to the **Source** field. To allow access from any computer, add `0.0.0.0/0` but note that this is not very secure.
 
-- Add the ports 22, 8800, and 80 to the **Port Range** field. The **Protocol** selected must be TCP.
+- Add the ports 22, 8800 (Replicated installations only), and 80 or 443 to the **Port Range** field. The **Protocol** selected must be TCP.
 
   For a self-managed configuration, also add the previously listed TCP ports.
 
@@ -170,7 +170,7 @@ You need to create an instance to run the YugabyteDB Anywhere server. To do this
 
 - Change the boot disk image to Ubuntu Server 16.04, as shown in the following illustration:
 
-  ![Image](/images/ee/aws-setup/yugaware-create-instance-os.png)
+  ![Ubuntu Server boot disk image](/images/ee/aws-setup/yugaware-create-instance-os.png)
 
 - Select c5.xlarge as the instance type (4 vCPUs are recommended for production).
 
@@ -179,6 +179,8 @@ You need to create an instance to run the YugabyteDB Anywhere server. To do this
   Ensure that **Auto-assign Public IP** is enabled (if it is disabled, the instance would not be accessible from outside AWS).
 
   If you created an IAM role, as described in [Create an IAM role](#create-an-iam-role-optional), or already had the IAM role that you would like to use, include this information under **IAM role**. See [Deploy the YugabyteDB universe using an IAM role](#deploy-the-yugabytedb-universe-using-an-iam-role) for more information.
+
+- If you are operating YBA and deploying universes in airgapped mode, create endpoints (**VPC > Endpoints**) for EC2, S3 (for backup), and KMS (for encryption at rest) services so that they can connect through the internal network.
 
 - Increase the root storage volume size to at least 100GiB.
 
@@ -194,7 +196,7 @@ You need to create an instance to run the YugabyteDB Anywhere server. To do this
 
   You should see an instance being created, as shown in the following illustration:
 
-  ![Image](/images/ee/aws-setup/yugaware-machine-creation.png)
+  ![Launch instance](/images/ee/aws-setup/yugaware-machine-creation.png)
 
 ### Deploy the YugabyteDB universe using an IAM role
 

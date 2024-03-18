@@ -30,6 +30,7 @@
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/result.h"
 #include "yb/util/subprocess.h"
+#include "yb/util/type_traits.h"
 #include "yb/util/uuid.h"
 
 namespace yb::pgwrapper {
@@ -44,6 +45,10 @@ struct PGResultClear {
 
 typedef std::unique_ptr<PGconn, PGConnClose> PGConnPtr;
 typedef std::unique_ptr<PGresult, PGResultClear> PGResultPtr;
+
+// FetchRow/GetValue<MonoDelta> return MonoDelta since POSTGRES_EPOCH_DATE
+// The PGPostgresEpoch function returns this moment as MonoTime
+const MonoTime& PGPostgresEpoch();
 
 struct PGOid {};
 
@@ -72,10 +77,16 @@ template<class T>
 inline constexpr bool IsPGNonNeg = IsPGNonNegImpl<T>::value;
 
 template<class T>
-concept AllowedPGType =
+concept BasePGType =
     IsPGNonNeg<T> || IsPGIntType<T> || IsPGFloatType<T> ||
     std::is_same_v<T, bool> || std::is_same_v<T, std::string> || std::is_same_v<T, char> ||
-    std::is_same_v<T, PGOid> || std::is_same_v<T, Uuid>;
+    std::is_same_v<T, PGOid> || std::is_same_v<T, Uuid> || std::is_same_v<T, MonoDelta>;
+
+template<class T>
+concept OptionalPGType = StdOptionalType<T> && BasePGType<typename T::value_type>;
+
+template<class T>
+concept AllowedPGType = BasePGType<T> || OptionalPGType<T>;
 
 template<AllowedPGType T>
 struct PGTypeTraits {
@@ -94,67 +105,138 @@ struct PGTypeTraits<T> {
   using ReturnType = Oid;
 };
 
+template<OptionalPGType T>
+struct PGTypeTraits<T> {
+  using ReturnType = std::optional<typename PGTypeTraits<typename T::value_type>::ReturnType>;
+};
+
 using PGUint16 = PGNonNeg<int16_t>;
 using PGUint32 = PGNonNeg<int32_t>;
 using PGUint64 = PGNonNeg<int64_t>;
 
-template<class T>
+template<AllowedPGType T>
 using GetValueResult = Result<typename PGTypeTraits<T>::ReturnType>;
 
-template<class T>
-GetValueResult<T> GetValue(const PGresult* result, int row, int column);
+namespace libpq_utils::internal {
 
-template<class T>
-requires(std::is_same_v<T, std::optional<typename T::value_type>>)
-Result<std::optional<typename PGTypeTraits<typename T::value_type>::ReturnType>> GetValue(
-    const PGresult* result, int row, int column) {
+template<BasePGType T>
+struct GetValueHelper {
+  static Status CheckType(const PGresult* result, int column);
+  static GetValueResult<T> Get(const PGresult* result, int row, int column);
+};
+
+} // namespace libpq_utils::internal
+
+template<BasePGType T>
+GetValueResult<T> GetValue(const PGresult* result, int row, int column) {
+  using Helper = libpq_utils::internal::GetValueHelper<T>;
+  RETURN_NOT_OK(Helper::CheckType(result, column));
+  return Helper::Get(result, row, column);
+}
+
+template<OptionalPGType T>
+GetValueResult<T> GetValue(const PGresult* result, int row, int column) {
+  using Helper = libpq_utils::internal::GetValueHelper<typename T::value_type>;
+  RETURN_NOT_OK(Helper::CheckType(result, column));
   if (PQgetisnull(result, row, column)) {
     return std::nullopt;
   }
-  return GetValue<typename T::value_type>(result, row, column);
+  return Helper::Get(result, row, column);
 }
 
 const std::string& DefaultColumnSeparator();
 const std::string& DefaultRowSeparator();
 
-Result<std::string> ToString(PGresult* result, int row, int column);
-Result<std::string> RowToString(
-    PGresult* result, int row, const std::string& sep = DefaultColumnSeparator());
-void LogResult(PGresult* result);
+// DEPRECATED: use FetchRows instead.
+Result<std::string> ToString(const PGresult* result, int row, int column);
 
 std::string PqEscapeLiteral(const std::string& input);
 std::string PqEscapeIdentifier(const std::string& input);
 
-template <class... Args>
-class FetchAllHelper {
-  using Tuple = std::tuple<Args...>;
-  using TupleVector = std::vector<Tuple>;
+namespace libpq_utils::internal {
 
+template <AllowedPGType... ColumnTypes>
+class RowFetcher {
  public:
-  static Result<TupleVector> Fetch(const PGresult* res) {
-    constexpr auto kExpectedColumns = sizeof...(Args);
-    SCHECK_EQ(PQnfields(res), kExpectedColumns, RuntimeError, "Unexpected number of columns");
-    TupleVector result(PQntuples(res));
-    auto row = 0;
-    for (auto& tuple : result) {
-      RETURN_NOT_OK(Update<0>(&tuple, res, row++));
-    }
+  static constexpr auto kNumColumns = sizeof...(ColumnTypes);
+  static_assert(kNumColumns > 1);
+  using RowType = std::tuple<typename PGTypeTraits<ColumnTypes>::ReturnType...>;
+
+  static Result<RowType> Fetch(const PGresult* res, int row) {
+    RowType result;
+    RETURN_NOT_OK(Update<0>(&result, res, row));
     return result;
   }
 
  private:
-  template <size_t ElIdx>
-  static Status Update(Tuple* dest, const PGresult* res, int row) {
-    auto& element = std::get<ElIdx>(*dest);
-    element = VERIFY_RESULT(GetValue<std::remove_cvref_t<decltype(element)>>(res, row, ElIdx));
-    constexpr auto kNextElIdx = ElIdx + 1;
-    if constexpr (kNextElIdx < sizeof...(Args)) {
-      return Update<kNextElIdx>(dest, res, row);
+  template <size_t ColumnIdx>
+  static Status Update(RowType* dest, const PGresult* res, int row) {
+    using ColumnType = std::tuple_element_t<ColumnIdx, std::tuple<ColumnTypes...>>;
+    std::get<ColumnIdx>(*dest) = VERIFY_RESULT(GetValue<ColumnType>(res, row, ColumnIdx));
+    constexpr auto kNextColumnIdx = ColumnIdx + 1;
+    if constexpr (kNextColumnIdx < kNumColumns) {
+      return Update<kNextColumnIdx>(dest, res, row);
     } else {
       return Status::OK();
     }
   }
 };
+
+template <AllowedPGType ColumnType>
+class RowFetcher<ColumnType> {
+ public:
+  static constexpr auto kNumColumns = 1;
+  using RowType = typename PGTypeTraits<ColumnType>::ReturnType;
+
+  static Result<RowType> Fetch(const PGresult* res, int row) {
+    return GetValue<ColumnType>(res, row, 0);
+  }
+};
+
+template <AllowedPGType... Args>
+class FetchHelper {
+  using Fetcher = RowFetcher<Args...>;
+  using RowType = typename Fetcher::RowType;
+  using RowsType = std::vector<RowType>;
+  using RowResult = Result<RowType>;
+  using RowsResult = Result<RowsType>;
+
+ public:
+  static RowResult FetchRow(Result<PGResultPtr>&& source) {
+    return FetchRow(VERIFY_RESULT(CheckSource(std::move(source))).get());
+  }
+
+  static RowsResult FetchRows(Result<PGResultPtr>&& source) {
+    return FetchRows(VERIFY_RESULT(CheckSource(std::move(source))).get());
+  }
+
+ private:
+  static RowResult FetchRow(const PGresult* source) {
+    SCHECK_EQ(PQntuples(source), 1, RuntimeError, "Unexpected number of rows");
+    return Fetcher::Fetch(source, 0);
+  }
+
+  static RowsResult FetchRows(const PGresult* source) {
+    RowsType result;
+    auto num_rows = PQntuples(source);
+    result.reserve(num_rows);
+    for (int row = 0; row < num_rows; ++row) {
+      result.push_back(VERIFY_RESULT(Fetcher::Fetch(source, row)));
+    }
+    return result;
+  }
+
+  static Result<PGResultPtr> CheckSource(Result<PGResultPtr>&& source) {
+    if (source.ok()) {
+      SCHECK_EQ(
+          PQnfields(source->get()), Fetcher::kNumColumns,
+          RuntimeError, "Unexpected number of columns");
+    }
+    return source;
+  }
+};
+
+} // namespace libpq_utils::internal
 
 class PGConn {
  public:
@@ -192,6 +274,8 @@ class PGConn {
 
   bool IsBusy();
 
+  ConnStatusType ConnStatus();
+
   Result<PGResultPtr> Fetch(const std::string& command);
 
   template <class... Args>
@@ -202,22 +286,25 @@ class PGConn {
 
   // Fetches data matrix of specified size. I.e. exact number of rows and columns are expected.
   Result<PGResultPtr> FetchMatrix(const std::string& command, int rows, int columns);
+
+  template <class... Args>
+  auto FetchRow(const std::string& query) {
+    return libpq_utils::internal::FetchHelper<Args...>::FetchRow(Fetch(query));
+  }
+
+  template <class... Args>
+  auto FetchRows(const std::string& query) {
+    return libpq_utils::internal::FetchHelper<Args...>::FetchRows(Fetch(query));
+  }
+
+  // The following two methods are really important because they convenient way for checking table
+  // content and debugging tests.
+  // Please do not remove them. Consult @sergei if you have any questions.
   Result<std::string> FetchRowAsString(
       const std::string& command, const std::string& sep = DefaultColumnSeparator());
   Result<std::string> FetchAllAsString(const std::string& command,
       const std::string& column_sep = DefaultColumnSeparator(),
       const std::string& row_sep = DefaultRowSeparator());
-
-  template <class T>
-  auto FetchValue(const std::string& command) -> decltype(GetValue<T>(nullptr, 0, 0)) {
-    auto res = VERIFY_RESULT(FetchMatrix(command, 1, 1));
-    return GetValue<T>(res.get(), 0, 0);
-  }
-
-  template <class... Args>
-  auto FetchAll(const std::string& query) -> decltype(FetchAllHelper<Args...>::Fetch(nullptr)) {
-    return FetchAllHelper<Args...>::Fetch(VERIFY_RESULT(Fetch(query)).get());
-  }
 
   Status StartTransaction(IsolationLevel isolation_level);
   Status CommitTransaction();
@@ -264,11 +351,12 @@ class PGConn {
 struct PGConnSettings {
   constexpr static const char* kDefaultUser = "postgres";
 
-  const std::string& host;
+  std::string host = {};
   uint16_t port;
-  const std::string& dbname = std::string();
-  const std::string& user = kDefaultUser;
-  const std::string& password = std::string();
+  std::string dbname = {};
+  std::string user = kDefaultUser;
+  std::string password = {};
+  std::string replication = {};
   size_t connect_timeout = 0;
 };
 
@@ -286,6 +374,9 @@ class PGConnBuilder {
 Result<PGConn> Execute(Result<PGConn> connection, const std::string& query);
 Result<PGConn> SetHighPriTxn(Result<PGConn> connection);
 Result<PGConn> SetLowPriTxn(Result<PGConn> connection);
+Result<PGConn> SetDefaultTransactionIsolation(
+    Result<PGConn> connection, IsolationLevel isolation_level);
+Result<IsolationLevel> EffectiveIsolationLevel(PGConn* conn);
 Status SetMaxBatchSize(PGConn* conn, size_t max_batch_size);
 
 class PGConnPerf {
@@ -295,5 +386,11 @@ class PGConnPerf {
  private:
   Subprocess process_;
 };
+
+// Utility function for creating internal pg connections (ie local connection using yb-tserver-key
+// authentication).
+PGConnBuilder CreateInternalPGConnBuilder(
+    const HostPort& pgsql_proxy_bind_address, const std::string& database_name,
+    uint64_t postgres_auth_key, const std::optional<CoarseTimePoint>& deadline);
 
 } // namespace yb::pgwrapper

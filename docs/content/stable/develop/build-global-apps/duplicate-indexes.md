@@ -1,5 +1,5 @@
 ---
-title: Duplicate Indexes for  global applications
+title: Duplicate Indexes for global applications
 headerTitle: Duplicate indexes
 linkTitle: Duplicate indexes
 description: Enhance the performance of global applications with Duplicate Indexes
@@ -35,7 +35,7 @@ Adding an application in `us-central` gives the following setup.
 In this scenario, the application in `us-central` has a read latency of 30 ms, whereas the application in `us-east` has a read latency of only 2 ms.
 
 {{<tip title="Goal #1">}}
-Reduce the 30 ms access latency of applications in `us-central`
+Reduce the 30 ms access latency of applications in `us-central`.
 {{</tip>}}
 
 This becomes worse when you add an application in `us-west`.
@@ -45,14 +45,14 @@ This becomes worse when you add an application in `us-west`.
 The application in `us-west` has a high read latency of 60 ms.
 
 {{<tip title="Goal #2">}}
-Reduce the 60 ms access latency of applications in `us-west`.
+Reduce the 60 ms access latency of applications in `us-west`
 {{</tip>}}
 
 ## Duplicate indexes
 
 By default, all reads go to the leader, so even though the replicas are available in other regions, applications incur cross-region latency if the leaders are in a different region than the application.
 
-To address this, you can create multiple [covering indexes](../../../explore/indexes-constraints/covering-index-ysql/) with the same schema as the table, and attach them to different tablespaces, with leader preference set to each region.
+To address this, you can create multiple [covering indexes](../../../explore/ysql-language-features/indexes-constraints/covering-index-ysql/) with the same schema as the table, and attach them to different tablespaces, with leader preference set to each region.
 
 To set this up, do the following:
 
@@ -162,5 +162,5 @@ In the case of zone or region failures, followers in other regions are elected l
 ## Learn more
 
 - [Tablespaces](../../../explore/ysql-language-features/going-beyond-sql/tablespaces/)
-- [Covering Indexes](../../../explore/indexes-constraints/covering-index-ysql/)
+- [Covering Indexes](../../../explore/ysql-language-features/indexes-constraints/covering-index-ysql/)
 - [Create Index](../../../api/ysql/the-sql-language/statements/ddl_create_index/)

@@ -39,7 +39,6 @@
 
 #include <gtest/gtest.h>
 
-#include "yb/client/async_initializer.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/client-test-util.h"
 #include "yb/client/client.h"
@@ -100,7 +99,6 @@
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/capabilities.h"
 #include "yb/util/metrics.h"
-#include "yb/util/net/dns_resolver.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/random_util.h"
 #include "yb/util/status.h"
@@ -2673,34 +2671,6 @@ TEST_F(ClientTest, GetNamespaceInfo) {
   ASSERT_TRUE(resp.colocated());
 }
 
-TEST_F(ClientTest, BadMasterAddress) {
-  auto messenger = ASSERT_RESULT(CreateMessenger("test-messenger"));
-  auto host = "should.not.resolve";
-
-  // Put host entry in cache.
-  ASSERT_NOK(messenger->resolver().Resolve(host));
-
-  {
-    struct TestServerOptions : public server::ServerBaseOptions {
-      TestServerOptions() : server::ServerBaseOptions(1) {}
-    };
-    TestServerOptions opts;
-    auto master_addr = std::make_shared<server::MasterAddresses>();
-    // Put several hosts, so resolve would take place.
-    master_addr->push_back({HostPort(host, 1)});
-    master_addr->push_back({HostPort(host, 2)});
-    opts.SetMasterAddresses(master_addr);
-
-    AsyncClientInitialiser async_init(
-        "test-client", /* timeout= */ 1s, "UUID", &opts,
-        /* metric_entity= */ nullptr, /* parent_mem_tracker= */ nullptr, messenger.get());
-    async_init.Start();
-    async_init.get_client_future().wait_for(1s);
-  }
-
-  messenger->Shutdown();
-}
-
 TEST_F(ClientTest, RefreshPartitions) {
   const auto kLookupTimeout = 10s;
   const auto kNumLookupThreads = 2;
@@ -2855,14 +2825,14 @@ TEST_F(ColocationClientTest, ColocatedTablesLookupTablet) {
   auto conn = ASSERT_RESULT(ConnectToDB());
   ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH COLOCATION = true", kPgsqlKeyspaceName));
   conn = ASSERT_RESULT(ConnectToDB(kPgsqlKeyspaceName));
-  auto database_oid = ASSERT_RESULT(conn.FetchValue<pgwrapper::PGOid>(Format(
+  auto database_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
       "SELECT oid FROM pg_database WHERE datname = '$0'", kPgsqlKeyspaceName)));
 
   std::vector<TableId> table_ids;
   for (auto i = 0; i < kNumTables; ++i) {
     const auto name = Format("table_$0", i);
     ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (key BIGINT PRIMARY KEY, value BIGINT)", name));
-    auto table_oid = ASSERT_RESULT(conn.FetchValue<pgwrapper::PGOid>(Format(
+    auto table_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
         "SELECT oid FROM pg_class WHERE relname = '$0'", name)));
     table_ids.push_back(GetPgsqlTableId(database_oid, table_oid));
   }

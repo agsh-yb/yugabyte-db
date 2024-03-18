@@ -110,6 +110,13 @@ Status PgCreateTable::Exec(
     set_table_properties = true;
   }
   if (set_table_properties) {
+    if (req_.schema_name() == "pg_catalog") {
+      table_properties.SetReplicaIdentity(PgReplicaIdentity::NOTHING);
+    } else if (req_.schema_name() == "information_schema") {
+      table_properties.SetReplicaIdentity(PgReplicaIdentity::DEFAULT);
+    } else {
+      table_properties.SetReplicaIdentity(PgReplicaIdentity::CHANGE);
+    }
     schema_builder_.SetTableProperties(table_properties);
   }
   if (!req_.schema_name().empty()) {
@@ -153,9 +160,14 @@ Status PgCreateTable::Exec(
     table_creator->tablespace_id(tablespace_oid.GetYbTablespaceId());
   }
 
-  auto matview_pg_table_oid = PgObjectId::FromPB(req_.matview_pg_table_oid());
-  if (matview_pg_table_oid.IsValid()) {
-    table_creator->matview_pg_table_id(matview_pg_table_oid.GetYbTableId());
+  auto pg_table_oid = PgObjectId::FromPB(req_.pg_table_oid());
+  if (pg_table_oid.IsValid()) {
+    table_creator->pg_table_id(pg_table_oid.GetYbTableId());
+  }
+
+  auto old_relfilenode_id = PgObjectId::FromPB(req_.old_relfilenode_oid());
+  if (old_relfilenode_id.IsValid()) {
+    table_creator->old_rewrite_table_id(old_relfilenode_id.GetYbTableId());
   }
 
   // For index, set indexed (base) table id.

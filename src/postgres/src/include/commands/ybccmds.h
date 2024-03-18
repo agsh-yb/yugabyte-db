@@ -27,6 +27,7 @@
 #include "catalog/objectaddress.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
+#include "replication/walsender.h"
 #include "storage/lock.h"
 #include "utils/relcache.h"
 #include "tcop/utility.h"
@@ -52,6 +53,7 @@ extern void YBCDropTablegroup(Oid grpoid);
 /*  Table Functions ----------------------------------------------------------------------------- */
 
 extern void YBCCreateTable(CreateStmt *stmt,
+						   char *relname,
 						   char relkind,
 						   TupleDesc desc,
 						   Oid relationId,
@@ -59,7 +61,8 @@ extern void YBCCreateTable(CreateStmt *stmt,
 						   Oid tablegroupId,
 						   Oid colocationId,
 						   Oid tablespaceId,
-						   Oid matviewPgTableId);
+						   Oid pgTableId,
+						   Oid oldRelfileNodeId);
 
 extern void YBCDropTable(Relation rel);
 
@@ -77,7 +80,9 @@ extern void YBCCreateIndex(const char *indexName,
 						   bool is_colocated,
 						   Oid tablegroupId,
 						   Oid colocationId,
-						   Oid tablespaceId);
+						   Oid tablespaceId,
+						   Oid pgTableId,
+						   Oid oldRelfileNodeId);
 
 extern void YBCDropIndex(Relation index);
 
@@ -104,10 +109,30 @@ extern void YBCValidatePlacement(const char *placement_info);
 
 /*  Replication Slot Functions ------------------------------------------------------------------ */
 
-extern void YBCCreateReplicationSlot(const char *slot_name);
+extern void YBCCreateReplicationSlot(const char *slot_name,
+									 CRSSnapshotAction snapshot_action,
+									 uint64_t *consistent_snapshot_time);
 
 extern void
 YBCListReplicationSlots(YBCReplicationSlotDescriptor **replication_slots,
 						size_t *numreplicationslots);
 
+extern void
+YBCGetReplicationSlot(const char *slot_name,
+					  YBCReplicationSlotDescriptor **replication_slot);
+
 extern void YBCDropReplicationSlot(const char *slot_name);
+
+extern void YBCInitVirtualWalForCDC(const char *stream_id,
+									Oid *relations,
+									size_t numrelations);
+
+extern void YBCDestroyVirtualWalForCDC();
+
+extern void YBCGetCDCConsistentChanges(const char *stream_id,
+									   YBCPgChangeRecordBatch **record_batch);
+
+extern void YBCUpdateAndPersistLSN(const char *stream_id,
+								   XLogRecPtr restart_lsn_hint,
+								   XLogRecPtr confirmed_flush,
+								   YBCPgXLogRecPtr *restart_lsn);

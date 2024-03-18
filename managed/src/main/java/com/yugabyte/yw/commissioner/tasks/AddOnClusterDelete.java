@@ -11,6 +11,7 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
+import com.yugabyte.yw.common.UniverseInProgressException;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
@@ -40,6 +41,17 @@ public class AddOnClusterDelete extends UniverseDefinitionTaskBase {
   }
 
   @Override
+  protected void validateUniverseState(Universe universe) {
+    try {
+      super.validateUniverseState(universe);
+    } catch (UniverseInProgressException e) {
+      if (!params().isForceDelete) {
+        throw e;
+      }
+    }
+  }
+
+  @Override
   public void run() {
     log.info("Started {} task for uuid={}", getName(), params().getUniverseUUID());
 
@@ -54,7 +66,9 @@ public class AddOnClusterDelete extends UniverseDefinitionTaskBase {
       if (params().isForceDelete) {
         universe = forceLockUniverseForUpdate(-1 /* expectedUniverseVersion */);
       } else {
-        universe = lockUniverseForUpdate(params().expectedUniverseVersion);
+        universe =
+            lockAndFreezeUniverseForUpdate(
+                params().expectedUniverseVersion, null /* Txn callback */);
       }
 
       Cluster clusterToDelete = universe.getCluster(params().clusterUUID);
@@ -81,7 +95,8 @@ public class AddOnClusterDelete extends UniverseDefinitionTaskBase {
               nodesToBeRemoved,
               params().isForceDelete,
               true /* deleteNodeFromDB */,
-              true /* deleteRootVolumes */)
+              true /* deleteRootVolumes */,
+              false /* skipDestroyPrecheck */)
           .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
       // Remove the cluster entry from the universe db entry.

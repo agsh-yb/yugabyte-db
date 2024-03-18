@@ -31,12 +31,9 @@
 #
 
 set(YB_PCH_PREFIX client)
-set(YB_PCH_DEP_LIBS opid_proto)
 
 set(CLIENT_SRCS
-  async_initializer.cc
   async_rpc.cc
-  auto_flags_manager.cc
   batcher.cc
   client.cc
   client_builder-internal.cc
@@ -68,6 +65,7 @@ set(CLIENT_SRCS
   transaction_rpc.cc
   universe_key_client.cc
   value.cc
+  xcluster_client.cc
   yb_op.cc
   yb_table_name.cc
 )
@@ -77,13 +75,13 @@ set(CLIENT_LIBS
   master_proto
   master_rpc
   master_util
-  server_process
   tserver_proto
   tserver_service_proto
   pg_auto_analyze_service_proto
   test_echo_service_proto
   tserver_util
   yb_ql_expr
+  yb_ash
   yb_util
   gutil
   yrpc

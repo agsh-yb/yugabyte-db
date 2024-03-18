@@ -8,11 +8,10 @@ import { browserHistory } from 'react-router';
 import { toast } from 'react-toastify';
 
 import { CurrentFormStep } from './CurrentFormStep';
-import { StorageConfigOption } from '../../sharedComponents/ReactSelectStorageConfig';
 import { Universe } from '../../../../redesign/helpers/dtos';
 import { YBErrorIndicator } from '../../../common/indicators';
 import { YBButton, YBModal, YBModalProps } from '../../../../redesign/components';
-import { api, drConfigQueryKey, EditDrConfigRequest } from '../../../../redesign/helpers/api';
+import { api, drConfigQueryKey, ReplaceDrReplicaRequest } from '../../../../redesign/helpers/api';
 import { assertUnreachableCase, handleServerError } from '../../../../utils/errorHandlingUtils';
 import { fetchTaskUntilItCompletes } from '../../../../actions/xClusterReplication';
 
@@ -28,8 +27,7 @@ interface EditConfigTargetModalProps {
 }
 
 export interface EditConfigTargetFormValues {
-  targetUniverse: Universe;
-  storageConfig: StorageConfigOption;
+  targetUniverse: { label: string; value: Universe };
 }
 
 export const FormStep = {
@@ -57,15 +55,13 @@ export const EditConfigTargetModal = ({
 
   const formMethods = useForm<EditConfigTargetFormValues>();
 
-  const editDrConfigMutation = useMutation(
+  const replaceDrReplicaMutation = useMutation(
     (formValues: EditConfigTargetFormValues) => {
-      const editDrConfigRequest: EditDrConfigRequest = {
-        newTargetUniverseUuid: formValues.targetUniverse.universeUUID,
-        bootstrapBackupParams: {
-          storageConfigUUID: formValues.storageConfig.value.uuid
-        }
+      const replaceDrReplicaRequest: ReplaceDrReplicaRequest = {
+        primaryUniverseUuid: drConfig.primaryUniverseUuid ?? '',
+        drReplicaUniverseUuid: formValues.targetUniverse.value.universeUUID
       };
-      return api.editDrConfig(drConfig.uuid, editDrConfigRequest);
+      return api.replaceDrReplica(drConfig.uuid, replaceDrReplicaRequest);
     },
     {
       onSuccess: (response) => {
@@ -96,6 +92,11 @@ export const EditConfigTargetModal = ({
           invalidateQueries();
         };
 
+        toast.success(
+          <Typography variant="body2" component="span">
+            {t('success.requestSuccess')}
+          </Typography>
+        );
         modalProps.onClose();
         if (redirectUrl) {
           browserHistory.push(redirectUrl);
@@ -107,7 +108,10 @@ export const EditConfigTargetModal = ({
     }
   );
 
-  if (drConfig.xClusterConfig.sourceUniverseUUID === undefined) {
+  if (!drConfig.primaryUniverseUuid || !drConfig.drReplicaUniverseUuid) {
+    const i18nKey = drConfig.primaryUniverseUuid
+      ? 'undefinedDrReplicaUniveresUuid'
+      : 'undefinedDrPrimaryUniveresUuid';
     return (
       <YBModal
         title={t('title')}
@@ -115,7 +119,9 @@ export const EditConfigTargetModal = ({
         cancelTestId={`${MODAL_NAME}-CancelButton`}
         {...modalProps}
       >
-        <YBErrorIndicator customErrorMessage="The DR primary universe is not defined for this DR configuration." />
+        <YBErrorIndicator
+          customErrorMessage={t(i18nKey, { keyPrefix: 'clusterDetail.disasterRecovery.error' })}
+        />
       </YBModal>
     );
   }
@@ -126,7 +132,7 @@ export const EditConfigTargetModal = ({
         setCurrentFormStep(FormStep.CONFIGURE_BOOTSTRAP);
         return;
       case FormStep.CONFIGURE_BOOTSTRAP:
-        return editDrConfigMutation.mutateAsync(formValues);
+        return replaceDrReplicaMutation.mutateAsync(formValues);
       default:
         return assertUnreachableCase(currentFormStep);
     }
@@ -178,8 +184,10 @@ export const EditConfigTargetModal = ({
       <FormProvider {...formMethods}>
         <CurrentFormStep
           currentFormStep={currentFormStep}
-          sourceUniverseUUID={drConfig.xClusterConfig.sourceUniverseUUID}
+          sourceUniverseUuid={drConfig.primaryUniverseUuid}
+          targetUniverseUuid={drConfig.drReplicaUniverseUuid}
           isFormDisabled={isFormDisabled}
+          storageConfigUuid={drConfig.bootstrapParams.backupRequestParams.storageConfigUUID}
         />
       </FormProvider>
     </YBModal>

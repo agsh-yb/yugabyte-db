@@ -68,7 +68,7 @@ import algoliasearch from 'algoliasearch';
   function emptySearch() {
     setTimeout(() => {
       if (document.querySelector('body').classList.contains('td-searchpage--')) {
-        document.querySelector('#doc-hit').innerHTML = '<li class="no-result">Search data related to <b>YugabyteDB</b> in our Documentation</li>';
+        document.querySelector('#search-summary').innerHTML = 'Search data related to <b>YugabyteDB</b> in our Documentation.';
         document.querySelector('#pagination-docs').style.display = 'none';
       } else {
         document.querySelector('.search-result').style.display = 'none';
@@ -80,11 +80,14 @@ import algoliasearch from 'algoliasearch';
    * Main Docs section HTML.
    */
   function docsSection(hitIs) {
+    const searchText = searchInput.value.trim();
+
     let content = '';
     hitIs.forEach(hit => {
       let pageBreadcrumb = '';
       let pageHash = '';
       let pageTitle = '';
+      let subHead = '';
 
       if (hit.title) {
         pageTitle = hit.title;
@@ -99,31 +102,53 @@ import algoliasearch from 'algoliasearch';
       }
 
       if (hit._highlightResult.title.matchLevel !== 'full' && hit._highlightResult.description.matchLevel !== 'full') {
-        let partialHeaderMatched = 0;
+        let finalSubHead = '';
+        let partialHeaderLength = 0;
+        let headerFull = '';
+        let headerPartial = '';
         if (hit._highlightResult.headers) {
           hit._highlightResult.headers.every(pageHeader => {
             if (pageHeader.matchLevel) {
-              if (pageHeader.matchLevel === 'full') {
-                pageHash = generateHeadingIDs(pageHeader.value);
-              } else if (pageHeader.matchLevel === 'partial' && pageHeader.matchedWords.length > partialHeaderMatched) {
-                partialHeaderMatched = pageHeader.matchedWords.length;
-                pageHash = generateHeadingIDs(pageHeader.value);
+              const testSubHead = pageHeader.value.replace(/<em>|<\/em>/g, '');
+              if (testSubHead.indexOf(searchText) !== -1) {
+                finalSubHead = pageHeader.value;
+
+                return false;
               }
 
-              if (pageHeader.matchLevel === 'full') {
-                return false;
+              if (pageHeader.matchLevel === 'full' && headerFull === '') {
+                headerFull = pageHeader.value;
+              } else if (pageHeader.matchLevel === 'partial' && pageHeader.matchedWords.length > partialHeaderLength) {
+                headerPartial = pageHeader.value;
+                partialHeaderLength = pageHeader.matchedWords.length;
               }
             }
 
             return true;
           });
+
+          if (finalSubHead !== '') {
+            pageHash = generateHeadingIDs(finalSubHead);
+            subHead = finalSubHead.replace(/<em>|<\/em>/g, '');
+          } else if (headerFull !== '') {
+            pageHash = generateHeadingIDs(headerFull);
+            subHead = headerFull.replace(/<em>|<\/em>/g, '');
+          } else if (headerPartial !== '') {
+            pageHash = generateHeadingIDs(headerPartial);
+            subHead = headerPartial.replace(/<em>|<\/em>/g, '');
+          }
         }
+      }
+
+      if (pageTitle === subHead) {
+        subHead = '';
       }
 
       content += `<li>
         <div class="search-title">
           <a href="${hit.url.replace(/^(?:\/\/|[^/]+)*\//, '/')}${pageHash}">
             <span class="search-title-inner">${pageTitle}</span>
+            <div class="search-subhead-inner">${subHead}</div>
             <div class="breadcrumb-item">${pageBreadcrumb}</div>
           </a>
         </div>
@@ -233,7 +258,9 @@ import algoliasearch from 'algoliasearch';
    * Add queries with filters selected by user and call search algolia function.
    */
   function searchAlgolia() {
-    const searchValue = searchInput.value.trim();
+    const searchedTerm = searchInput.value.trim();
+
+    let searchValue = searchedTerm;
     if (searchValue.length > 0) {
       document.querySelector('.search-result').style.display = 'block';
       setTimeout(() => {
@@ -257,6 +284,16 @@ import algoliasearch from 'algoliasearch';
       hitsPerPage: perPageCount,
       page: 0,
     };
+    const searchSummary = document.getElementById('search-summary');
+
+    if (searchValue.includes('_')) {
+      const searchScript = document.getElementById('algolia-search-script');
+      const sequenceExpressions = searchScript.getAttribute('data-sequence-expressions');
+
+      if (sequenceExpressions) {
+        searchValue = searchValue.replace(/_/g, '-');
+      }
+    }
 
     if (pageItems && pageItems > 0) {
       searchOptions.page = pageItems - 1;
@@ -268,11 +305,54 @@ import algoliasearch from 'algoliasearch';
       }) => {
         let pagerDetails = {};
         let sectionHTML = '';
+        let totalResults = nbHits;
         sectionHTML += docsSection(hits);
+
+        if (totalResults > 1000) {
+          totalResults = 1000;
+        }
+
+        document.getElementById('doc-hit').innerHTML = sectionHTML;
         if (hits.length > 0 && sectionHTML !== '') {
-          document.getElementById('doc-hit').innerHTML = sectionHTML;
+          if (searchSummary !== null) {
+            searchSummary.innerHTML = `${totalResults} results found for <b>"${searchedTerm}"</b>. <a role="button" id="ai-search">Try this search in AI</a>.`;
+          }
         } else {
-          document.getElementById('doc-hit').innerHTML = `<li class="no-result">0 results found for <b>"${searchValue}"</b></li>`;
+          const noResultMessage = `No results found for <b>"${searchedTerm}"</b>. <a role="button" id="ai-search">Try this search in AI</a>.`;
+          if (searchSummary) {
+            searchSummary.innerHTML = noResultMessage;
+          } else {
+            document.getElementById('doc-hit').innerHTML = `<li class="no-result">${noResultMessage}</li>`;
+          }
+        }
+
+        const aiSearch = document.getElementById('ai-search');
+        if (aiSearch) {
+          aiSearch.addEventListener('click', () => {
+            const kapaWidgetButton = document.querySelector('#kapa-widget-container > button');
+            if (kapaWidgetButton) {
+              kapaWidgetButton.click();
+              setTimeout(() => {
+                const aiSearchTab = document.querySelector('.mantine-SegmentedControl-control input[value="search"]');
+                if (aiSearchTab) {
+                  aiSearchTab.click();
+                }
+
+                setTimeout(() => {
+                  const aiSearchInput = document.querySelector('.mantine-TextInput-input');
+                  if (aiSearchInput) {
+                    const event = new Event('input', {
+                      bubbles: true,
+                    });
+
+                    aiSearchInput.setAttribute('value', searchedTerm);
+
+                    document.querySelector('.mantine-TextInput-input').dispatchEvent(event);
+                  }
+                }, 10);
+              }, 5);
+            }
+          });
         }
 
         if (document.querySelector('body').classList.contains('td-searchpage')) {
@@ -280,14 +360,14 @@ import algoliasearch from 'algoliasearch';
             currentPage: page + 1,
             pagerId: 'pagination-docs',
             pagerType: 'docs',
-            totalHits: nbHits,
+            totalHits: totalResults,
             totalPages: nbPages,
           };
 
           searchPagination(pagerDetails);
-          searchpagerparent.className = `pager results-${nbHits}`;
+          searchpagerparent.className = `pager results-${totalResults}`;
         } else {
-          searchpagerparent.className = `pager results-${nbHits}`;
+          searchpagerparent.className = `pager results-${totalResults}`;
           let viewAll = '';
           if (nbPages > 1) {
             viewAll = `<a href="/search/?query=${searchValue}" title="View all results">View all results</a>`;
@@ -295,7 +375,7 @@ import algoliasearch from 'algoliasearch';
 
           document.getElementById('pagination-docs').innerHTML = `<nav class="pager-area">
             <div class="pager-area">
-              <span class="total-result">${nbHits} Results</span>
+              <span class="total-result">${totalResults} Results</span>
             </div>
             ${viewAll}
           </nav>`;
@@ -348,7 +428,11 @@ import algoliasearch from 'algoliasearch';
   addSearchEvents();
 
   document.addEventListener('keydown', (event) => {
-    if (event.code === 'Slash' || event.code === 'NumpadDivide') {
+    if (event.target.nodeName === 'TEXTAREA') {
+      return;
+    }
+
+    if (event.key === '/' || event.code === 'NumpadDivide') {
       document.querySelector('body').classList.add('search-focus');
       if (searchURLParameter('query')) {
         searchInput.setAttribute('value', searchURLParameter('query'));

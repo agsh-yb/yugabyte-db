@@ -79,6 +79,11 @@ extern bool YBIsUsingYBParser();
 extern int YBUnsupportedFeatureSignalLevel();
 
 /**
+ * Returns whether unsafe ALTER notice should be suppressed.
+ */
+extern bool YBSuppressUnsafeAlterNotice();
+
+/**
  * Returns whether non-transactional COPY gflag is enabled.
  */
 extern bool YBIsNonTxnCopyEnabled();
@@ -123,11 +128,6 @@ extern const char *YbGetTmpDir();
  * Returns whether COLLATION support is enabled.
  */
 extern bool YBIsCollationEnabled();
-
-/**
- * Returns whether failure injection is enabled for matview refreshes.
- */
-extern bool YBIsRefreshMatviewFailureInjected();
 
 /**
  * Returns the value of the configration variable `max_clock_sec_usec`

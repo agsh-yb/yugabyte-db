@@ -29,6 +29,7 @@ DECLARE_string(vmodule);
 DECLARE_bool(TEST_disable_apply_committed_transactions);
 DECLARE_bool(TEST_xcluster_fail_table_create_during_bootstrap);
 DECLARE_int32(TEST_user_ddl_operation_timeout_sec);
+DECLARE_bool(TEST_enable_xcluster_api_v2);
 
 using std::string;
 using namespace std::chrono_literals;
@@ -41,17 +42,19 @@ const auto kInsertStmtFormat = Format("INSERT INTO $0 VALUES($1, $1)", kTableNam
 const auto kDropIndexStmt = Format("DROP INDEX $0", kIndexName);
 const auto kId1CountStmt = Format("SELECT COUNT(*) FROM $0 WHERE id1 >= 0", kTableName);
 const auto kId2CountStmt = Format("SELECT COUNT(*) FROM $0 WHERE id2 >= 0", kTableName);
-const auto kSelectAllId1Stmt = Format("SELECT id1 FROM $0 ORDER BY id1", kTableName);
-const auto kSelectAllId2Stmt = Format("SELECT id2 FROM $0 ORDER BY id2", kTableName);
+const auto kSelectAllId12Stmt = Format("SELECT id1, id2 FROM $0 ORDER BY id1, id2", kTableName);
 
 class XClusterYsqlIndexTest : public XClusterYsqlTestBase {
  public:
   void SetUp() override {
     YB_SKIP_TEST_IN_TSAN();
     XClusterYsqlTestBase::SetUp();
-    ASSERT_OK(SET_FLAG(vmodule, "backfill_index*=4,xrepl*=4,xcluster*=4,add_table*=4,catalog*=4"));
-
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_user_ddl_operation_timeout_sec) = NonTsanVsTsan(60, 90);
+    google::SetVLOGLevel("backfill_index*", 4);
+    google::SetVLOGLevel("xrepl*", 4);
+    google::SetVLOGLevel("xcluster*", 4);
+    google::SetVLOGLevel("add_table*", 4);
+    google::SetVLOGLevel("multi_step*", 4);
+    google::SetVLOGLevel("catalog*", 4);
 
     ASSERT_OK(Initialize(3 /* replication_factor */));
 
@@ -122,84 +125,67 @@ class XClusterYsqlIndexTest : public XClusterYsqlTestBase {
     return conn.Execute(Format("CREATE INDEX $0 ON $1 (id2 ASC)", kIndexName, kTableName));
   }
 
-  virtual Status WaitForSafeTimeToAdvanceToNow() {
-    HybridTime now = producer_master_->clock()->Now();
-    for (auto ts : producer_cluster()->mini_tablet_servers()) {
-      now.MakeAtLeast(ts->server()->clock()->Now());
-    }
-    return WaitForSafeTime(namespace_id_, now);
-  }
-
-  template <class T>
-  pgwrapper::GetValueResult<T> FetchValue(const std::string& command, pgwrapper::PGConn* conn) {
-    auto res = VERIFY_RESULT(conn->Fetch(command));
-
-    auto fetched_rows = PQntuples(res.get());
-    auto fetched_columns = PQnfields(res.get());
-    if (fetched_rows != 1 || fetched_columns != 1) {
-      return STATUS_FORMAT(
-          RuntimeError, "Fetched $0 rows and $1 columns, while only 1 expected", fetched_rows,
-          fetched_columns);
-    }
-
-    return pgwrapper::GetValue<T>(res.get(), 0 /* row */, 0 /* column */);
-  }
-
-  Result<string> GetAllRows(pgwrapper::PGConn* conn) {
-    return Format(
-        "\nId1 rows: $0\nId2 rows: $1\n",
-        VERIFY_RESULT(conn->FetchAllAsString(kSelectAllId1Stmt)),
-        VERIFY_RESULT(conn->FetchAllAsString(kSelectAllId2Stmt)));
+  auto GetAllRows(pgwrapper::PGConn* conn) {
+    return conn->FetchRows<int32_t, int32_t>(kSelectAllId12Stmt);
   }
 
   Status ValidateRows() {
-    const auto producer_row_count =
-        VERIFY_RESULT(FetchValue<int64_t>(kId1CountStmt, producer_conn_.get()));
-    const auto id1_count = VERIFY_RESULT(FetchValue<int64_t>(kId1CountStmt, consumer_conn_.get()));
-    const auto id2_count = VERIFY_RESULT(FetchValue<int64_t>(kId2CountStmt, consumer_conn_.get()));
-    SCHECK_EQ(
-        producer_row_count, id1_count, IllegalState,
-        "Producer consumer row count mismatch.\nProducer: " +
-            VERIFY_RESULT(GetAllRows(producer_conn_.get())) +
-            "Consumer: " + VERIFY_RESULT(GetAllRows(consumer_conn_.get())));
-    SCHECK_EQ(
-        id1_count, id2_count, IllegalState,
-        "Id1 id2 row count mismatch." + VERIFY_RESULT(GetAllRows(consumer_conn_.get())));
+    // With should be less than or equal to row_count_ since some inserts may fail due to
+    // transactions aborted by the DDLs.
+    const auto all_prod_rows = VERIFY_RESULT(GetAllRows(producer_conn_.get()));
+    SCHECK_LE(all_prod_rows.size(), row_count_, IllegalState, "Producer row count mismatch.");
+    const auto actual_count = all_prod_rows.size();
 
+    const auto all_cons_rows = VERIFY_RESULT(GetAllRows(consumer_conn_.get()));
     SCHECK_EQ(
-        VERIFY_RESULT(GetAllRows(producer_conn_.get())),
-        VERIFY_RESULT(GetAllRows(consumer_conn_.get())), IllegalState,
-        "Producer and consumer have different rows.");
+        all_prod_rows, all_cons_rows, IllegalState, "Producer and consumer have different rows.");
+
+    const auto producer_count1 =
+        VERIFY_RESULT(producer_conn_->FetchRow<pgwrapper::PGUint64>(kId1CountStmt));
+    SCHECK_EQ(producer_count1, actual_count, IllegalState, "Id1 count mismatch in producer");
+    const auto producer_count2 =
+        VERIFY_RESULT(producer_conn_->FetchRow<pgwrapper::PGUint64>(kId2CountStmt));
+    SCHECK_EQ(producer_count2, actual_count, IllegalState, "Id2 count mismatch in producer");
+
+    const auto consumer_count1 =
+        VERIFY_RESULT(consumer_conn_->FetchRow<pgwrapper::PGUint64>(kId1CountStmt));
+    SCHECK_EQ(consumer_count1, actual_count, IllegalState, "Id1 count mismatch in consumer");
+    const auto consumer_count2 =
+        VERIFY_RESULT(consumer_conn_->FetchRow<pgwrapper::PGUint64>(kId2CountStmt));
+    SCHECK_EQ(consumer_count2, actual_count, IllegalState, "Id2 count mismatch in consumer");
+
     return Status::OK();
   }
 
   // Get row count using indexed table and index when available. Both counts should match.
   // Row count should never move backwards.
-  void ValidateRowsDuringCreateIndex(int initial_count, std::atomic_bool* stop) {
-    int64_t min_count = initial_count;
+  void ValidateRowsDuringCreateIndex(uint64_t initial_count, std::atomic_bool* stop) {
+    auto min_count = initial_count;
     auto consumer_conn = CHECK_RESULT(consumer_cluster_.ConnectToDB(namespace_name));
+    auto row_counts_getter = [&consumer_conn]() -> Result<std::pair<uint64_t, uint64_t>> {
+      // Intentionally fetch id1 count first.
+      const auto count1 = VERIFY_RESULT(consumer_conn.FetchRow<pgwrapper::PGUint64>(kId1CountStmt));
+      const auto count2 = VERIFY_RESULT(consumer_conn.FetchRow<pgwrapper::PGUint64>(kId2CountStmt));
+      return std::make_pair(count1, count2);
+    };
+
     while (!*stop) {
-      int64_t id1_count, id2_count;
-      auto get_row_counts = [&]() -> Status {
-        id1_count = VERIFY_RESULT(FetchValue<int64_t>(kId1CountStmt, &consumer_conn));
-        id2_count = VERIFY_RESULT(FetchValue<int64_t>(kId2CountStmt, &consumer_conn));
-        return Status::OK();
-      };
-      auto s = get_row_counts();
-      if (!s.ok()) {
+      auto result = row_counts_getter();
+      if (!result.ok()) {
         // Failure expected from the index create DDL. DDL version is bumped and propagated to pg
         // clients asynchronously leading to transient errors.
-        CHECK(s.message().Contains("schema version mismatch"));
+        CHECK(result.status().message().Contains("schema version mismatch"));
         continue;
       }
+      auto [id1_count, id2_count] = *result;
 
       CHECK_GE(id2_count, min_count)
-          << "Id2 count reduced." << CHECK_RESULT(GetAllRows(consumer_conn_.get()));
+          << "Id2 count reduced." << ToString(CHECK_RESULT(GetAllRows(consumer_conn_.get())));
 
       // id1_count should be less than or equal to id2_count because it was fetched first and the
       // two statements are run in different transactions.
       CHECK_LE(id1_count, id2_count) << "Id1 count should be <= id2 row count."
-                                     << CHECK_RESULT(GetAllRows(consumer_conn_.get()));
+                                     << ToString(CHECK_RESULT(GetAllRows(consumer_conn_.get())));
 
       min_count = id2_count;
 
@@ -241,6 +227,9 @@ class XClusterYsqlIndexTest : public XClusterYsqlTestBase {
       SleepFor(3s * kTimeMultiplier);
 
       RETURN_NOT_OK(CreateIndex(*consumer_conn_));
+
+      // Keep running for a while with the index.
+      SleepFor(3s * kTimeMultiplier);
     }
 
     SCHECK(
@@ -248,6 +237,7 @@ class XClusterYsqlIndexTest : public XClusterYsqlTestBase {
         "Index scan should be present on Consumer col id2.");
 
     RETURN_NOT_OK(WaitForSafeTimeToAdvanceToNow());
+
     RETURN_NOT_OK(ValidateRows());
 
     for (int i = 0; i < 20; row_count_++, i++) {
@@ -262,7 +252,7 @@ class XClusterYsqlIndexTest : public XClusterYsqlTestBase {
   client::YBTableName yb_table_name_;
   NamespaceId namespace_id_;
   std::unique_ptr<pgwrapper::PGConn> producer_conn_, consumer_conn_;
-  int row_count_ = 0;
+  uint row_count_ = 0;
 };
 
 TEST_F(XClusterYsqlIndexTest, CreateIndex) {
@@ -308,20 +298,22 @@ TEST_F(XClusterYsqlIndexTest, CreateIndexWithWorkload) {
 
 TEST_F(XClusterYsqlIndexTest, FailedCreateIndex) {
   // Create index on consumer before producer should fail.
-  ASSERT_NOK(CreateIndex(*consumer_conn_));
+  ASSERT_QUERY_FAIL(CreateIndex(*consumer_conn_), "not found");
 
   ASSERT_OK(CreateIndex(*producer_conn_));
 
   // Create index while replication is paused should fail.
   ASSERT_OK(
       ToggleUniverseReplication(consumer_cluster(), consumer_client(), kReplicationGroupId, false));
-  ASSERT_NOK(CreateIndex(*consumer_conn_));
+  ASSERT_QUERY_FAIL(CreateIndex(*consumer_conn_), "is currently disabled");
+
   ASSERT_OK(
       ToggleUniverseReplication(consumer_cluster(), consumer_client(), kReplicationGroupId, true));
 
   // Failure during bootstrap
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_fail_table_create_during_bootstrap) = true;
-  ASSERT_NOK(CreateIndex(*consumer_conn_));
+  ASSERT_QUERY_FAIL(
+      CreateIndex(*consumer_conn_), "FLAGS_TEST_xcluster_fail_table_create_during_bootstrap");
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_xcluster_fail_table_create_during_bootstrap) = false;
 
   ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
@@ -334,14 +326,16 @@ TEST_F(XClusterYsqlIndexTest, FailedCreateIndex) {
 }
 
 TEST_F(XClusterYsqlIndexTest, MasterFailoverRetryAddTableToXcluster) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_user_ddl_operation_timeout_sec) = NonTsanVsTsan(60, 90);
+
   ASSERT_OK(CreateIndex(*producer_conn_));
 
   SyncPoint::GetInstance()->LoadDependency(
-      {{"AddTableToXClusterTask::RunInternal::BeforeBootstrap",
+      {{"AddTableToXClusterTargetTask::RunInternal::BeforeBootstrap",
         "MasterFailoverRetryAddTableToXcluster::BeforeStepDown"}});
 
   SyncPoint::GetInstance()->SetCallBack(
-      "AddTableToXClusterTask::RunInternal::BeforeBootstrap",
+      "AddTableToXClusterTargetTask::RunInternal::BeforeBootstrap",
       [](void* stuck_add_table_to_xcluster) {
         *(reinterpret_cast<bool*>(stuck_add_table_to_xcluster)) = true;
       });
@@ -461,6 +455,49 @@ TEST_F(XClusterColocatedNonTransactionalIndexTest, CreateIndexWithWorkload) {
 
   // We should only have 1 stream
   ASSERT_EQ(resp.entry().table_streams_size(), 1);
+}
+
+class XClusterDbScopedYsqlIndexTest : public XClusterYsqlIndexTest {
+  Status SetupUniverseReplication(
+      MiniCluster* producer_cluster, MiniCluster* consumer_cluster, YBClient* consumer_client,
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const std::vector<TableId>& producer_table_ids,
+      const std::vector<xrepl::StreamId>& bootstrap_ids, SetupReplicationOptions opts) override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_xcluster_api_v2) = true;
+    RETURN_NOT_OK(CheckpointReplicationGroup());
+    RETURN_NOT_OK(CreateReplicationFromCheckpoint());
+    return Status::OK();
+  }
+  Status ChangeXClusterRole(const cdc::XClusterRole role, Cluster* cluster) override {
+    // No-op for Db scoped repl groups.
+    return Status::OK();
+  }
+};
+
+TEST_F(XClusterDbScopedYsqlIndexTest, CreateIndex) {
+  ASSERT_OK(CreateIndex(*producer_conn_));
+  ASSERT_FALSE(ASSERT_RESULT(producer_conn_->HasIndexScan(kId1CountStmt)));
+  ASSERT_TRUE(ASSERT_RESULT(producer_conn_->HasIndexScan(kId2CountStmt)));
+
+  ASSERT_OK(ValidateRows());
+
+  ASSERT_OK(CreateIndex(*consumer_conn_));
+  ASSERT_FALSE(ASSERT_RESULT(consumer_conn_->HasIndexScan(kId1CountStmt)));
+  ASSERT_TRUE(ASSERT_RESULT(consumer_conn_->HasIndexScan(kId2CountStmt)));
+
+  ASSERT_OK(ValidateRows());
+
+  // Insert more rows and validate.
+  for (int i = 0; i < 10; i++, row_count_++) {
+    ASSERT_OK(producer_conn_->ExecuteFormat(kInsertStmtFormat, row_count_));
+  }
+
+  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
+  ASSERT_OK(ValidateRows());
+}
+
+TEST_F(XClusterDbScopedYsqlIndexTest, CreateIndexWithWorkload) {
+  ASSERT_OK(TestCreateIndexConcurrentWorkload());
 }
 
 }  // namespace yb

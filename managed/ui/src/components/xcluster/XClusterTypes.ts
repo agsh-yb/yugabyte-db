@@ -5,18 +5,20 @@ import {
   DROPDOWN_DIVIDER,
   MetricName,
   METRIC_TIME_RANGE_OPTIONS,
-  XClusterTableEligibility
+  XClusterTableEligibility,
+  XCLUSTER_SUPPORTED_TABLE_TYPES
 } from './constants';
 
-import { TableType, YBTable } from '../../redesign/helpers/dtos';
+import { MetricTrace, YBTable } from '../../redesign/helpers/dtos';
 import { XClusterTableDetails } from './dtos';
 
 /**
  * XCluster supported table type.
  */
-export type XClusterTableType = typeof TableType.PGSQL_TABLE_TYPE | typeof TableType.YQL_TABLE_TYPE;
+export type XClusterTableType = typeof XCLUSTER_SUPPORTED_TABLE_TYPES[number];
 
-export type XClusterTable = YBTable & Omit<XClusterTableDetails, 'tableId'>;
+export type XClusterTable = YBTable &
+  Omit<XClusterTableDetails, 'tableId'> & { replicationLag?: number };
 
 //------------------------------------------------------------------------------------
 // Table Selection Types
@@ -32,31 +34,39 @@ export type EligibilityDetails =
       status: typeof XClusterTableEligibility.ELIGIBLE_IN_CURRENT_CONFIG;
       xClusterConfigName: string;
     }
-  | { status: typeof XClusterTableEligibility.INELIGIBLE_IN_USE; xClusterConfigName: string }
-  | { status: typeof XClusterTableEligibility.INELIGIBLE_NO_MATCH };
+  | { status: typeof XClusterTableEligibility.INELIGIBLE_IN_USE; xClusterConfigName: string };
 
 /**
- * YBTable with an EligibilityDetail field
+ * YBTable with an EligibilityDetail field.
  */
-export interface XClusterTableCandidate extends YBTable {
+export interface IndexTableReplicationCandidate extends YBTable {
   eligibilityDetails: EligibilityDetails;
 }
 
 /**
+ * YBTable with an EligibilityDetail field and an array of index tables.
+ */
+export interface MainTableReplicationCandidate extends YBTable {
+  eligibilityDetails: EligibilityDetails;
+  indexTables?: IndexTableReplicationCandidate[];
+}
+
+export type TableReplicationCandidate =
+  | MainTableReplicationCandidate
+  | IndexTableReplicationCandidate;
+
+/**
  * Holds list of tables for a keyspace and provides extra metadata.
  */
-export interface KeyspaceItem {
+export interface NamespaceItem {
+  uuid: string;
   name: string;
   tableEligibilityCount: {
     ineligible: number;
     eligibleInCurrentConfig: number;
   };
   sizeBytes: number;
-  tables: XClusterTableCandidate[];
-}
-
-export interface KeyspaceRow extends KeyspaceItem {
-  keyspace: string;
+  tables: MainTableReplicationCandidate[];
 }
 
 /**
@@ -64,24 +74,9 @@ export interface KeyspaceRow extends KeyspaceItem {
  */
 export type ReplicationItems = Record<
   XClusterTableType,
-  { keyspaces: Record<string, KeyspaceItem>; tableCount: number }
+  { namespaces: Record<string, NamespaceItem>; tableCount: number }
 >;
 //------------------------------------------------------------------------------------
-
-// TODO: Move the metric types to dtos.ts or another more appropriate file.
-
-export interface MetricTrace {
-  instanceName?: string;
-  name: string;
-  type: string;
-  x: number[];
-  y: string[] | number[];
-  mode?: string;
-  line?: {
-    dash: string;
-    width: number;
-  };
-}
 
 export type Metrics<MetricNameType extends MetricName> = {
   [metricName in MetricNameType]: {
@@ -101,6 +96,8 @@ export type Metrics<MetricNameType extends MetricName> = {
     queryKey: string;
   };
 };
+
+//------------------------------------------------------------------------------------
 
 // Time range selector types.
 

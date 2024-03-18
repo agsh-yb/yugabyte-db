@@ -2,13 +2,14 @@
 
 package com.yugabyte.yw.commissioner.tasks.upgrade;
 
-import static com.yugabyte.yw.commissioner.ITask.Abortable;
-import static com.yugabyte.yw.commissioner.ITask.Retryable;
-
 import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.KubernetesUpgradeTaskBase;
+import com.yugabyte.yw.commissioner.UpgradeTaskBase.UpgradeContext;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
+import com.yugabyte.yw.common.operator.OperatorStatusUpdaterFactory;
 import com.yugabyte.yw.forms.RollbackUpgradeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
@@ -21,8 +22,10 @@ import lombok.extern.slf4j.Slf4j;
 public class RollbackKubernetesUpgrade extends KubernetesUpgradeTaskBase {
 
   @Inject
-  protected RollbackKubernetesUpgrade(BaseTaskDependencies baseTaskDependencies) {
-    super(baseTaskDependencies);
+  protected RollbackKubernetesUpgrade(
+      BaseTaskDependencies baseTaskDependencies,
+      OperatorStatusUpdaterFactory operatorStatusUpdaterFactory) {
+    super(baseTaskDependencies, operatorStatusUpdaterFactory);
   }
 
   @Override
@@ -32,7 +35,7 @@ public class RollbackKubernetesUpgrade extends KubernetesUpgradeTaskBase {
 
   @Override
   public UserTaskDetails.SubTaskGroupType getTaskSubGroupType() {
-    return UserTaskDetails.SubTaskGroupType.UpgradingSoftware;
+    return UserTaskDetails.SubTaskGroupType.RollingBackSoftware;
   }
 
   public NodeDetails.NodeState getNodeState() {
@@ -44,6 +47,9 @@ public class RollbackKubernetesUpgrade extends KubernetesUpgradeTaskBase {
     runUpgrade(
         () -> {
           Universe universe = getUniverse();
+
+          createUpdateUniverseSoftwareUpgradeStateTask(
+              UniverseDefinitionTaskParams.SoftwareUpgradeState.RollingBack);
 
           UniverseDefinitionTaskParams.PrevYBSoftwareConfig prevYBSoftwareConfig =
               universe.getUniverseDetails().prevYBSoftwareConfig;
@@ -65,11 +71,26 @@ public class RollbackKubernetesUpgrade extends KubernetesUpgradeTaskBase {
               true,
               true,
               taskParams().isEnableYbc(),
-              taskParams().getYbcSoftwareVersion());
+              taskParams().getYbcSoftwareVersion(),
+              getRollbackUpgradeContext(newVersion));
 
           // Update Software version
           createUpdateSoftwareVersionTask(newVersion, false /*isSoftwareUpdateViaVm*/)
               .setSubTaskGroupType(getTaskSubGroupType());
+
+          createUpdateUniverseSoftwareUpgradeStateTask(
+              UniverseDefinitionTaskParams.SoftwareUpgradeState.Ready,
+              false /* isSoftwareRollbackAllowed */);
         });
+  }
+
+  private UpgradeContext getRollbackUpgradeContext(String targetSoftwareVersion) {
+    return UpgradeContext.builder()
+        .reconfigureMaster(false)
+        .runBeforeStopping(false)
+        .processInactiveMaster(true)
+        .processTServersFirst(true)
+        .targetSoftwareVersion(targetSoftwareVersion)
+        .build();
   }
 }

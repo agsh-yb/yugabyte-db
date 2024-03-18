@@ -25,6 +25,12 @@ import {
   DEVICE_INFO_FIELD
 } from '../../../utils/constants';
 import { useSectionStyles } from '../../../universeMainStyle';
+import { CPUArchField } from '../../fields/CPUArchField/CPUArchField';
+import { LinuxVersionField } from '../../fields/LinuxVersionField/LinuxVersionField';
+import {
+  VM_PATCHING_RUNTIME_CONFIG,
+  isImgBundleSupportedByProvider
+} from '../../../../../../../components/configRedesign/providerRedesign/components/linuxVersionCatalog/LinuxVersionUtils';
 
 const CONTAINER_WIDTH = '605px';
 
@@ -56,9 +62,13 @@ export const InstanceConfiguration = ({ runtimeConfigs }: UniverseFormConfigurat
     (c: RunTimeConfigEntry) => c.key === 'yb.max_volume_count'
   )?.value;
 
+  const osPatchingEnabled = runtimeConfigs?.configEntries?.find(
+    (c: RunTimeConfigEntry) => c.key === VM_PATCHING_RUNTIME_CONFIG
+  )?.value;
+
   //form context
   const { getValues } = useFormContext<UniverseFormData>();
-  const { mode, clusterType, newUniverse, universeConfigureTemplate } = useContext(
+  const { mode, clusterType, newUniverse, universeConfigureTemplate, isViewMode } = useContext(
     UniverseFormContext
   )[0];
   const isPrimary = clusterType === ClusterType.PRIMARY;
@@ -82,11 +92,12 @@ export const InstanceConfiguration = ({ runtimeConfigs }: UniverseFormConfigurat
             <K8NodeSpecField
               isEditMode={!isCreateMode}
               isDedicatedMasterField={isDedicatedMasterField}
+              disabled={isViewMode}
             />
             <K8VolumeInfoField
               isEditMode={!isCreateMode}
               isDedicatedMasterField={isDedicatedMasterField}
-              disableVolumeSize={!isNodeResizable}
+              disableVolumeSize={!isNodeResizable || isViewMode}
               disableNumVolumes={!isCreateMode && provider?.code === CloudType.kubernetes}
               maxVolumeCount={maxVolumeCount}
             />
@@ -96,11 +107,13 @@ export const InstanceConfiguration = ({ runtimeConfigs }: UniverseFormConfigurat
             <InstanceTypeField
               isEditMode={!isCreateMode}
               isDedicatedMasterField={isDedicatedMasterField}
+              disabled={isViewMode}
             />
             <VolumeInfoField
+              isNodeResizable={isNodeResizable}
               isEditMode={!isCreateMode}
               isPrimary={isPrimary}
-              disableVolumeSize={!isNodeResizable}
+              disableVolumeSize={!isNodeResizable || isViewMode}
               disableNumVolumes={!isCreateMode && provider?.code === CloudType.kubernetes}
               disableStorageType={!isCreatePrimary && !isCreateRR}
               disableIops={!isCreatePrimary && !isCreateRR}
@@ -131,7 +144,17 @@ export const InstanceConfiguration = ({ runtimeConfigs }: UniverseFormConfigurat
       data-testid="InstanceConfiguration-Section"
     >
       <Typography variant="h4">{t('universeForm.instanceConfig.title')}</Typography>
-      <Box width="100%" display="flex" flexDirection="column" mt={4}>
+      <Box width="100%" display="flex" flexDirection="column" mt={2}>
+        {osPatchingEnabled === 'true' && isImgBundleSupportedByProvider(provider) && (
+          <Grid lg={6} item container>
+            <CPUArchField disabled={!isCreatePrimary} />
+            <Box mt={2} width={'100%'}>
+              <LinuxVersionField disabled={!isCreateMode} />
+            </Box>
+          </Grid>
+        )}
+      </Box>
+      <Box width="100%" display="flex" flexDirection="column" mt={2}>
         <Grid container spacing={3}>
           <Grid lg={6} item container>
             {/* Display separate section for Master and TServer in dedicated mode*/}

@@ -277,7 +277,9 @@ public class ApiUtils {
       @Override
       public void run(Universe universe) {
         UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
-        UserIntent userIntent = universeDetails.getPrimaryCluster().userIntent;
+        final UniverseDefinitionTaskParams.Cluster primaryCluster =
+            universeDetails.getPrimaryCluster();
+        UserIntent userIntent = primaryCluster.userIntent;
         // Add a desired number of nodes.
         universeDetails.nodeDetailsSet = new HashSet<>();
         userIntent.numNodes = userIntent.replicationFactor;
@@ -287,12 +289,14 @@ public class ApiUtils {
                   idx,
                   NodeDetails.NodeState.Live,
                   setMasters && idx <= userIntent.replicationFactor);
+          node.placementUuid = primaryCluster.uuid;
           universeDetails.nodeDetailsSet.add(node);
         }
         universeDetails.upsertPrimaryCluster(userIntent, null);
 
         NodeDetails node =
             getDummyNodeDetails(userIntent.numNodes + 1, NodeDetails.NodeState.Removed);
+        node.placementUuid = primaryCluster.uuid;
         universeDetails.nodeDetailsSet.add(node);
         universeDetails.nodePrefix = "host";
         universe.setUniverseDetails(universeDetails);
@@ -532,7 +536,7 @@ public class ApiUtils {
       node.isMaster = true;
       node.isTserver = false;
       node.cloudInfo = new CloudSpecificInfo();
-      node.cloudInfo.private_ip = "1.2.3.4";
+      node.cloudInfo.private_ip = "1.2.3." + Integer.toString(i);
       counter++;
       nodeDetailsSet.add(node);
     }
@@ -544,7 +548,7 @@ public class ApiUtils {
       node.isMaster = false;
       node.isTserver = true;
       node.cloudInfo = new CloudSpecificInfo();
-      node.cloudInfo.private_ip = "1.2.3.4";
+      node.cloudInfo.private_ip = "1.2.2." + Integer.toString(i);
       counter++;
       nodeDetailsSet.add(node);
     }
@@ -675,6 +679,7 @@ public class ApiUtils {
     DeviceInfo deviceInfo = new DeviceInfo();
     deviceInfo.numVolumes = numVolumes;
     deviceInfo.volumeSize = volumeSize;
+    deviceInfo.mountPoints = "/mnt/d0";
     return deviceInfo;
   }
 

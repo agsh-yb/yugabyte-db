@@ -39,7 +39,6 @@
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tools/admin-test-base.h"
-#include "yb/tserver/xcluster_consumer.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/util/backoff_waiter.h"
@@ -764,17 +763,16 @@ class XClusterTabletSplitMetricsTest : public XClusterTabletSplitITest {
 
       for (const auto& tablet_id : tablet_ids) {
         // Fetch the metrics, but ensure we don't create new metric entities.
-        const auto metrics =
-            std::static_pointer_cast<cdc::CDCTabletMetrics>(cdc_service->GetCDCTabletMetrics(
-                {{}, stream_id, tablet_id}, nullptr /* tablet_peer */, cdc::XCLUSTER,
-                cdc::CreateCDCMetricsEntity::kFalse));
+        const auto metrics = GetXClusterTabletMetrics(
+            *cdc_service, tablet_id, stream_id, cdc::CreateMetricsEntityIfNotFound::kFalse);
         if (metrics) {
           committed_lag_micros = std::max(
-              committed_lag_micros, metrics->async_replication_committed_lag_micros->value());
+              committed_lag_micros, metrics.get()->async_replication_committed_lag_micros->value());
           sent_lag_micros =
-              std::max(sent_lag_micros, metrics->async_replication_sent_lag_micros->value());
-          LOG(INFO) << tablet_id << ": " << metrics->async_replication_committed_lag_micros->value()
-                    << " " << metrics->async_replication_sent_lag_micros->value();
+              std::max(sent_lag_micros, metrics.get()->async_replication_sent_lag_micros->value());
+          LOG(INFO) << tablet_id << ": "
+                    << metrics.get()->async_replication_committed_lag_micros->value() << " "
+                    << metrics.get()->async_replication_sent_lag_micros->value();
         } else {
           LOG(INFO) << tablet_id << ": no metrics";
         }

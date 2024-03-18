@@ -3,20 +3,16 @@ title: Cassandra feature support
 linkTitle: Cassandra feature support
 description: Summary of YugabyteDB's parity to Cassandra features
 headcontent: YugabyteDB supports most standard Cassandra features
-image: /images/section_icons/secure/create-roles.png
 menu:
   preview:
     identifier: explore-ycql-language-feature-support
     parent: explore-ycql-language
     weight: 50
 
-rightNav:
-  hideH3: true
-
 type: docs
 ---
 
-Yugabyte Cloud Query Language (YCQL) has its roots in the [Cassandra Query Language (CQL)](http://cassandra.apache.org/doc/latest/cql/index.html). This page highlights the important differences in feature support between YCQL and Cassandra 3.4.2.
+Yugabyte Cloud Query Language (YCQL) has its roots in the [Cassandra Query Language (CQL)](http://cassandra.apache.org/doc/latest/cql/index.html). The following tables highlight the important differences in feature support between YCQL and Cassandra 3.4.2.
 
 ## Data types
 
@@ -31,7 +27,7 @@ Yugabyte Cloud Query Language (YCQL) has its roots in the [Cassandra Query Langu
 | {{<icon/yes>}} | Date/Time    | [DATE, TIME, TIMESTAMP](../../../api/ycql/type_datetime/)                                    |
 | {{<icon/yes>}} | Collections  | [FROZEN](../../../api/ycql/type_frozen), [LIST, MAP, SET](../../../api/ycql/type_collection) |
 | {{<icon/yes>}} | IP Addresses | [INET](../../../api/ycql/type_inet)                                                          |
-| {{<icon/yes>}} | Json         | [JSONB](../../../api/ycql/type_jsonb)                                                        |
+| {{<icon/yes>}} | JSON         | [JSONB](../../../api/ycql/type_jsonb)                                                        |
 | {{<icon/yes>}} | String       | [TEXT, VARCHAR](../../../api/ycql/type_text)                                                 |
 | {{<icon/yes>}} | UUID         | [TIMEUUID, UUID](../../../api/ycql/type_uuid)                                                |
 | {{<icon/no>}}  | TUPLE        |                                                                                              |
@@ -79,7 +75,7 @@ Yugabyte Cloud Query Language (YCQL) has its roots in the [Cassandra Query Langu
 | {{<icon/yes>}} | Partial indexes              | [Partial indexes](../../../api/ycql/ddl_create_index#partial-index)                               |
 | {{<icon/yes>}} | Covering indexes             | [Covering indexes](../../../api/ycql/ddl_create_index#included-columns)                           |
 | {{<icon/yes>}} | Unique indexes               | [Unique indexes](../../../api/ycql/ddl_create_index#unique-index)                                 |
-| {{<icon/no>}}  | Adding indexes on Collection | Cannot create index on  `map/list/set/full jsonb/udt` and the keys,values,entries of a collection |
+| {{<icon/no>}}  | Adding indexes on Collection | Cannot create index on `map/list/set/full jsonb/udt` and the keys,values,entries of a collection |
 {.sno-1}
 
 ## DML
@@ -110,13 +106,13 @@ Yugabyte Cloud Query Language (YCQL) has its roots in the [Cassandra Query Langu
 
 ### Delete
 
-|                |                 Operation                 |                                 Details                                  |
-| :------------: | :---------------------------------------- | :----------------------------------------------------------------------- |
-| {{<icon/yes>}} | Delete rows                               | [DELETE](../../../api/ycql/dml_delete/)                                  |
-| {{<icon/yes>}} | Conditional delete with `IF` clause       | [DELETE ... IF](../../../api/ycql/dml_update#if-clause)                  |
-| {{<icon/yes>}} | Conditional delete with `[NOT] IN` clause | [DELETE ... WHERE key IN ...](../../../api/ycql/dml_delete#where-clause) |
-| {{<icon/yes>}} | Delete with `USING` clause                | [DELETE ... USING](../../../api/ycql/dml_delete#using-clause)            |
-| {{<icon/no>}}  | Conditional Delete using `CONTAINS [KEY]` | `DELETE ... WHERE <col> CONTAINS ...`                                    |
+|                    |                 Operation                 |                               Details                                |
+| :----------------: | :---------------------------------------- | :------------------------------------------------------------------- |
+| {{<icon/partial>}} | Delete rows                               | [DELETE](../../../api/ycql/dml_delete/)  - Only single row deletes   |
+|   {{<icon/yes>}}   | Conditional delete with `IF` clause       | [DELETE ... IF](../../../api/ycql/dml_update#if-clause)              |
+|   {{<icon/yes>}}   | Delete with `USING` clause                | [DELETE ... USING](../../../api/ycql/dml_delete#using-clause)        |
+| {{<icon/partial>}} | Conditional delete with `[NOT] IN` clause | [Only single row deletes](../../../api/ycql/dml_delete#where-clause) |
+|   {{<icon/no>}}    | Conditional delete using `CONTAINS [KEY]` | `DELETE ... WHERE <col> CONTAINS ...`                                |
 {.sno-1}
 
 ### Insert

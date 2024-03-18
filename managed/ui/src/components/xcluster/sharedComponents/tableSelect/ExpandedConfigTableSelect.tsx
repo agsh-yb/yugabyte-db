@@ -10,14 +10,15 @@ import { YBControlledSelect } from '../../../common/forms/fields';
 import YBPagination from '../../../tables/YBPagination/YBPagination';
 import { XClusterTableStatus } from '../../constants';
 import { formatBytes, tableSort } from '../../ReplicationUtils';
+import { XClusterTableStatusLabel } from '../../XClusterTableStatusLabel';
+import { SortOrder } from '../../../../redesign/helpers/constants';
+import { getTableName, getTableUuid } from '../../../../utils/tableUtils';
 
 import { XClusterTableType } from '../..';
 import { TableType } from '../../../../redesign/helpers/dtos';
+import { XClusterTable } from '../../XClusterTypes';
 
 import styles from './ExpandedTableSelect.module.scss';
-import { XClusterTable } from '../../XClusterTypes';
-import { XClusterTableStatusLabel } from '../../XClusterTableStatusLabel';
-import { SortOrder } from '../../../../redesign/helpers/constants';
 
 const TABLE_MIN_PAGE_SIZE = 10;
 const PAGE_SIZE_OPTIONS = [TABLE_MIN_PAGE_SIZE, 20, 30, 40, 50, 100, 1000] as const;
@@ -27,7 +28,6 @@ interface ExpandedConfigTableSelectProps {
   selectedTableUUIDs: string[];
   tableType: XClusterTableType;
   sourceUniverseUUID: string;
-  sourceUniverseNodePrefix: string;
   handleTableSelect: (row: XClusterTable, isSelected: boolean) => void;
   handleAllTableSelect: (isSelected: boolean, rows: XClusterTable[]) => boolean;
 }
@@ -37,7 +37,6 @@ export const ExpandedConfigTableSelect = ({
   selectedTableUUIDs,
   tableType,
   sourceUniverseUUID,
-  sourceUniverseNodePrefix,
   handleTableSelect,
   handleAllTableSelect
 }: ExpandedConfigTableSelectProps) => {
@@ -74,7 +73,7 @@ export const ExpandedConfigTableSelect = ({
         options={tableOptions}
       >
         <TableHeaderColumn dataField="tableUUID" isKey={true} hidden={true} />
-        <TableHeaderColumn dataField="tableName" dataSort={true}>
+        <TableHeaderColumn dataField="tableName" dataFormat={(_, table) => getTableName(table)}>
           Table Name
         </TableHeaderColumn>
         <TableHeaderColumn
@@ -86,13 +85,11 @@ export const ExpandedConfigTableSelect = ({
         </TableHeaderColumn>
         <TableHeaderColumn
           dataField="status"
-          dataFormat={(cell: XClusterTableStatus, row: XClusterTable) => (
+          dataFormat={(xClusterTableStatus: XClusterTableStatus, xClusterTable: XClusterTable) => (
             <XClusterTableStatusLabel
-              status={cell}
-              streamId={row.streamId}
-              tableUUID={row.tableUUID}
-              nodePrefix={sourceUniverseNodePrefix}
-              universeUUID={sourceUniverseUUID}
+              replicationLag={xClusterTable.replicationLag}
+              status={xClusterTableStatus}
+              sourceUniverseUuid={sourceUniverseUUID}
             />
           )}
         >

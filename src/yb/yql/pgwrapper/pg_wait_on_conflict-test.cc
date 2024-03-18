@@ -34,11 +34,13 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
+#include "yb/util/sync_point.h"
 
 #include "yb/yql/pgwrapper/libpq_test_base.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 #include "yb/yql/pgwrapper/pg_tablet_split_test_base.h"
+#include "yb/yql/pgwrapper/pg_test_utils.h"
 
 
 DECLARE_bool(enable_wait_queues);
@@ -51,14 +53,17 @@ DECLARE_uint64(force_single_shard_waiter_retry_ms);
 DECLARE_uint64(rpc_connection_timeout_ms);
 DECLARE_uint64(transactions_status_poll_interval_ms);
 DECLARE_int32(TEST_sleep_amidst_iterating_blockers_ms);
-DECLARE_int32(ysql_max_write_restart_attempts);
 DECLARE_uint64(refresh_waiter_timeout_ms);
+DECLARE_bool(ysql_skip_row_lock_for_update);
 DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_bool(TEST_drop_participant_signal);
 DECLARE_int32(send_wait_for_report_interval_ms);
+DECLARE_uint64(wait_for_relock_unblocked_txn_keys_ms);
 DECLARE_uint64(TEST_inject_process_update_resp_delay_ms);
 DECLARE_uint64(TEST_delay_rpc_status_req_callback_ms);
+DECLARE_int32(TEST_txn_participant_inject_delay_on_start_shutdown_ms);
+DECLARE_string(ysql_pg_conf_csv);
 
 using namespace std::literals;
 
@@ -75,7 +80,7 @@ class PgWaitQueuesTest : public PgMiniTestBase {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_select_all_status_tablets) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_single_shard_waiter_retry_ms) = 10000;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_max_write_restart_attempts) = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = MaxQueryLayerRetriesConf(0);
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
     PgMiniTestBase::SetUp();
   }
@@ -133,29 +138,35 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TestDeadlock)) {
       ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
 
       ASSERT_OK(conn.FetchFormat("SELECT * FROM foo WHERE k=$0 FOR UPDATE", i));
+
+      auto txn_id = ASSERT_RESULT(conn.FetchRow<Uuid>("SELECT yb_get_current_transaction()"));
       first_select.CountDown();
-      LOG(INFO) << "Finished first select " << i;
+      LOG(INFO) << "Finished first select thread " << i << " with txn " << txn_id.ToString();
 
       ASSERT_TRUE(first_select.WaitFor(5s * kTimeMultiplier));
 
+      LOG(INFO) << "Unblocked thread " << i;
+
       auto blocker_idx = GetBlockerIdx(i, kCycleSize);
+
+      LOG(INFO) << "Unblocked thread " << i << " " << blocker_idx;
 
       if (conn.FetchFormat("SELECT * FROM foo WHERE k=$0 FOR UPDATE", blocker_idx).ok()) {
         succeeded_second_select++;
-        LOG(INFO) << "Second select succeeded " << i << " on blocker " << blocker_idx;
+        LOG(INFO) << "Second select succeeded thread " << i << " on blocker " << blocker_idx;
 
         if (conn.CommitTransaction().ok()) {
-          LOG(INFO) << "Commit succeeded " << i;
+          LOG(INFO) << "Commit succeeded thread " << i;
           succeeded_commit++;
         } else {
-          LOG(INFO) << "Commit failed " << i;
+          LOG(INFO) << "Commit failed thread " << i;
         }
       } else {
-        LOG(INFO) << "Second select failed " << i << " on blocker " << blocker_idx;
+        LOG(INFO) << "Second select failed thread " << i << " on blocker " << blocker_idx;
       }
 
       done.CountDown();
-      LOG(INFO) << "Thread done " << i;
+      LOG(INFO) << "Done thread " << i;
       ASSERT_TRUE(done.WaitFor(5s * kTimeMultiplier));
     });
   }
@@ -703,11 +714,11 @@ class ConcurrentBlockedWaitersTest {
     auto conn = VERIFY_RESULT(GetDbConn());
     for (int i = 0; i < num_waiters; ++i) {
       auto k = num_waiters + i;
-      auto v = VERIFY_RESULT(conn.FetchValue<int32_t>(Format("SELECT v FROM foo WHERE k=$0", k)));
+      auto v = VERIFY_RESULT(conn.FetchRow<int32_t>(Format("SELECT v FROM foo WHERE k=$0", k)));
       EXPECT_EQ(v, k);
     }
     for (int i = -1; i > num_waiters; --i) {
-      auto v = VERIFY_RESULT(conn.FetchValue<int32_t>(Format("SELECT v FROM foo WHERE k=$0", i)));
+      auto v = VERIFY_RESULT(conn.FetchRow<int32_t>(Format("SELECT v FROM foo WHERE k=$0", i)));
       EXPECT_EQ(v, i);
     }
     return Status::OK();
@@ -804,7 +815,7 @@ class PgTabletSplittingWaitQueuesTest : public PgTabletSplitTestBase,
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_connection_timeout_ms) = 60000;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_max_write_restart_attempts) = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = MaxQueryLayerRetriesConf(0);
     PgTabletSplitTestBase::SetUp();
   }
 
@@ -846,7 +857,7 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TablegroupUpdateAndSelectForSha
   std::thread th([&] {
     auto conn2 = ASSERT_RESULT(Connect());
     ASSERT_OK(conn2.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
-    auto value = conn2.FetchValue<int32_t>("select v from t1 where k=1 for share");
+    auto value = conn2.FetchRow<int32_t>("select v from t1 where k=1 for share");
     // Should detect the conflict and raise serializable error.
     ASSERT_NOK(value);
     ASSERT_TRUE(value.status().message().Contains("All transparent retries exhausted"));
@@ -868,14 +879,14 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TablegroupSelectForShareAndUpda
 
   // txn1: lock the row in share mode
   ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
-  auto value = ASSERT_RESULT(conn.FetchValue<int32_t>("select v from t1 where k=1 for share"));
+  auto value = ASSERT_RESULT(conn.FetchRow<int32_t>("select v from t1 where k=1 for share"));
   ASSERT_EQ(value, 11);
 
   // txn2: do an UPDATE on the same row, should wait for txn1 to commit
   std::thread th([&] {
     auto conn2 = ASSERT_RESULT(Connect());
     ASSERT_OK(conn2.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
-    auto value = ASSERT_RESULT(conn2.FetchValue<int32_t>(
+    auto value = ASSERT_RESULT(conn2.FetchRow<int32_t>(
         "update t1 set v=111 where k=1 returning v"));
     ASSERT_OK(conn2.Execute("COMMIT"));
     ASSERT_EQ(value, 111);
@@ -890,53 +901,67 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TablegroupSelectForShareAndUpda
 
 class PgWaitQueueContentionStressTest : public PgMiniTestBase {
   static constexpr int kClientStatementTimeoutSeconds = 60;
-
+ protected:
   void SetUp() override {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = Format(
         "statement_timeout=$0", kClientStatementTimeoutSeconds * 1ms / 1s);
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = true;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_wait_queue_poll_interval_ms) = 2;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_transactions_status_poll_interval_ms) = 5;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_max_write_restart_attempts) = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = MaxQueryLayerRetriesConf(0);
     PgMiniTestBase::SetUp();
   }
 
   size_t NumTabletServers() override {
     return 1;
   }
+
+  void PerformConcurrentReads() {
+    constexpr int kNumReaders = 8;
+    constexpr int kNumTxnsPerReader = 100;
+
+    auto setup_conn = ASSERT_RESULT(Connect());
+
+    ASSERT_OK(setup_conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+    ASSERT_OK(setup_conn.Execute("INSERT INTO foo VALUES (1, 1)"));
+    TestThreadHolder thread_holder;
+    CountDownLatch finished_readers{kNumReaders};
+
+    for (int reader_idx = 0; reader_idx < kNumReaders; ++reader_idx) {
+      thread_holder.AddThreadFunctor([this, &finished_readers, &stop = thread_holder.stop_flag()] {
+        auto conn = ASSERT_RESULT(Connect());
+        for (int i = 0; i < kNumTxnsPerReader; ++i) {
+          if (stop) {
+            EXPECT_FALSE(true) << "Only completed " << i << " reads";
+            return;
+          }
+          ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+          ASSERT_OK(conn.Fetch("SELECT * FROM foo WHERE k=1 FOR UPDATE"));
+          ASSERT_OK(conn.CommitTransaction());
+        }
+        finished_readers.CountDown();
+        finished_readers.Wait();
+      });
+    }
+
+    finished_readers.WaitFor(60s * kTimeMultiplier);
+    finished_readers.Reset(0);
+    thread_holder.Stop();
+  }
 };
 
 TEST_F(PgWaitQueueContentionStressTest, YB_DISABLE_TEST_IN_TSAN(ConcurrentReaders)) {
-  constexpr int kNumReaders = 8;
-  constexpr int kNumTxnsPerReader = 100;
+  PerformConcurrentReads();
+}
 
-  auto setup_conn = ASSERT_RESULT(Connect());
-
-  ASSERT_OK(setup_conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
-  ASSERT_OK(setup_conn.Execute("INSERT INTO foo VALUES (1, 1)"));
-  TestThreadHolder thread_holder;
-  CountDownLatch finished_readers{kNumReaders};
-
-  for (int reader_idx = 0; reader_idx < kNumReaders; ++reader_idx) {
-    thread_holder.AddThreadFunctor([this, &finished_readers, &stop = thread_holder.stop_flag()] {
-      auto conn = ASSERT_RESULT(Connect());
-      for (int i = 0; i < kNumTxnsPerReader; ++i) {
-        if (stop) {
-          EXPECT_FALSE(true) << "Only completed " << i << " reads";
-          return;
-        }
-        ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
-        ASSERT_OK(conn.Fetch("SELECT * FROM foo WHERE k=1 FOR UPDATE"));
-        ASSERT_OK(conn.CommitTransaction());
-      }
-      finished_readers.CountDown();
-      finished_readers.Wait();
-    });
-  }
-
-  finished_readers.WaitFor(60s * kTimeMultiplier);
-  finished_readers.Reset(0);
-  thread_holder.Stop();
+// When a waiter fails to re-acquire the shared in-memory locks while being resumed from the thread
+// running ResumedWaiterRunner (which resumes waiters serially), it is scheduled for retry on the
+// Tablet Server's Scheduler which attempts to re-acquire the shared in-memory locks until the
+// request deadline passes. The below test simulates a contentious workload and helps assert the
+// above, particularly in tsan mode.
+TEST_F(PgWaitQueueContentionStressTest, TestResumeWaitersOnScheduler) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_wait_for_relock_unblocked_txn_keys_ms) = 100;
+  PerformConcurrentReads();
 }
 
 TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TestDelayedProbeAnalysis)) {
@@ -974,7 +999,18 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TestDelayedProbeAnalysis)) {
   thread_holder.WaitAndStop(25s * kTimeMultiplier);
 }
 
-TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TestWaiterTxnReRunConflictResolution)) {
+class PgWaitQueuesDisableRowLocking : public PgWaitQueuesTest {
+ protected:
+  void SetUp() override {
+    // ysql_skip_row_lock_for_update is set so that TestWaiterTxnReRunConflictResolution uses column
+    // level locking and the 3 transactions result in a deadlock.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_skip_row_lock_for_update) = true;
+    PgWaitQueuesTest::SetUp();
+  }
+};
+
+TEST_F(
+    PgWaitQueuesDisableRowLocking, YB_DISABLE_TEST_IN_TSAN(TestWaiterTxnReRunConflictResolution)) {
   // In the current implementation of the wait queue, we don't update the blocker info for
   // waiter transactions waiting in the queue with the new incoming transaction requests
   // (than don't enter the wait-queue). Since the waiter dependency is not up to date, we
@@ -1071,7 +1107,6 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(ParallelUpdatesDetectDeadlock))
   }
 }
 
-
 TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(MultiTabletFairness)) {
   constexpr int kNumUpdateConns = 20;
   constexpr int kNumKeys = 40;
@@ -1121,11 +1156,20 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(MultiTabletFairness)) {
       "statements involving multiple tablets.";
   auto update_analyze_query = Format("EXPLAIN (ANALYZE, DIST) $0", Format(update_query, -10));
   ASSERT_OK(setup_conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
-  auto explain_analyze_output = ASSERT_RESULT(setup_conn.FetchAllAsString(update_analyze_query));
-  ASSERT_NE(explain_analyze_output.find(
-      Format("Storage Write Requests: $0", kNumKeys)), std::string::npos) << explain_fail_help_text;
-  ASSERT_NE(explain_analyze_output.find("Storage Flush Requests: 1"), std::string::npos)
-      << explain_fail_help_text;
+  auto values = ASSERT_RESULT(
+      setup_conn.FetchRows<std::string>(update_analyze_query));
+  const auto storage_write_requests_text = Format("Storage Write Requests: $0", kNumKeys);
+  bool found_flush_requests_line = false;
+  bool found_write_requests_line = false;
+  for (const auto& value : values) {
+    if (value.find(storage_write_requests_text) != std::string::npos) {
+      found_write_requests_line = true;
+    } else if (value.find("Storage Flush Requests: 1") != std::string::npos) {
+      found_flush_requests_line = true;
+    }
+  }
+  ASSERT_TRUE(found_flush_requests_line && found_write_requests_line)
+      << explain_fail_help_text << "\n" << JoinStrings(values, "\n");
   ASSERT_OK(setup_conn.CommitTransaction());
 
   ASSERT_OK(setup_conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
@@ -1158,8 +1202,8 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(MultiTabletFairness)) {
     thread_holder.AddThreadFunctor(
         [i, &conn, &update_did_return = update_did_return[i], &queued_waiters, &update_query] {
       // Wait for all connections to queue their thread of execution
-      auto txn_id = ASSERT_RESULT(conn.FetchAllAsString("SELECT yb_get_current_transaction()"));
-      LOG(INFO) << "Conn " << i << " queued with txn id " <<  txn_id;
+      auto txn_id = ASSERT_RESULT(conn.FetchRow<Uuid>("SELECT yb_get_current_transaction()"));
+      LOG(INFO) << "Conn " << i << " queued with txn id " << yb::ToString(txn_id);
       queued_waiters.CountDown();
       ASSERT_TRUE(queued_waiters.WaitFor(10s * kTimeMultiplier));
       LOG(INFO) << "Conn " << i << " finished waiting";
@@ -1180,7 +1224,7 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(MultiTabletFairness)) {
             execute_status.ToString(), "pgsql error 40001");
       }
       LOG(INFO) << "Update completed on conn " << i
-                << " with txn id: " << txn_id
+                << " with txn id: " << yb::ToString(txn_id)
                 << " and status " << execute_status;
 
       update_did_return.exchange(true);
@@ -1211,9 +1255,153 @@ TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(MultiTabletFairness)) {
   // Confirm that all rows have been updated to the value set by the first update txn.
   for (int i = 0; i < kNumKeys; ++i) {
     ASSERT_EQ(
-        ASSERT_RESULT(setup_conn.FetchValue<int>(Format("SELECT v FROM foo WHERE k=$0", i))), 0);
+        ASSERT_RESULT(setup_conn.FetchRow<int>(Format("SELECT v FROM foo WHERE k=$0", i))), 0);
   }
 }
+
+#ifndef NDEBUG
+TEST_F(PgWaitQueuesTest, TestDDLsNotBlockedOnWaiters) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_refresh_waiter_timeout_ms) = 120000;
+
+  constexpr int kNumTxns = 2;
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(setup_conn.Execute("INSERT INTO foo SELECT generate_series(0, 10), 0"));
+
+  yb::SyncPoint::GetInstance()->LoadDependency({
+    {"WaitQueue::Impl::SetupWaiterUnlocked:1", "TestDDLsNotBlockedOnWaiters"}});
+  yb::SyncPoint::GetInstance()->ClearTrace();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
+
+  CountDownLatch ddl_finished{1};
+  TestThreadHolder thread_holder;
+  for (int i = 0; i < kNumTxns; i++) {
+    thread_holder.AddThreadFunctor([&] {
+      auto conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+      auto s = conn.Execute("UPDATE foo SET v=v+1 WHERE k=1");
+      ddl_finished.WaitFor(10s * kTimeMultiplier);
+      ASSERT_FALSE(s.ok() && conn.CommitTransaction().ok());
+    });
+  }
+
+  DEBUG_ONLY_TEST_SYNC_POINT("TestDDLsNotBlockedOnWaiters");
+  ASSERT_OK(WaitFor([&] {
+    return setup_conn.Execute("ALTER TABLE foo ADD COLUMN v1 TEXT DEFAULT 'def'").ok();
+  }, 2s * kTimeMultiplier, "DLL timed-out"));
+  ddl_finished.CountDown();
+  thread_holder.WaitAndStop(20s * kTimeMultiplier);
+}
+#endif // NDEBUG
+
+TEST_F(PgWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(TestMultipleRequestsPerTxn)) {
+  auto blocker_conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(blocker_conn.Execute(
+      "CREATE TABLE foo (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS"));
+  ASSERT_OK(blocker_conn.Execute("INSERT INTO foo SELECT generate_series(0, 1000), 0"));
+
+  ASSERT_OK(blocker_conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  ASSERT_OK(blocker_conn.Execute("UPDATE foo SET v=2 WHERE k > 500"));
+
+  TestThreadHolder thread_holder;
+
+  std::atomic_bool read_blocker_failed = false;
+  std::atomic_bool write_blocker_failed = false;
+
+  thread_holder.AddThreadFunctor([this, &read_blocker_failed] {
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+    ASSERT_OK(conn.Execute("SET ysql_session_max_batch_size=1"));
+    ASSERT_OK(conn.Execute("SET ysql_max_in_flight_ops=10"));
+    LOG(INFO) << "About to block";
+    // This query should fail due to conflict after blocking
+    ASSERT_NOK(conn.Execute("UPDATE foo SET v=1 WHERE k > 500"));
+    read_blocker_failed = true;
+  });
+
+  thread_holder.AddThreadFunctor([this, &write_blocker_failed] {
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+    ASSERT_OK(conn.Execute("SET ysql_session_max_batch_size=1"));
+    ASSERT_OK(conn.Execute("SET ysql_max_in_flight_ops=10"));
+    LOG(INFO) << "About to block";
+    // This query should fail due to conflict after blocking
+    ASSERT_NOK(conn.Fetch("SELECT * FROM foo WHERE k > 500 FOR UPDATE"));
+    write_blocker_failed = true;
+  });
+
+  std::this_thread::sleep_for(5s * kTimeMultiplier);
+
+  ASSERT_FALSE(read_blocker_failed);
+  ASSERT_FALSE(write_blocker_failed);
+
+  ASSERT_OK(blocker_conn.CommitTransaction());
+  LOG(INFO) << "Committed blocker conn";
+
+  thread_holder.WaitAndStop(25s * kTimeMultiplier);
+
+  ASSERT_TRUE(read_blocker_failed);
+  ASSERT_TRUE(write_blocker_failed);
+
+  // Confirm tserver is not in a bad state after the failed txn.
+  auto value = blocker_conn.FetchRow<int32_t>("SELECT v FROM foo WHERE k = 501");
+  ASSERT_OK(value);
+  ASSERT_EQ(value.get(), 2);
+}
+
+class PgWaitQueueRF1Test : public PgWaitQueuesTest {
+ protected:
+  size_t NumTabletServers() override {
+    return 1;
+  }
+};
+
+#ifndef NDEBUG
+TEST_F(PgWaitQueueRF1Test, TestResumingWaitersDoesntBlockTabletShutdown) {
+  static const char* sync_points[1][4] = {
+      {"WaitQueue::Impl::SetupWaiterUnlocked:1", "PgWaitQueueRF1Test::CommitConnection1:1",
+       "TabletPeer::StartShutdown:1", "WaiterData::Impl::InvokeCallback:1"}};
+  yb::SyncPoint::GetInstance()->LoadDependency({
+    {sync_points[0][0], sync_points[0][1]},
+    {sync_points[0][2], sync_points[0][3]}});
+  yb::SyncPoint::GetInstance()->ClearTrace();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
+
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT) SPLIT INTO 1 TABLETS"));
+  ASSERT_OK(setup_conn.Execute("INSERT INTO foo SELECT generate_series(0, 2), 0"));
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+  yb::SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(conn.Execute("UPDATE foo SET v=v+1 WHERE k=1"));
+
+  auto status_future = std::async(std::launch::async, [&]() -> Status {
+    auto conn = VERIFY_RESULT(Connect());
+    EXPECT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+    RETURN_NOT_OK(conn.Execute("UPDATE foo SET v=v+1 WHERE k=1"));
+    return Status::OK();
+  });
+  // Hold off commit until the waiter txn registers itself with the wait-queue.
+  DEBUG_ONLY_TEST_SYNC_POINT("PgWaitQueueRF1Test::CommitConnection1:1");
+  ASSERT_OK(conn.CommitTransaction());
+  // TabletPeer::StartShutdown:1 "happens before" WaiterData::Impl::InvokeCallback:1 dependency
+  // will ensure that the resumed waiter's callback would only be called after the tablet peer's
+  // lock_ has been acquired in TabletPeer::StartShutdown.
+  //
+  // Delay participant shutdown so as to give a chance for the resumed waiter to grab a valid
+  // request scope. Post that, the resumed waiter thread will block temporarily while trying to
+  // obtain tablet peer's lock_ during construction of operation driver.
+  //
+  // Ensure that the thread executing Tablet::StartShutdown (while holding the peer's lock_)
+  // doesn't wait for the completion of waiter's callback. Else, it could result in a deadlock.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_participant_inject_delay_on_start_shutdown_ms) =
+      1000 * kTimeMultiplier;
+  ASSERT_OK(setup_conn.Execute("DROP TABLE foo"));
+  ASSERT_NOK(status_future.get());
+}
+#endif // NDEBUG
 
 class PgWaitQueuesReadCommittedTest : public PgWaitQueuesTest {
  protected:
@@ -1252,7 +1440,7 @@ TEST_F(PgWaitQueuePackedRowTest, YB_DISABLE_TEST_IN_TSAN(TestKeyShareAndUpdate))
   // txn2: do select-for-keyshare on the same row, should be able to lock and get the value.
   std::thread th([&] {
     auto conn2 = ASSERT_RESULT(Connect());
-    auto value = conn2.FetchValue<int32_t>(
+    auto value = conn2.FetchRow<int32_t>(
         "select value from foo where key = 1 for key share");
     ASSERT_OK(value);
     ASSERT_EQ(value.get(), 1);

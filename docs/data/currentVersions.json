@@ -12,25 +12,38 @@
       "initialRelease": "2023-06-20"
     },
     {
-      "series": "v2.18",
+      "series": "v2.20",
       "alias": "stable",
+      "display": "v2.20 (LTS)",
+      "version": "2.20.2.0",
+      "versionShort": "2.20.2",
+      "appVersion": "2.20.2.0-b145",
+      "isStable": true,
+      "isLTS": true,
+      "initialRelease": "2023-11-13",
+      "endOfMaintenance": "2025-11-13",
+      "endOfLife": "2026-05-13",
+      "PreviewBehindStable": true
+    },
+    {
+      "series": "v2.18",
       "display": "v2.18 (STS)",
-      "version": "2.18.4.0",
-      "versionShort": "2.18.4",
-      "appVersion": "2.18.4.0-b52",
+      "version": "2.18.6.0",
+      "versionShort": "2.18.6",
+      "appVersion": "2.18.6.0-b73",
       "isStable": true,
       "isLTS": false,
       "isSTS": true,
       "initialRelease": "2023-05-16",
       "endOfMaintenance": "2024-05-16",
-      "endOfLife": "2025-11-16"
+      "endOfLife": "2024-11-16"
     },
     {
       "series": "v2.16",
       "display": "v2.16 (STS)",
-      "version": "2.16.8.0",
-      "versionShort": "2.16.8",
-      "appVersion": "2.16.8.0-b16",
+      "version": "2.16.9.0",
+      "versionShort": "2.16.9",
+      "appVersion": "2.16.9.0-b67",
       "isStable": true,
       "isLTS": false,
       "isSTS": true,
@@ -41,26 +54,14 @@
     {
       "series": "v2.14",
       "display": "v2.14 (LTS)",
-      "version": "2.14.14.0",
-      "versionShort": "2.14.14",
-      "appVersion": "2.14.14.0-b17",
+      "version": "2.14.15.0",
+      "versionShort": "2.14.15",
+      "appVersion": "2.14.15.0-b57",
       "isStable": true,
       "isLTS": true,
       "initialRelease": "2022-07-14",
       "endOfMaintenance": "2024-07-14",
       "endOfLife": "2025-01-14"
-    },
-    {
-      "series": "v2.12",
-      "display": "v2.12",
-      "version": "2.12.12.0",
-      "versionShort": "2.12.12",
-      "appVersion": "2.12.12.0-b12",
-      "isStable": true,
-      "isLTS": false,
-      "initialRelease": "2022-02-22",
-      "endOfMaintenance": "2023-02-22",
-      "endOfLife": "2023-08-22"
     }
   ],
   "ybaVersions":

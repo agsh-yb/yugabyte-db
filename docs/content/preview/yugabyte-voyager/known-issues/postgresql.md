@@ -1,8 +1,8 @@
 ---
 title: PostgreSQL source database
 linkTitle: PostgreSQL
-headcontent: Known issues when migrating data from PostgreSQL.
-description: Known issues and suggested workarounds for migrating data from PostgreSQL.
+headcontent: What to watch out for when migrating data from PostgreSQL
+description: Review limitations and suggested workarounds for migrating data from PostgreSQL.
 menu:
   preview_yugabyte-voyager:
     identifier: postgresql-issues
@@ -13,7 +13,7 @@ rightNav:
   hideH3: true
 ---
 
-This page documents known issues you may encounter and suggested workarounds when migrating data from PostgreSQL to YugabyteDB.
+Review limitations and implement suggested workarounds to successfully migrate data from PostgreSQL to YugabyteDB.
 
 ## Contents
 
@@ -70,7 +70,7 @@ PARTITION BY LIST (region);
 
 **Description**: If you have a partitioned table with indexes on it, the migration will fail with an error for YugabyteDB `2.15` or `2.16` due to a regression.
 
-Note that this is fixed in release [12.17.1.0](../../../releases/release-notes/v2.17/#v2.17.1.0).
+Note that this is fixed in release [2.17.1.0](../../../releases/ybdb-releases/v2.17/#v2.17.1.0).
 
 **Workaround**: N/A
 

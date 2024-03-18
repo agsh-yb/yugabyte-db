@@ -56,6 +56,8 @@
 
 #include "yb/master/master_defaults.h"
 
+#include "yb/server/async_client_initializer.h"
+
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/tablet_server.h"
@@ -64,6 +66,7 @@
 
 #include "yb/client/client_fwd.h"
 #include "yb/gutil/macros.h"
+#include "yb/util/callsite_profiling.h"
 
 #include "yb/util/bytes_formatter.h"
 #include "yb/util/capabilities.h"
@@ -100,11 +103,11 @@ DEFINE_UNKNOWN_string(metrics_snapshotter_table_metrics_whitelist,
     "Table metrics to record in native metrics storage.");
 TAG_FLAG(metrics_snapshotter_table_metrics_whitelist, advanced);
 
-constexpr int kTServerMetricsSnapshotterYbClientDefaultTimeoutMs =
+constexpr int kTServerMetricsSnapshotterYBClientDefaultTimeoutMs =
   yb::RegularBuildVsSanitizers(5, 60) * 1000;
 
 DEFINE_UNKNOWN_int32(tserver_metrics_snapshotter_yb_client_default_timeout_ms,
-    kTServerMetricsSnapshotterYbClientDefaultTimeoutMs,
+    kTServerMetricsSnapshotterYBClientDefaultTimeoutMs,
     "Default timeout for the YBClient embedded into the tablet server that is used "
     "by metrics snapshotter.");
 TAG_FLAG(tserver_metrics_snapshotter_yb_client_default_timeout_ms, advanced);
@@ -113,7 +116,6 @@ DEFINE_UNKNOWN_uint64(metrics_snapshotter_ttl_ms, 7 * 24 * 60 * 60 * 1000 /* 1 w
              "Ttl for snapshotted metrics.");
 TAG_FLAG(metrics_snapshotter_ttl_ms, advanced);
 
-DECLARE_int32(max_tables_metrics_breakdowns);
 DECLARE_bool(enable_ysql_conn_mgr_stats);
 
 using std::shared_ptr;
@@ -168,7 +170,7 @@ class MetricsSnapshotter::Thread {
   // The actual running thread (NULL before it is started)
   scoped_refptr<yb::Thread> thread_;
 
-  boost::optional<yb::client::AsyncClientInitialiser> async_client_init_;
+  boost::optional<yb::client::AsyncClientInitializer> async_client_init_;
 
   // True once at least one attempt to record a snapshot has been made.
   bool has_metricssnapshotted_ = false;
@@ -360,7 +362,8 @@ Status MetricsSnapshotter::Thread::DoYsqlConnMgrMetricsSnapshot(const client::Ta
     return Status::OK();
   }
   for (uint32_t itr = 0; itr < kYsqlConnMgrMaxPools; itr++) {
-    if (strcmp(shmp[itr].pool_name, "") == 0) {
+    if (strcmp(shmp[itr].database_name, "") == 0) {
+      // All the valid entries in the shmem have been processed.
       break;
     }
     stats_list.push_back(shmp[itr]);
@@ -372,7 +375,7 @@ Status MetricsSnapshotter::Thread::DoYsqlConnMgrMetricsSnapshot(const client::Ta
   uint64_t total_logical_connections = 0;
   uint64_t total_physical_connections = 0;
   for (const auto &stat : stats_list) {
-    if (strcmp(stat.pool_name, "control_connection") != 0) {
+    if (strcmp(stat.database_name, "control_connection") != 0) {
       total_logical_connections += stat.active_clients +
                                    stat.queued_clients +
                                    stat.idle_or_pending_clients;
@@ -404,13 +407,10 @@ Status MetricsSnapshotter::Thread::DoMetricsSnapshot() {
 
   NMSWriter::EntityMetricsMap table_metrics;
   NMSWriter::MetricsMap server_metrics;
-  NMSWriter nmswriter{&table_metrics, &server_metrics};
-  MetricPrometheusOptions opt;
-  MetricEntityOptions entity_opts;
-  entity_opts.metrics.push_back("*");
-  opt.max_tables_metrics_breakdowns = FLAGS_max_tables_metrics_breakdowns;
+  MetricPrometheusOptions opts;
+  NMSWriter nmswriter(&table_metrics, &server_metrics, opts);
   WARN_NOT_OK(
-      server_->metric_registry()->WriteForPrometheus(&nmswriter, entity_opts, opt),
+      server_->metric_registry()->WriteForPrometheus(&nmswriter, opts),
       "Couldn't write metrics for native metrics storage");
   for (const auto& [metric_name, metric_value] : server_metrics) {
     if (tserver_metrics_whitelist_.contains(metric_name)) {
@@ -615,7 +615,7 @@ Status MetricsSnapshotter::Thread::Stop() {
   {
     MutexLock l(mutex_);
     should_run_ = false;
-    cond_.Signal();
+    YB_PROFILE(cond_.Signal());
   }
   RETURN_NOT_OK(ThreadJoiner(thread_.get()).Join());
   thread_ = nullptr;

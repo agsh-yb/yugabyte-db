@@ -544,10 +544,14 @@ endif()
 # - disable 'alignment' because unaligned access is really OK on Nehalem and we do it
 #   all over the place.
 if ("${YB_BUILD_TYPE}" STREQUAL "asan")
-  set(CXX_NO_SANITIZE_FLAG "alignment")
+  set(CXX_NO_SANITIZE_FLAG "")
+  add_cxx_no_sanitize_flag("alignment")
   if(NOT APPLE)
-    set(CXX_NO_SANITIZE_FLAG "${CXX_NO_SANITIZE_FLAG},vptr")
+    add_cxx_no_sanitize_flag("vptr")
     ADD_CXX_FLAGS("-fsanitize=undefined")
+  endif()
+  if("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "17.0.0")
+    add_cxx_no_sanitize_flag("function")
   endif()
   ADD_CXX_FLAGS("-fno-sanitize-recover=all -fno-sanitize=${CXX_NO_SANITIZE_FLAG}")
   ADD_CXX_FLAGS("-fsanitize-recover=float-cast-overflow")
@@ -866,6 +870,7 @@ add_postgres_shared_library(pq "${LIBPQ_SHARED_LIB}")
 add_postgres_shared_library(yb_pgbackend "${YB_PGBACKEND_SHARED_LIB}")
 
 set(YB_SUBDIR_NAMES
+    ash
     bfcommon
     bfpg
     bfql

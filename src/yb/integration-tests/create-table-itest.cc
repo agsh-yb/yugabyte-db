@@ -335,7 +335,7 @@ TEST_F(CreateTableITest, LegacyColocatedDBTableColocationRemoteBootstrapTest) {
 
   {
     string ns_id;
-    auto namespaces = ASSERT_RESULT(client_->ListNamespaces(boost::none));
+    auto namespaces = ASSERT_RESULT(client_->ListNamespaces());
     for (const auto& ns : namespaces) {
       if (ns.id.name() == "colocation_test") {
         ns_id = ns.id.id();
@@ -401,9 +401,9 @@ TEST_F(CreateTableITest, TableColocationRemoteBootstrapTest) {
   ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH colocation = true", kNamespaceName));
   conn = ASSERT_RESULT(ConnectToDB(kNamespaceName));
   ASSERT_OK(conn.Execute("CREATE TABLE tbl (k int PRIMARY KEY, v int)"));
-  auto db_oid = ASSERT_RESULT(conn.FetchValue<pgwrapper::PGOid>(Format(
+  auto db_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
       "SELECT oid FROM pg_database WHERE datname = '$0'", kNamespaceName)));
-  auto tablegroup_oid = ASSERT_RESULT(conn.FetchValue<pgwrapper::PGOid>(
+  auto tablegroup_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
       "SELECT oid FROM pg_yb_tablegroup WHERE grpname = 'default'"));
   TablegroupId tablegroup_id = GetPgsqlTablegroupId(db_oid, tablegroup_oid);
   parent_table_id = GetColocationParentTableId(tablegroup_id);
@@ -472,7 +472,7 @@ TEST_F(CreateTableITest, TablegroupRemoteBootstrapTest) {
                                      boost::none /* next_pg_oid */, nullptr /* txn */, false));
 
   {
-    auto namespaces = ASSERT_RESULT(client_->ListNamespaces(boost::none));
+    auto namespaces = ASSERT_RESULT(client_->ListNamespaces());
     for (const auto& ns : namespaces) {
       if (ns.id.name() == namespace_name) {
         namespace_id = ns.id.id();
@@ -584,10 +584,13 @@ TEST_F(CreateTableITest, TestLiveTabletPeersMetric) {
   // For each tserver verify the metric value ts_live_tablet_peers is equal to the number of tablets
   // we requested for the table.
   for (const auto& tserver : cluster_->tserver_daemons()) {
-    ASSERT_EQ(
-        ASSERT_RESULT(tserver->GetMetric<uint32>(
-            "server", "yb.tabletserver", "ts_live_tablet_peers", "value")),
-        kNumTablets);
+    ASSERT_OK(LoggedWaitFor(
+        [&]() -> Result<bool> {
+          auto metric_value = VERIFY_RESULT(tserver->GetMetric<uint32>(
+              "server", "yb.tabletserver", "ts_live_tablet_peers", "value"));
+          return metric_value == kNumTablets;
+        },
+        10s * kTimeMultiplier, "Wait for ts_live_tablet_peers to become equal to kNumTablets"));
   }
 }
 
@@ -1083,7 +1086,7 @@ void CreateTableITest::TestLazySuperblockFlushPersistence(int num_tables, int it
     auto new_conn = ASSERT_RESULT(ConnectToDB(database));
     for (int i = 0; i < num_tables; ++i) {
       auto res = ASSERT_RESULT(
-          new_conn.FetchValue<int64_t>(Format("SELECT COUNT(*) FROM $0$1", table_prefix, i)));
+          new_conn.FetchRow<int64_t>(Format("SELECT COUNT(*) FROM $0$1", table_prefix, i)));
       ASSERT_EQ(res, 1);
     }
   }

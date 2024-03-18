@@ -32,33 +32,30 @@ public class AddOnClusterCreate extends UniverseDefinitionTaskBase {
   @Override
   public void run() {
     log.info("Started {} task for uuid={}", getName(), taskParams().getUniverseUUID());
-
+    Universe universe = null;
     try {
       Cluster cluster = taskParams().getAddOnClusters().get(0);
-      Universe universe =
-          lockUniverseForUpdate(
+      universe =
+          lockAndFreezeUniverseForUpdate(
               taskParams().expectedUniverseVersion,
               u -> {
-                if (isFirstTry()) {
-                  // TODO: Do we need to stop health checks?
-                  preTaskActions(u);
-                  // Set all the in-memory node names.
-                  setNodeNames(u);
-                  // Set non on-prem node UUIDs.
-                  setCloudNodeUuids(u);
-                  // Update on-prem node UUIDs.
-                  updateOnPremNodeUuidsOnTaskParams();
-                  // Set the prepared data to universe in-memory.
-                  updateUniverseNodesAndSettings(u, taskParams(), true);
-                  u.getUniverseDetails()
-                      .upsertCluster(cluster.userIntent, cluster.placementInfo, cluster.uuid);
-                  // There is a rare possibility that this succeeds and
-                  // saving the Universe fails. It is ok because the retry
-                  // will just fail.
-                  updateTaskDetailsInDB(taskParams());
-                }
+                // TODO: Do we need to stop health checks?
+                preTaskActions(u);
+                // Set all the in-memory node names.
+                setNodeNames(u);
+                // Set non on-prem node UUIDs.
+                setCloudNodeUuids(u);
+                // Update on-prem node UUIDs.
+                updateOnPremNodeUuidsOnTaskParams(true /* commit changes */);
+                // Set the prepared data to universe in-memory.
+                updateUniverseNodesAndSettings(u, taskParams(), true);
+                u.getUniverseDetails()
+                    .upsertCluster(cluster.userIntent, cluster.placementInfo, cluster.uuid);
+                // There is a rare possibility that this succeeds and
+                // saving the Universe fails. It is ok because the retry
+                // will just fail.
+                updateTaskDetailsInDB(taskParams());
               });
-
       Set<NodeDetails> addOnNodes = taskParams().getNodesInCluster(cluster.uuid);
       boolean ignoreUseCustomImageConfig = !addOnNodes.stream().allMatch(n -> n.ybPrebuiltAmi);
 
@@ -77,7 +74,7 @@ public class AddOnClusterCreate extends UniverseDefinitionTaskBase {
           universe,
           nodesToProvision,
           false /* ignore node status check */,
-          ignoreUseCustomImageConfig);
+          setupParams -> setupParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig);
 
       // no need to enable tservers.
       // no need to start ybc process.
@@ -100,16 +97,25 @@ public class AddOnClusterCreate extends UniverseDefinitionTaskBase {
       log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
       throw t;
     } finally {
-      // Mark the update of the universe as done. This will allow future edits/updates to the
-      // universe to happen.
-      Universe universe = unlockUniverseForUpdate();
-      if (universe.getConfig().getOrDefault(Universe.USE_CUSTOM_IMAGE, "false").equals("true")) {
-        universe.updateConfig(
-            ImmutableMap.of(
-                Universe.USE_CUSTOM_IMAGE,
-                Boolean.toString(
-                    universe.getUniverseDetails().nodeDetailsSet.stream()
-                        .allMatch(n -> n.ybPrebuiltAmi))));
+      if (universe != null) {
+        // Universe is locked by this task.
+        try {
+          // Fetch the latest universe.
+          universe = Universe.getOrBadRequest(universe.getUniverseUUID());
+          if (universe
+              .getConfig()
+              .getOrDefault(Universe.USE_CUSTOM_IMAGE, "false")
+              .equals("true")) {
+            universe.updateConfig(
+                ImmutableMap.of(
+                    Universe.USE_CUSTOM_IMAGE,
+                    Boolean.toString(
+                        universe.getUniverseDetails().nodeDetailsSet.stream()
+                            .allMatch(n -> n.ybPrebuiltAmi))));
+          }
+        } finally {
+          unlockUniverseForUpdate();
+        }
       }
     }
     log.info("Finished {} task.", getName());

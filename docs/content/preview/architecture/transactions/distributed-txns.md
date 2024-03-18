@@ -7,7 +7,7 @@ menu:
   preview:
     identifier: architecture-distributed-acid-transactions
     parent: architecture-acid-transactions
-    weight: 1155
+    weight: 70
 aliases:
   - /architecture/concepts/transactions/
 type: docs
@@ -15,13 +15,13 @@ type: docs
 
 YugabyteDB supports distributed transactions based on principles of atomicity, consistency, isolation, durability (ACID) that modify multiple rows in more than one shard. This enables strongly consistent secondary indexes, as well as multi-table and multi-row ACID operations in both YCQL and YSQL contexts.
 
-Once you are familiar with the preceding concepts, refer to [Transactional I/O path](../transactional-io-path/) for an overview of a distributed transaction's lifecycle.
+After you are familiar with the preceding concepts, refer to [Transactional I/O path](../transactional-io-path/) for an overview of a distributed transaction's lifecycle.
 
 ## Provisional records
 
 Just as YugabyteDB stores values written by single-shard ACID transactions into [DocDB](../../docdb/persistence/), it needs to store uncommitted values written by distributed transactions in a similar persistent data structure. However, they cannot be written to DocDB as regular values, because they would then become visible at different times to clients reading through different tablet servers, allowing a client to see a partially applied transaction and thus breaking atomicity. YugabyteDB therefore writes provisional records to all tablets responsible for the keys the transaction is trying to modify. These transactions are called provisional as opposed to regular (permanent) records because they are invisible to readers until the transaction commits.
 
-Provisional records are stored in a separate RocksDB instance in the same tablet peer. Compared to other possible design options, such as storing provisional records inline with the regular records, or putting them in the same RocksDB instance together with regular records, the chosen approach has the following benefits:
+Provisional records are stored in a separate RocksDB instance in the same tablet peer (referred to as IntentsDB, as opposed to RegularDB, for regular records). Compared to other possible design options, such as storing provisional records inline with the regular records, or putting them in the same RocksDB instance together with regular records, the chosen approach has the following benefits:
 
 - Scanning all provisional records is straightforward, which is helpful in cleaning up aborted or abandoned transactions.
 - During the read path, there is a need to handle provisional records very differently from the regular records, and putting them in a separate section of the RocksDB key space allows to simplify the read path.
@@ -39,7 +39,7 @@ There are three types of RocksDB key-value pairs corresponding to provisional re
 DocumentKey, SubKey1, ..., SubKeyN, LockType, ProvisionalRecordHybridTime -> TxnId, Value
 ```
 
-The `DocumentKey`, `SubKey1`, ..., `SubKey` components exactly match those in DocDB's [encoding](../../docdb/persistence/#mapping-docdb-documents-to-rocksdb) of paths to a particular subdocument (for example, a row, a column, or an element in a collection-type column) to RocksDB keys.
+The `DocumentKey`, `SubKey1`, ..., `SubKey` components exactly match those in DocDB's [encoding](../../docdb/persistence/#encoding-documents) of paths to a particular subdocument (for example, a row, a column, or an element in a collection-type column) to RocksDB keys.
 
 Each of these primary provisional records also acts as a persistent revocable lock. There are some similarities as well as differences when compared to [blocking in-memory locks](../isolation-levels/) maintained by every tablet's lock manager. These persistent locks can be of any of the same types as for in-memory leader-only locks (SI write, serializable write and read, and a separate strong and weak classification for handling nested document changes). However, unlike the leader-side in-memory locks, the locks represented by provisional records can be revoked by another conflicting transaction. The conflict resolution subsystem makes sure that for any two conflicting transactions, at least one of them is aborted.
 

@@ -21,8 +21,9 @@
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 
-#include "yb/util/protobuf_util.h"
 #include "yb/util/metrics.h"
+#include "yb/util/protobuf_util.h"
+#include "yb/util/range.h"
 #include "yb/util/status.h"
 #include "yb/util/test_macros.h"
 
@@ -36,8 +37,9 @@ METRIC_DECLARE_histogram(handler_latency_yb_tserver_PgClientService_Perform);
 DECLARE_uint64(ysql_session_max_batch_size);
 DECLARE_bool(TEST_ysql_ignore_add_fk_reference);
 DECLARE_bool(enable_automatic_tablet_splitting);
-DECLARE_int32(ysql_max_write_restart_attempts);
 DECLARE_bool(enable_wait_queues);
+DECLARE_bool(pg_client_use_shared_memory);
+DECLARE_string(ysql_pg_conf_csv);
 
 namespace yb::pgwrapper {
 namespace {
@@ -53,14 +55,14 @@ struct RpcCountMetric {
 };
 
 struct RpcCountMetricDescriber : public MetricWatcherDeltaDescriberTraits<RpcCountMetric, 3> {
-  explicit RpcCountMetricDescriber(std::reference_wrapper<const MetricEntity::MetricMap> map)
+  explicit RpcCountMetricDescriber(std::reference_wrapper<const MetricEntity> entity)
       : descriptors{
           Descriptor{
-              &delta.read, map, METRIC_handler_latency_yb_tserver_TabletServerService_Read},
+              &delta.read, entity, METRIC_handler_latency_yb_tserver_TabletServerService_Read},
           Descriptor{
-              &delta.write, map, METRIC_handler_latency_yb_tserver_TabletServerService_Write},
+              &delta.write, entity, METRIC_handler_latency_yb_tserver_TabletServerService_Write},
           Descriptor{
-              &delta.perform, map, METRIC_handler_latency_yb_tserver_PgClientService_Perform}}
+              &delta.perform, entity, METRIC_handler_latency_yb_tserver_PgClientService_Perform}}
   {}
 
   DeltaType delta;
@@ -71,9 +73,11 @@ class PgFKeyTest : public PgMiniTestBase {
  protected:
   void SetUp() override {
     FLAGS_enable_automatic_tablet_splitting = false;
-    FLAGS_ysql_max_write_restart_attempts = 0;
+    // This test counts number of performed RPC calls, so turn off pg client shared memory.
+    FLAGS_pg_client_use_shared_memory = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_pg_conf_csv) = MaxQueryLayerRetriesConf(0);
     PgMiniTestBase::SetUp();
-    rpc_count_.emplace(GetMetricMap(*cluster_->mini_tablet_server(0)->server()));
+    rpc_count_.emplace(*cluster_->mini_tablet_server(0)->server()->metric_entity());
   }
 
   size_t NumTabletServers() override {
@@ -191,7 +195,7 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
   void SetUp() override {
     // This test depends on fail-on-conflict concurrency control to perform its validation.
     // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
-    FLAGS_enable_wait_queues = false;
+    EnableFailOnConflict();
     PgFKeyTest::SetUp();
     auto aux_conn = ASSERT_RESULT(Connect());
     ASSERT_OK(CreateTables(&aux_conn));
@@ -214,6 +218,10 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
     ASSERT_NE(conn_for_referencing->has_high_priority_txn,
               conn_for_delete->has_high_priority_txn);
     auto& ref_conn = conn_for_referencing->conn;
+    SCOPED_TRACE(Format(
+        "referencing conn high priority: $0 delete conn high priority: $1 isolation level: $2",
+        conn_for_referencing->has_high_priority_txn, conn_for_delete->has_high_priority_txn,
+        GetParam()));
 
     ASSERT_OK(ref_conn.StartTransaction(GetParam()));
     const auto rpc_count = ASSERT_RESULT(rpc_count_->Delta(
@@ -223,10 +231,15 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
     ASSERT_EQ(rpc_count.write, num_batches);
     ASSERT_EQ(rpc_count.perform, rpc_count.read + rpc_count.write - 1);
 
+    const IsolationLevel effective_isolation = ASSERT_RESULT(EffectiveIsolationLevel(&ref_conn));
+
     auto delete_res = conn_for_delete->conn.Execute(kDeletePKQuery);
     auto ref_res = ref_conn.CommitTransaction();
 
-    if (conn_for_referencing->has_high_priority_txn) {
+    // There is no concept of priorities in read committed isolation, all transactions used th same
+    // priority which is 1.0 from the high priority bucket.
+    if ((effective_isolation == IsolationLevel::READ_COMMITTED) ||
+         conn_for_referencing->has_high_priority_txn) {
       ASSERT_OK(ref_res);
       ASSERT_NOK(delete_res);
     } else {
@@ -239,6 +252,10 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
       PGConnWithTxnPriority* conn_for_delete, PGConnWithTxnPriority* conn_for_referencing) {
     ASSERT_NE(conn_for_referencing->has_high_priority_txn, conn_for_delete->has_high_priority_txn);
     auto& delete_conn = conn_for_delete->conn;
+    SCOPED_TRACE(Format(
+        "referencing conn high priority: $0 delete conn high priority: $1 isolation level: $2",
+        conn_for_referencing->has_high_priority_txn, conn_for_delete->has_high_priority_txn,
+        GetParam()));
 
     ASSERT_OK(delete_conn.StartTransaction(GetParam()));
     const auto rpc_count = ASSERT_RESULT(rpc_count_->Delta(
@@ -247,10 +264,15 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
     ASSERT_EQ(rpc_count.write, 1);
     ASSERT_EQ(rpc_count.perform, rpc_count.read + rpc_count.write);
 
+    const IsolationLevel effective_isolation = ASSERT_RESULT(EffectiveIsolationLevel(&delete_conn));
+
     auto ref_res = InsertItems(&conn_for_referencing->conn, kFKTable, 1, kItemsCount);
     auto delete_res = delete_conn.CommitTransaction();
 
-    if (conn_for_referencing->has_high_priority_txn) {
+    // There is no concept of priorities in read committed isolation, all transactions use the same
+    // priority which is 1.0 from the high priority bucket.
+    if (conn_for_referencing->has_high_priority_txn &&
+        (effective_isolation != IsolationLevel::READ_COMMITTED)) {
       ASSERT_OK(ref_res);
       ASSERT_NOK(delete_res);
     } else {
@@ -261,7 +283,9 @@ class PgFKeyTestConcurrentModification : public PgFKeyTest,
 
   Result<PGConnWithTxnPriority> MakeConnWithPriority(bool high_priority_txn) {
     return PGConnWithTxnPriority{
-        .conn = VERIFY_RESULT((*(high_priority_txn ? &SetHighPriTxn : &SetLowPriTxn))(Connect())),
+        .conn = VERIFY_RESULT(SetDefaultTransactionIsolation(
+            (*(high_priority_txn ? &SetHighPriTxn : &SetLowPriTxn))(Connect()),
+            IsolationLevel::SNAPSHOT_ISOLATION)),
         .has_high_priority_txn = high_priority_txn};
   }
 
@@ -365,7 +389,7 @@ TEST_F(PgFKeyTest, MultipleFKConstraintRPCCount) {
     return conn.ExecuteFormat(
       "INSERT INTO $0 VALUES(1, 11, 21, 31), (2, 12, 22, 32), (3, 13, 23, 33)", kFKTable);
   })).perform;
-  ASSERT_EQ(insert_fk_rpc_count, 1);
+  ASSERT_EQ(insert_fk_rpc_count, 2);
 }
 
 // Test checks that insertion into table with large number of foreign keys doesn't fail.
@@ -512,9 +536,33 @@ TEST_P(PgFKeyTestConcurrentModification, HighPriorityDeleteBeforeLowPriorityRefe
 }
 
 // Test checks that batching of FK check doesn't break transaction conflict detection
-// in scenario when rows get referenced (hight priority txn) after being deleted (low priority txn).
+// in scenario when rows get referenced (high priority txn) after being deleted (low priority txn).
 TEST_P(PgFKeyTestConcurrentModification, LowPriorityDeleteBeforeHighPriorityReferencing) {
   DeleteBeforeReferencing(&state_->low_priority_txn_conn, &state_->high_priority_txn_conn);
+}
+
+// Test checks that fk may reference on entry inserted in same statement
+TEST_F(PgFKeyTest, SameTableReference) {
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE company(k INT PRIMARY KEY)"));
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE employee("
+      "    k INT PRIMARY KEY, company_fk INT, manager_fk INT,"
+      "    UNIQUE(k, company_fk),"
+      "    FOREIGN KEY (company_fk) REFERENCES company(k),"
+      "    FOREIGN KEY (manager_fk, company_fk) REFERENCES employee(company_fk, k))"));
+  ASSERT_OK(conn.Execute("INSERT INTO company VALUES(1)"));
+  for (auto i : Range(10)) {
+    const auto perform_count = ASSERT_RESULT(rpc_count_->Delta([&conn] {
+      return conn.Execute("INSERT INTO employee VALUES (1, 1, NULL), (2, 1, 1), (3, 1, 1)");
+    })).perform;
+    // Skip initial iteration because sys catalog on-demand loading affects number of
+    // perform requests
+    if (i) {
+      ASSERT_EQ(perform_count, 2);
+    }
+    ASSERT_OK(conn.Execute("DELETE FROM employee"));
+  }
 }
 
 } // namespace yb::pgwrapper

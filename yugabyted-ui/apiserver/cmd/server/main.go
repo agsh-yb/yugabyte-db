@@ -145,7 +145,7 @@ func main() {
     }
 
     //todo: handle the error!
-    c, _ := handlers.NewContainer(log, cluster, gocqlSession, pgxConnMap, helper)
+    c, _ := handlers.NewContainer(log, cluster, gocqlSession, pgxConnMap, helper, serverPort)
     defer c.Cleanup()
 
     // Middleware
@@ -263,6 +263,12 @@ func main() {
     // Get Voyager Data migration metrics
     e.GET("/api/migration_metrics", c.GetVoyagerMetrics)
 
+    // GetClusterConnections - Get YSQL connection manager stats for every node of the cluster
+    e.GET("/api/connections", c.GetClusterConnections)
+
+    // GetClusterConnections - Get the node address for the current node
+    e.GET("/api/node_address", c.GetNodeAddress)
+
     render_htmls := templates.NewTemplate()
 
     // Code for rendering UI Without embedding the files
@@ -278,6 +284,9 @@ func main() {
     e.GET("/", handlers.IndexHandler)
 
     // Start server
-    uiBindAddress := helpers.HOST + port
+    if helpers.BindAddr == "" {
+        helpers.BindAddr = helpers.HOST
+    }
+    uiBindAddress := helpers.BindAddr + port
     e.Logger.Fatal(e.Start(uiBindAddress))
 }

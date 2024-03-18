@@ -14,11 +14,10 @@ import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasValue;
 import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -51,7 +50,6 @@ import com.yugabyte.yw.models.helpers.LoadBalancerConfig;
 import com.yugabyte.yw.models.helpers.LoadBalancerPlacement;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
-import com.yugabyte.yw.models.helpers.TaskType;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -59,7 +57,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
 import junitparams.converters.Nullable;
@@ -81,7 +79,7 @@ public class UniverseTaskBaseTest extends FakeDBApplication {
 
   @Mock private PlatformExecutorFactory platformExecutorFactory;
 
-  @Mock private ExecutorService executorService;
+  @Mock private ThreadPoolExecutor executorService;
 
   private static final int NUM_NODES = 3;
   private TestUniverseTaskBase universeTaskBase;
@@ -118,7 +116,7 @@ public class UniverseTaskBaseTest extends FakeDBApplication {
       nodeInstance.setNodeUuid(node.nodeUuid);
       nodeInstance.setInstanceName(details.instanceName);
       nodeInstance.setZoneUuid(node.azUuid);
-      nodeInstance.setInUse(true);
+      nodeInstance.setState(NodeInstance.State.USED);
       nodeInstance.setInstanceTypeCode(details.instanceType);
 
       nodeInstance.save();
@@ -204,16 +202,15 @@ public class UniverseTaskBaseTest extends FakeDBApplication {
   @Test
   // @formatter:off
   @Parameters({
-    "aws, 1.1.1.1, false", // aws with private IP
-    "aws, null, false", // aws without private IP
     "onprem, 1.1.1.1, false", // onprem with private IP
     "onprem, null, true" // onprem without private IP
   })
   // @formatter:on
   public void testCreateDestroyServerTasks(
-      CloudType cloudType, @Nullable String privateIp, boolean detailsCleanExpected) {
+      CloudType cloudType, @Nullable String privateIp, boolean setToFailedCleanup) {
     List<NodeDetails> nodes = setupNodeDetails(cloudType, privateIp);
     Universe universe = Mockito.mock(Universe.class);
+    when(universe.getNodes()).thenReturn(nodes);
     UniverseDefinitionTaskParams.UserIntent userIntent =
         new UniverseDefinitionTaskParams.UserIntent();
     UniverseDefinitionTaskParams.Cluster cluster =
@@ -223,18 +220,14 @@ public class UniverseTaskBaseTest extends FakeDBApplication {
     universeDetails.clusters.add(cluster);
     Mockito.when(universe.getCluster(Mockito.any())).thenReturn(cluster);
     Mockito.when(universe.getUniverseDetails()).thenReturn(universeDetails);
-    universeTaskBase.createDestroyServerTasks(universe, nodes, false, false, false);
+    universeTaskBase.createDestroyServerTasks(universe, nodes, false, false, false, true);
     for (int i = 0; i < NUM_NODES; i++) {
       // Node should not be in use.
       NodeInstance ni = NodeInstance.get(nodes.get(i).nodeUuid);
-      assertEquals(detailsCleanExpected, !ni.isInUse());
-      // If the instance details are cleared then it is not possible to find it by node name
-      try {
-        NodeInstance nodeInstance = NodeInstance.getByName(nodes.get(i).nodeName);
-        assertFalse(detailsCleanExpected);
-        assertTrue(nodeInstance.isInUse());
-      } catch (Exception e) {
-        assertTrue(detailsCleanExpected);
+      if (setToFailedCleanup) {
+        assertEquals(NodeInstance.State.DECOMMISSIONED, ni.getState());
+      } else {
+        assertEquals(NodeInstance.State.USED, ni.getState());
       }
     }
   }
@@ -502,12 +495,8 @@ public class UniverseTaskBaseTest extends FakeDBApplication {
 
     public TestUniverseTaskBase() {
       super(baseTaskDependencies);
-      // Create a real task with fake parameters to make validations succeed.
-      runnableTask =
-          baseTaskDependencies
-              .getTaskExecutor()
-              .createRunnableTask(TaskType.CreateUniverse, new UniverseDefinitionTaskParams());
-      taskParams = new UniverseTaskParams();
+      runnableTask = mock(RunnableTask.class);
+      taskParams = mock(UniverseTaskParams.class);
     }
 
     @Override

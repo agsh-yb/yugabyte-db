@@ -494,10 +494,13 @@ ybginSetupTargets(IndexScanDesc scan)
 static void
 ybginExecSelect(IndexScanDesc scan, ScanDirection dir)
 {
-	bool		is_forward_scan = (dir == ForwardScanDirection);
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
 
-	HandleYBStatus(YBCPgSetForwardScan(ybso->handle, is_forward_scan));
+	Assert(!ScanDirectionIsBackward(dir));
+	/* Set scan direction, if matters */
+	if (ScanDirectionIsForward(dir))
+		HandleYBStatus(YBCPgSetForwardScan(ybso->handle, true));
+
 	HandleYBStatus(YBCPgExecSelect(ybso->handle, NULL /* exec_params */));
 }
 
@@ -588,7 +591,7 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
 
 	/* Sanity check: amcanbackward. */
-	Assert(dir == ForwardScanDirection);
+	Assert(!ScanDirectionIsBackward(dir));
 
 	if (!ybso->is_exec_done)
 	{
@@ -598,7 +601,6 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	/* fetch */
-	scan->xs_ctup.t_ybctid = 0;
 	if (scan->yb_aggrefs)
 	{
 		/*
@@ -616,19 +618,18 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		if (true)				/* TODO(jason): don't assume a match. */
 		{
-			scan->xs_ctup.t_ybctid = tup->t_ybctid;
 			scan->xs_hitup = tup;
 			scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
 
 			/* TODO(jason): don't assume that recheck is needed. */
 			scan->xs_recheck = true;
-			break;
+			return true;
 		}
 
 		heap_freetuple(tup);
 	}
 
-	return scan->xs_ctup.t_ybctid != 0;
+	return false;
 }
 
 /*

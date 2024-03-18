@@ -172,7 +172,7 @@ SELECT * FROM pk_multi WHERE yb_hash_code(h) = yb_hash_code(1);
 (4 rows)
 
 -- Test yb_pushdown_is_not_null
-CREATE TABLE inn_hash(k int PRIMARY KEY, v int);
+CREATE TABLE inn_hash(k int PRIMARY KEY, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX ON inn_hash(v ASC);
 INSERT INTO inn_hash VALUES (1,NULL),(2,102),(3,NULL),(4,104),(5,105),(6,NULL);
 SELECT * FROM inn_hash WHERE v IS NOT NULL;
@@ -245,7 +245,7 @@ SELECT * FROM usc_asc ORDER BY v NULLS FIRST;
  33 | 30
 (5 rows)
 
-CREATE TABLE usc_multi_asc(k int, r int, v int);
+CREATE TABLE usc_multi_asc(k int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX ON usc_multi_asc(k, r ASC NULLS FIRST);
 INSERT INTO usc_multi_asc(k, r, v) VALUES (1, 10, 1),(1, NULL, 2),(1, 20, 3);
 EXPLAIN (COSTS OFF) SELECT * FROM usc_multi_asc WHERE k = 1;
@@ -317,7 +317,7 @@ SELECT * FROM sc_desc ORDER BY v NULLS FIRST;
  3 | 30
 (5 rows)
 
-CREATE TABLE sc_multi_desc(k int, r int, v int);
+CREATE TABLE sc_multi_desc(k int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX ON sc_multi_desc(k, r DESC);
 INSERT INTO sc_multi_desc(k, r, v) VALUES (1, 10, 10),(1, 10, 10),(1, NULL, 2),(1, 20, 3);
 EXPLAIN (COSTS OFF) SELECT * FROM sc_multi_desc WHERE k = 1;
@@ -352,7 +352,7 @@ SELECT v,r FROM sc_multi_desc WHERE v IN (2,4) and r is null;
 (1 row)
 
 -- Test NULLS last ordering.
-CREATE TABLE sc_desc_nl(h int, r int, v int);
+CREATE TABLE sc_desc_nl(h int, r int, v int) SPLIT INTO 1 TABLETS;
 CREATE INDEX on sc_desc_nl(h HASH, r DESC NULLS LAST);
 INSERT INTO sc_desc_nl(h,r,v) values (1,1,1), (1,2,2), (1,3,3), (1,4,4), (1,5,5), (1, null, 6);
 -- Rows should be ordered DESC NULLS LAST by r.
@@ -563,7 +563,7 @@ explain select * from test where col9 = 99;
                         QUERY PLAN
 ----------------------------------------------------------
  Seq Scan on test  (cost=0.00..102.50 rows=1000 width=96)
-   Remote Filter: (col9 = 99)
+   Storage Filter: (col9 = 99)
 (2 rows)
 
 select * from test where col9 = 88;
@@ -593,7 +593,7 @@ explain select * from test where lower(col7) = 'dd';
                         QUERY PLAN
 ----------------------------------------------------------
  Seq Scan on test  (cost=0.00..107.50 rows=1000 width=96)
-   Remote Filter: (lower((col7)::text) = 'dd'::text)
+   Storage Filter: (lower((col7)::text) = 'dd'::text)
 (2 rows)
 
 select * from test where col7 = 'Dd';
@@ -651,7 +651,7 @@ EXPLAIN SELECT * FROM test WHERE col4 = 222 and col5 = 223;
 -----------------------------------------------------------------------
  Index Scan using idx_col5 on test  (cost=0.00..5.28 rows=10 width=96)
    Index Cond: (col5 = 223)
-   Remote Filter: (col4 = 222)
+   Storage Filter: (col4 = 222)
 (3 rows)
 
 SELECT * FROM test WHERE col4 = 222 and col5 = 223;
@@ -693,7 +693,7 @@ EXPLAIN SELECT * FROM test WHERE col5 = 444 and col6 = 35;
 -----------------------------------------------------------------------
  Index Scan using idx_col5 on test  (cost=0.00..5.28 rows=10 width=96)
    Index Cond: (col5 = 444)
-   Remote Index Filter: (col6 = 35)
+   Storage Index Filter: (col6 = 35)
 (3 rows)
 
 SELECT * FROM test WHERE col5 = 444 and col6 = 35;
@@ -707,7 +707,7 @@ EXPLAIN SELECT * FROM test WHERE col6 = 5554;
                         QUERY PLAN
 ----------------------------------------------------------
  Seq Scan on test  (cost=0.00..102.50 rows=1000 width=96)
-   Remote Filter: (col6 = 5554)
+   Storage Filter: (col6 = 5554)
 (2 rows)
 
 SELECT * FROM test WHERE col6 = 5554;
@@ -723,7 +723,7 @@ EXPLAIN SELECT col4, col5 FROM test WHERE col4 = 232 and col5 % 3 = 0;
 -----------------------------------------------------------------------------------------------
  Index Only Scan using idx_col4_idx_col5_idx_col6 on test  (cost=0.00..16.25 rows=100 width=8)
    Index Cond: (col4 = 232)
-   Remote Filter: ((col5 % 3) = 0)
+   Storage Filter: ((col5 % 3) = 0)
 (3 rows)
 
 SELECT col4, col5 FROM test WHERE col4 = 232 and col5 % 3 = 0;
@@ -738,7 +738,7 @@ EXPLAIN SELECT col4 FROM test WHERE col4 = 232 and col5 % 3 = 0;
 -----------------------------------------------------------------------------------------------
  Index Only Scan using idx_col4_idx_col5_idx_col6 on test  (cost=0.00..16.25 rows=100 width=4)
    Index Cond: (col4 = 232)
-   Remote Filter: ((col5 % 3) = 0)
+   Storage Filter: ((col5 % 3) = 0)
 (3 rows)
 
 SELECT col4 FROM test WHERE col4 = 232 and col5 % 3 = 0;
@@ -3754,3 +3754,132 @@ SELECT a, b FROM test_tbl WHERE b = 4;
 
 DROP INDEX test_idx;
 DROP TABLE test_tbl;
+-- (#21004) The tests in this section validate that computation of range bounds
+-- is skipped while prechecking an Index-only Scan's rescan condition.
+DROP TABLE IF EXISTS aa;
+NOTICE:  table "aa" does not exist, skipping
+DROP TABLE IF EXISTS bb;
+NOTICE:  table "bb" does not exist, skipping
+CREATE TABLE aa (col_varchar_key VARCHAR(1), col_varchar_nokey VARCHAR(1));
+CREATE TABLE bb (col_varchar_key VARCHAR(1), col_varchar_nokey VARCHAR(1));
+INSERT INTO aa VALUES ('g', 'g');
+INSERT INTO bb VALUES ('g', 'g');
+CREATE INDEX bb_varchar_key ON bb (col_varchar_key ASC);
+-- Correlation between two different tables
+EXPLAIN (COSTS OFF) SELECT (
+  SELECT
+    COUNT(*)
+  FROM
+    bb AS subquery_t1
+  WHERE
+    subquery_t1.col_varchar_key <= table2.col_varchar_nokey AND
+    subquery_t1.col_varchar_key <= table2.col_varchar_nokey
+) AS field1
+FROM
+  aa AS table2;
+                                                                  QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on aa table2
+   SubPlan 1
+     ->  Finalize Aggregate
+           ->  Index Only Scan using bb_varchar_key on bb subquery_t1
+                 Index Cond: ((col_varchar_key <= (table2.col_varchar_nokey)::text) AND (col_varchar_key <= (table2.col_varchar_nokey)::text))
+                 Partial Aggregate: true
+(6 rows)
+
+-- Correlation of the same table
+SELECT (
+  SELECT
+    COUNT(*)
+  FROM
+    bb AS subquery_t1
+  WHERE
+    subquery_t1.col_varchar_key >= table1.col_varchar_nokey AND
+    subquery_t1.col_varchar_key > 'a'
+) AS field1
+FROM
+  bb AS table1;
+ field1
+--------
+      1
+(1 row)
+
+create table sample(a int, b int, primary key(a asc, b asc));
+insert into sample values (1,1);
+insert into sample values (1,2);
+insert into sample values (2,1);
+explain (costs off) select * from sample where b < 2 and b >= 2;
+               QUERY PLAN
+----------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b < 2) AND (b >= 2))
+(2 rows)
+
+select * from sample where b < 2 and b >= 2;
+ a | b
+---+---
+(0 rows)
+
+explain (costs off) select * from sample where b >= 2 and b < 2;
+               QUERY PLAN
+----------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b >= 2) AND (b < 2))
+(2 rows)
+
+select * from sample where b >= 2 and b < 2;
+ a | b
+---+---
+(0 rows)
+
+explain (costs off) select * from sample where b < 2 and b >= 2;
+               QUERY PLAN
+----------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b < 2) AND (b >= 2))
+(2 rows)
+
+select * from sample where b < 2 and b >= 2;
+ a | b
+---+---
+(0 rows)
+
+explain (costs off) select * from sample where b <= 2 and b < 2 and b >= 2;
+                    QUERY PLAN
+---------------------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b <= 2) AND (b < 2) AND (b >= 2))
+(2 rows)
+
+select * from sample where b <= 2 and b < 2 and b >= 2;
+ a | b
+---+---
+(0 rows)
+
+explain (costs off) select * from sample where b <= 2 and b >= 2;
+               QUERY PLAN
+----------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b <= 2) AND (b >= 2))
+(2 rows)
+
+select * from sample where b <= 2 and b >= 2;
+ a | b
+---+---
+ 1 | 2
+(1 row)
+
+explain (costs off) select * from sample where b <= 3 and b <= 2 and b >= 2;
+                     QUERY PLAN
+----------------------------------------------------
+ Index Scan using sample_pkey on sample
+   Index Cond: ((b <= 3) AND (b <= 2) AND (b >= 2))
+(2 rows)
+
+select * from sample where b <= 3 and b <= 2 and b >= 2;
+ a | b
+---+---
+ 1 | 2
+(1 row)
+
+drop table sample;

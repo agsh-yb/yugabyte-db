@@ -101,12 +101,11 @@
 using namespace std::literals;
 
 DEFINE_test_flag(bool, assert_local_tablet_server_selected, false, "Verify that SelectTServer "
-                 "selected the local tablet server. Also verify that ReplicaSelection is equal "
-                 "to CLOSEST_REPLICA");
+    "selected the local tablet server. Also verify that ReplicaSelection is equal "
+    "to CLOSEST_REPLICA");
 
 DEFINE_test_flag(string, assert_tablet_server_select_is_in_zone, "",
-                 "Verify that SelectTServer selected a talet server in the AZ specified by this "
-                 "flag.");
+    "Verify that SelectTServer selected a talet server in the AZ specified by this flag.");
 
 DEFINE_RUNTIME_uint32(change_metadata_backoff_max_jitter_ms, 0,
     "Max jitter (in ms) in the exponential backoff loop that checks if a change metadata operation "
@@ -119,7 +118,7 @@ DEFINE_RUNTIME_uint32(change_metadata_backoff_init_exponent, 1,
 DECLARE_int64(reset_master_leader_timeout_ms);
 
 DECLARE_string(flagfile);
-DECLARE_bool(ysql_ddl_rollback_enabled);
+DECLARE_bool(ysql_yb_ddl_rollback_enabled);
 
 namespace yb {
 
@@ -178,6 +177,8 @@ class SyncClientMasterRpc : public internal::ClientMasterRpcBase {
   Status ResponseStatus() override {
     return internal::StatusFromResp(*resp_);
   }
+
+  bool ShouldRetry(const Status& status) override;
 
  private:
   RespClass* resp_;
@@ -243,6 +244,7 @@ YB_CLIENT_SPECIALIZE_SIMPLE(DeleteTable);
 YB_CLIENT_SPECIALIZE_SIMPLE(DeleteTablegroup);
 YB_CLIENT_SPECIALIZE_SIMPLE(DeleteUDType);
 YB_CLIENT_SPECIALIZE_SIMPLE(FlushTables);
+YB_CLIENT_SPECIALIZE_SIMPLE(GetBackfillStatus);
 YB_CLIENT_SPECIALIZE_SIMPLE(GetTablegroupSchema);
 YB_CLIENT_SPECIALIZE_SIMPLE(GetColocatedTabletSchema);
 YB_CLIENT_SPECIALIZE_SIMPLE(GetMasterClusterConfig);
@@ -266,6 +268,7 @@ YB_CLIENT_SPECIALIZE_SIMPLE(ValidateReplicationInfo);
 YB_CLIENT_SPECIALIZE_SIMPLE(CheckIfPitrActive);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Encryption, GetFullUniverseKeyRegistry);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Admin, AddTransactionStatusTablet);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Admin, AreNodesSafeToTakeDown);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Admin, CreateTransactionStatusTable);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Admin, WaitForYsqlBackendsCatalogVersion);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Backup, CreateSnapshot);
@@ -281,6 +284,7 @@ YB_CLIENT_SPECIALIZE_SIMPLE_EX(Client, RedisConfigSet);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Client, ReservePgsqlOids);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Client, GetStatefulServiceLocation);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Cluster, GetAutoFlagsConfig);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Cluster, ValidateAutoFlagsConfig);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Cluster, IsLoadBalanced);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Cluster, IsLoadBalancerIdle);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Cluster, ListLiveTabletServers);
@@ -292,6 +296,8 @@ YB_CLIENT_SPECIALIZE_SIMPLE_EX(Dcl, DeleteRole);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Dcl, GetPermissions);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Dcl, GrantRevokePermission);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Dcl, GrantRevokeRole);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, AlterUniverseReplication);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetXClusterSafeTimeForNamespace);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, CreateCDCStream);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, DeleteCDCStream);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetCDCDBStreamInfo);
@@ -306,6 +312,32 @@ YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, UpdateConsumerOnProducerSplit);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, UpdateConsumerOnProducerMetadata);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, GetXClusterSafeTime);
 YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, BootstrapProducer);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterReportNewAutoFlagConfigVersion);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterAddNamespaceToOutboundReplicationGroup);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterRemoveNamespaceFromOutboundReplicationGroup);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, SetupUniverseReplication);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, IsSetupUniverseReplicationDone);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, CreateXClusterReplication);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, IsCreateXClusterReplicationDone);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterCreateOutboundReplicationGroup);
+YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, XClusterDeleteOutboundReplicationGroup);
+
+#define YB_CLIENT_SPECIALIZE_SIMPLE_EX_EACH(i, data, set) YB_CLIENT_SPECIALIZE_SIMPLE_EX set
+
+#define YB_CLIENT_SPECIALIZE_SIMPLE_FOR(rpcs) \
+  BOOST_PP_SEQ_FOR_EACH(YB_CLIENT_SPECIALIZE_SIMPLE_EX_EACH, ~, rpcs)
+
+template<class ProxyClass, class RespClass>
+bool SyncClientMasterRpc<ProxyClass, RespClass>::ShouldRetry(const Status& status) {
+  return internal::ClientMasterRpcBase::ShouldRetry(status);
+}
+
+template<>
+bool SyncClientMasterRpc<master::MasterAdminProxy,
+                         WaitForYsqlBackendsCatalogVersionResponsePB>::ShouldRetry(
+    const Status& status) {
+  return status.IsTryAgain();
+}
 
 YBClient::Data::Data()
     : leader_master_rpc_(rpcs_.InvalidHandle()),
@@ -551,12 +583,11 @@ Status YBClient::Data::IsCreateTableInProgress(YBClient* client,
     return STATUS(InternalError, "Cannot query IsCreateTableInProgress without table info");
   }
 
-  RETURN_NOT_OK(SyncLeaderMasterRpc(
-      deadline, req, &resp, "IsCreateTableDone",
-      &master::MasterDdlProxy::IsCreateTableDoneAsync));
+  auto status = SyncLeaderMasterRpc(
+      deadline, req, &resp, "IsCreateTableDone", &master::MasterDdlProxy::IsCreateTableDoneAsync);
 
   *create_in_progress = !resp.done();
-  return Status::OK();
+  return status;
 }
 
 Status YBClient::Data::WaitForCreateTableToFinish(YBClient* client,
@@ -590,14 +621,14 @@ Status YBClient::Data::DeleteTable(YBClient* client,
   if (!table_id.empty()) {
     req.mutable_table()->set_table_id(table_id);
   }
-  if (FLAGS_ysql_ddl_rollback_enabled && txn) {
+  if (FLAGS_ysql_yb_ddl_rollback_enabled && txn) {
     // If 'txn' is set, this means this delete operation should actually result in the
     // deletion of table data only if this transaction is a success. Therefore ensure that
     // 'wait' is not set, because it makes no sense to wait for the deletion to complete if we want
     // to postpone the deletion until end of transaction.
     DCHECK(!wait);
     txn->ToPB(req.mutable_transaction());
-    req.set_ysql_ddl_rollback_enabled(true);
+    req.set_ysql_yb_ddl_rollback_enabled(true);
   }
   req.set_is_index_table(is_index_table);
   const Status status = SyncLeaderMasterRpc(
@@ -659,7 +690,12 @@ Status YBClient::Data::DeleteTable(YBClient* client,
     indexed_table_name->GetFromTableIdentifierPB(resp.indexed_table());
   }
 
-  LOG(INFO) << "Deleted table " << (!table_id.empty() ? table_id : table_name.ToString());
+  if (req.ysql_yb_ddl_rollback_enabled()) {
+    LOG(INFO) << "Marked table " << (!table_id.empty() ? table_id : table_name.ToString())
+              << " for deletion at the end of transaction " << txn->ToString();
+  } else {
+    LOG(INFO) << "Deleted table " << (!table_id.empty() ? table_id : table_name.ToString());
+  }
   return Status::OK();
 }
 
@@ -770,7 +806,7 @@ Status YBClient::Data::CreateTablegroup(YBClient* client,
 
   if (txn) {
     txn->ToPB(req.mutable_transaction());
-    req.set_ysql_ddl_rollback_enabled(FLAGS_ysql_ddl_rollback_enabled);
+    req.set_ysql_yb_ddl_rollback_enabled(FLAGS_ysql_yb_ddl_rollback_enabled);
   }
 
   int attempts = 0;
@@ -848,9 +884,9 @@ Status YBClient::Data::DeleteTablegroup(YBClient* client,
   // and perform the actual deletion only after the transaction commits. Thus there is no point
   // waiting for the table to be deleted here if DDL Rollback is enabled.
   bool wait = true;
-  if (txn && FLAGS_ysql_ddl_rollback_enabled) {
+  if (txn && FLAGS_ysql_yb_ddl_rollback_enabled) {
     txn->ToPB(req.mutable_transaction());
-    req.set_ysql_ddl_rollback_enabled(true);
+    req.set_ysql_yb_ddl_rollback_enabled(true);
     wait = false;
   }
 
@@ -952,6 +988,26 @@ Status YBClient::Data::WaitForBackfillIndexToFinish(
       "Timed out waiting for Backfill Index",
       std::bind(
           &YBClient::Data::IsBackfillIndexInProgress, this, client, table_id, index_id, _1, _2));
+}
+
+Result<master::GetBackfillStatusResponsePB> YBClient::Data::GetBackfillStatus(
+    const std::vector<std::string_view>& table_ids, const CoarseTimePoint deadline) {
+  if (table_ids.empty()) {
+    return STATUS(InvalidArgument, "At least one table must be specified");
+  }
+
+  GetBackfillStatusRequestPB req;
+  GetBackfillStatusResponsePB resp;
+  req.mutable_index_tables()->Reserve(yb::narrow_cast<int>(table_ids.size()));
+  for (auto it = table_ids.begin(); it != table_ids.end(); ++it) {
+    req.add_index_tables()->set_table_id(std::string{*it});
+  }
+
+  RETURN_NOT_OK(SyncLeaderMasterRpc(
+      deadline, req, &resp, "GetBackfillStatus",
+      &master::MasterDdlProxy::GetBackfillStatusAsync));
+
+  return resp;
 }
 
 Status YBClient::Data::IsCreateNamespaceInProgress(
@@ -1163,6 +1219,9 @@ Status YBClient::Data::IsFlushTableInProgress(YBClient* client,
       &master::MasterAdminProxy::IsFlushTablesDoneAsync));
 
   *flush_in_progress = !resp.done();
+  if (!resp.success()) {
+    return STATUS_FORMAT(InternalError, "Flush operation for id: $0 failed", flush_id);
+  }
   return Status::OK();
 }
 
@@ -1383,6 +1442,8 @@ Status CreateTableInfoFromTableSchemaResp(const GetTableSchemaResponsePB& resp, 
   }
   SCHECK_GT(info->table_id.size(), 0U, IllegalState, "Running against a too-old master");
   info->colocated = resp.colocated();
+
+  info->pg_table_id = resp.pg_table_id();
 
   return Status::OK();
 }
@@ -1702,7 +1763,7 @@ class CreateSnapshotRpc
   }
 
   string ToString() const override {
-    return Format("CreateSnapshotRpc(num_attempts: $1)", num_attempts());
+    return Format("CreateSnapshotRpc(num_attempts: $0)", num_attempts());
   }
 
   virtual ~CreateSnapshotRpc() {}
@@ -2076,6 +2137,129 @@ class GetTableLocationsRpc
   }
 
   GetTableLocationsCallback user_cb_;
+};
+
+// A simple RPC that keeps retrying if resp has not_ready set.
+class GetXClusterStreamsRpc
+    : public ClientMasterRpc<
+          master::GetXClusterStreamsRequestPB, master::GetXClusterStreamsResponsePB> {
+ public:
+  GetXClusterStreamsRpc(
+      YBClient* client, std::function<void(Result<master::GetXClusterStreamsResponsePB>)> user_cb,
+      CoarseTimePoint deadline)
+      : ClientMasterRpc(client, deadline), user_cb_(std::move(user_cb)) {}
+
+  Status Init(
+      const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id,
+      const std::vector<TableName>& table_names, const std::vector<PgSchemaName>& pg_schema_names) {
+    SCHECK_EQ(
+        table_names.size(), pg_schema_names.size(), InvalidArgument,
+        "Table names and pg schema names must be of the same size");
+
+    req_.set_replication_group_id(replication_group_id.ToString());
+    req_.set_namespace_id(namespace_id);
+
+    for (size_t i = 0; i < table_names.size(); i++) {
+      auto* table_info = req_.add_table_infos();
+      table_info->set_table_name(table_names[i]);
+      table_info->set_pg_schema_name(pg_schema_names[i]);
+    }
+
+    return Status::OK();
+  }
+
+  string ToString() const override {
+    return Format(
+        "GetXClusterStreamsRpc(replication_group_id: $0, num_attempts: $1)",
+        req_.replication_group_id(), num_attempts());
+  }
+
+  virtual ~GetXClusterStreamsRpc() {}
+
+ private:
+  void CallRemoteMethod() override {
+    master_replication_proxy()->GetXClusterStreamsAsync(
+        req_, &resp_, mutable_retrier()->mutable_controller(),
+        std::bind(&GetXClusterStreamsRpc::Finished, this, Status::OK()));
+  }
+
+  Status ResponseStatus() override {
+    RETURN_NOT_OK(internal::StatusFromResp(resp_));
+    if (resp_.not_ready()) {
+      VLOG(2) << ToString() << ": xClusterOutboundReplicationGroup is not ready yet, retrying.";
+      return STATUS(TryAgain, "xClusterOutboundReplicationGroup is not ready yet");
+    }
+    return Status::OK();
+  }
+
+  bool ShouldRetry(const Status& status) override { return status.IsTryAgain(); }
+
+  void ProcessResponse(const Status& status) override {
+    if (!status.ok()) {
+      LOG(WARNING) << ToString() << " failed: " << status;
+      user_cb_(std::move(status));
+      return;
+    }
+
+    user_cb_(std::move(resp_));
+  }
+
+  std::function<void(Result<master::GetXClusterStreamsResponsePB>)> user_cb_;
+};
+
+// A simple RPC that keeps retrying if resp has not_ready set.
+class IsXClusterBootstrapRequiredRpc : public ClientMasterRpc<
+                                           master::IsXClusterBootstrapRequiredRequestPB,
+                                           master::IsXClusterBootstrapRequiredResponsePB> {
+ public:
+  IsXClusterBootstrapRequiredRpc(
+      YBClient* client, std::function<void(Result<bool>)> user_cb, CoarseTimePoint deadline)
+      : ClientMasterRpc(client, deadline), user_cb_(std::move(user_cb)) {}
+
+  Status Init(
+      const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id) {
+    req_.set_replication_group_id(replication_group_id.ToString());
+    req_.set_namespace_id(namespace_id);
+    return Status::OK();
+  }
+
+  string ToString() const override {
+    return Format(
+        "IsXClusterBootstrapRequired(replication_group_id: $0, num_attempts: $1)",
+        req_.replication_group_id(), num_attempts());
+  }
+
+  virtual ~IsXClusterBootstrapRequiredRpc() {}
+
+ private:
+  void CallRemoteMethod() override {
+    master_replication_proxy()->IsXClusterBootstrapRequiredAsync(
+        req_, &resp_, mutable_retrier()->mutable_controller(),
+        std::bind(&IsXClusterBootstrapRequiredRpc::Finished, this, Status::OK()));
+  }
+
+  Status ResponseStatus() override {
+    RETURN_NOT_OK(internal::StatusFromResp(resp_));
+    if (resp_.not_ready()) {
+      VLOG(2) << ToString() << ": xClusterOutboundReplicationGroup is not ready yet, retrying.";
+      return STATUS(TryAgain, "xClusterOutboundReplicationGroup is not ready yet");
+    }
+    return Status::OK();
+  }
+
+  bool ShouldRetry(const Status& status) override { return status.IsTryAgain(); }
+
+  void ProcessResponse(const Status& status) override {
+    if (!status.ok()) {
+      LOG(WARNING) << ToString() << " failed: " << status;
+      user_cb_(std::move(status));
+      return;
+    }
+
+    user_cb_(resp_.initial_bootstrap_required());
+  }
+
+  std::function<void(Result<bool>)> user_cb_;
 };
 
 } // namespace internal
@@ -2705,6 +2889,45 @@ Status YBClient::Data::ReportYsqlDdlTxnStatus(
   return Status::OK();
 }
 
+Status YBClient::Data::IsYsqlDdlVerificationInProgress(
+    const TransactionMetadata& txn,
+    CoarseTimePoint deadline,
+    bool *ddl_verification_in_progress) {
+  master::IsYsqlDdlVerificationDoneRequestPB req;
+  master::IsYsqlDdlVerificationDoneResponsePB resp;
+
+  txn.ToPB(req.mutable_transaction());
+  auto s = SyncLeaderMasterRpc(
+      deadline, req, &resp, "IsYsqlDdlVerificationDone",
+      &master::MasterDdlProxy::IsYsqlDdlVerificationDoneAsync);
+
+  // Check DDL verification is paused. This can happen during error injection tests.  If so, no
+  // point continuing to retry.
+  if (resp.has_error()) {
+    if (resp.error().has_status() &&
+        resp.error().status().has_message() &&
+        resp.error().status().message().find("DDL Rollback is paused") != std::string::npos) {
+      *ddl_verification_in_progress = false;
+    }
+    return StatusFromPB(resp.error().status());
+  }
+
+  RETURN_NOT_OK(s);
+
+  *ddl_verification_in_progress = !resp.done();
+  return Status::OK();
+}
+
+Status YBClient::Data::WaitForDdlVerificationToFinish(
+    const TransactionMetadata& txn,
+    CoarseTimePoint deadline) {
+  return RetryFunc(
+      deadline,
+      Format("Waiting on YSQL DDL Verification for $0 to be completed", txn.transaction_id),
+      Format("Timed out on YSQL DDL Verification for $0 to be completed", txn.transaction_id),
+      std::bind(&YBClient::Data::IsYsqlDdlVerificationInProgress, this, txn, _1, _2));
+}
+
 Result<bool> YBClient::Data::CheckIfPitrActive(CoarseTimePoint deadline) {
   CheckIfPitrActiveRequestPB req;
   CheckIfPitrActiveResponsePB resp;
@@ -2719,6 +2942,31 @@ Result<bool> YBClient::Data::CheckIfPitrActive(CoarseTimePoint deadline) {
   }
 
   return resp.is_pitr_active();
+}
+
+Status YBClient::Data::GetXClusterStreams(
+    YBClient* client, CoarseTimePoint deadline,
+    const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id,
+    const std::vector<TableName>& table_names, const std::vector<PgSchemaName>& pg_schema_names,
+    std::function<void(Result<master::GetXClusterStreamsResponsePB>)> user_cb) {
+  auto rpc =
+      std::make_shared<internal::GetXClusterStreamsRpc>(client, std::move(user_cb), deadline);
+  RETURN_NOT_OK(rpc->Init(replication_group_id, namespace_id, table_names, pg_schema_names));
+  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+
+  return Status::OK();
+}
+
+Status YBClient::Data::IsXClusterBootstrapRequired(
+    YBClient* client, CoarseTimePoint deadline,
+    const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id,
+    std::function<void(Result<bool>)> user_cb) {
+  auto rpc = std::make_shared<internal::IsXClusterBootstrapRequiredRpc>(
+      client, std::move(user_cb), deadline);
+  RETURN_NOT_OK(rpc->Init(replication_group_id, namespace_id));
+  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
+
+  return Status::OK();
 }
 
 HostPort YBClient::Data::leader_master_hostport() const {

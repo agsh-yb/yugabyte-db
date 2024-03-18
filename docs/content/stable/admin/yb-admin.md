@@ -606,7 +606,66 @@ yb-admin \
 
 To verify that the new status tablet has been created, run the [`list_tablets`](#list-tablets) command.
 
+#### flush_table
+
+Flush the memstores of the specified table on all tablet servers to disk.
+
+**Syntax**
+
+```sh
+yb-admin \
+    -master_addresses <master-addresses> \
+    flush_table <table_name> | <table_id> <db_type>.<namespace> [timeout_in_seconds] [ADD_INDEXES]
+```
+
+* *master_addresses*: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`.
+* *db_type*: The type of database. Valid values include ysql, ycql, yedis, and unknown.
+* *namespace*: The name of the database (for YSQL) or keyspace (for YCQL).
+* *table_name*: The name of the table to flush.
+* *table_id*: The unique UUID of the table to flush.
+* *timeout_in_seconds*: Specifies duration, in seconds when the cli timeouts waiting for flushing to end. Default value is `20`.
+* *ADD_INDEXES*: If the DB should also flush the secondary indexes associated with the table. Default is `false`.
+
+
+**Example**
+
+```sh
+./bin/yb-admin \
+    -master_addresses $MASTER_RPC_ADDRS \
+    flush_table ysql.yugabyte table_name
+
+```
+```output
+Flushed [yugabyte.table_name] tables.
+```
 ---
+
+
+#### backfill_indexes_for_table
+
+Backfill all DEFERRED indexes in a YCQL table.
+
+**Syntax**
+
+```sh
+yb-admin \
+    -master_addresses <master-addresses> \
+    backfill_indexes_for_table <keyspace> <table_name>
+```
+
+* *master-addresses*: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`.
+* *keyspace*: Specifies the keyspace `ycql.keyspace-name`.
+* *table_name*: Specifies the table name.
+
+**Example**
+
+```sh
+./bin/yb-admin \
+    -master_addresses ip1:7100,ip2:7100,ip3:7100 \
+    backfill_indexes_for_table ybdemo table_name
+```
+
+A new backfill job is created for all the `DEFERRED` indexes of the table. The command does not have any output.
 
 ### Backup and snapshot commands
 
@@ -626,6 +685,13 @@ The following backup and snapshot commands are available:
 * [**list_snapshot_schedules**](#list-snapshot-schedules) returns a list of all snapshot schedules
 * [**restore_snapshot_schedule**](#restore-snapshot-schedule) restores all objects in a scheduled snapshot
 * [**delete_snapshot_schedule**](#delete-snapshot-schedule) deletes the specified snapshot schedule
+
+
+{{< note title="YugabyteDB Anywhere" >}}
+
+If you are using YugabyteDB Anywhere to manage point-in-time-recovery (PITR) for a universe, you must initiate and manage PITR using the YugabyteDB Anywhere UI. If you use the yb-admin CLI to make changes to the PITR configuration of a universe managed by YugabyteDB Anywhere, including creating schedules and snapshots, your changes are not reflected in YugabyteDB Anywhere.
+
+{{< /note >}}
 
 #### create_database_snapshot
 
@@ -652,7 +718,7 @@ When this command runs, a `snapshot_id` is generated and printed.
     create_database_snapshot
 ```
 
-To see if the database snapshot creation has completed, run the [`yb-admin list_snapshots`](#list_snapshots) command.
+To see if the database snapshot creation has completed, run the [`yb-admin list_snapshots`](#list-snapshots) command.
 
 #### create_keyspace_snapshot
 
@@ -679,7 +745,7 @@ When this command runs, a `snapshot_id` is generated and printed.
     create_keyspace_snapshot
 ```
 
-To see if the database snapshot creation has completed, run the [`yb-admin list_snapshots`](#list_snapshots) command.
+To see if the database snapshot creation has completed, run the [`yb-admin list_snapshots`](#list-snapshots) command.
 
 #### list_snapshots
 
@@ -805,7 +871,7 @@ Flushing complete: SUCCESS
 Started snapshot creation: 4963ed18fc1e4f1ba38c8fcf4058b295
 ```
 
-To see if the snapshot creation has finished, run the [`yb-admin list_snapshots`](#list_snapshots) command.
+To see if the snapshot creation has finished, run the [`yb-admin list_snapshots`](#list-snapshots) command.
 
 #### restore_snapshot
 
@@ -1195,7 +1261,7 @@ In both cases, the output is similar to the following:
 
 Deletes the snapshot schedule with the given ID, **and all of the snapshots** associated with that schedule.
 
-Returns a JSON object with the schedule_id that was just deleted.
+Returns a JSON object with the `schedule_id` that was just deleted.
 
 **Syntax**
 
@@ -1451,7 +1517,7 @@ yb-admin \
 * *master-addresses*: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`.
 * *placement_info*: A comma-delimited list of read replica placements for *cloud*.*region*.*zone*, using the format `<cloud1.region1.zone1>:<num_replicas_in_zone1>,<cloud2.region2.zone2>:<num_replicas_in_zone2>,...`. Default value is `cloud1.datacenter1.rack1`.
     Read replica availability zones must be uniquely different from the primary availability zones. To use the same cloud, region, and availability zone for a read replica as a primary cluster, you can suffix the zone with `_rr` (for read replica). For example, `c1.r1.z1` vs `c1.r1.z1_rr:1`.
-* *replication_factor*: The number of replicas.
+* *replication_factor*: The total number of read replicas.
 * *placement_id*: The identifier of the read replica cluster, which can be any unique string. If not set, a randomly-generated ID will be used. Primary and read replica clusters must use different placement IDs.
 
 #### modify_read_replica_placement_info
@@ -1615,6 +1681,8 @@ For example:
     -master_addresses 127.0.0.1:7100 \
     create_change_data_stream ysql.yugabyte
 ```
+
+
 
 ##### Enabling before image
 
@@ -1942,12 +2010,12 @@ Sets the xCluster role to `STANDBY` or `ACTIVE`.
 
 ```sh
 yb-admin \
-    -master_addresses <master_addresses> \
+    -master_addresses <master-addresses> \
     change_xcluster_role \
-    <role> 
+    <role>
 ```
 
-* *master_addresses*: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`. These are the addresses of the master nodes where the role is to be applied. For example, to change the target to `STANDBY`, use target universe master addresses, and to change the source universe role, use source universe master addresses.
+* *master-addresses*: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`. These are the addresses of the master nodes where the role is to be applied. For example, to change the target to `STANDBY`, use target universe master addresses, and to change the source universe role, use source universe master addresses.
 * *role*: Can be `STANDBY` or `ACTIVE`.
 
 **Example**
@@ -1968,7 +2036,7 @@ Reports the current xCluster safe time for each namespace, which is the time at 
 yb-admin \
     -master_addresses <target_master_addresses> \
     get_xcluster_safe_time \
-    [include_lag_and_skew] 
+    [include_lag_and_skew]
 ```
 
 * *target_master_addresses*: Comma-separated list of target YB-Master hosts and ports. Default value is `localhost:7100`.
@@ -2084,7 +2152,7 @@ yb-admin \
 * `force_delete`: (Optional) Force the delete operation.
 
 {{< note title="Note" >}}
-This command should only be needed for advanced operations, such as doing manual cleanup of old bootstrapped streams that were never fully initialized, or otherwise failed replication streams. For normal xCluster replication cleanup, use [`delete_universe_replication`](#delete-universe-replication).
+This command should only be needed for advanced operations, such as doing manual cleanup of old bootstrapped streams that were never fully initialized, or otherwise failed replication streams. For normal xCluster replication cleanup, use [delete_universe_replication](#delete-universe-replication-source-universe-uuid).
 {{< /note >}}
 
 #### bootstrap_cdc_producer <comma_separated_list_of_table_ids>
@@ -2118,20 +2186,20 @@ table id: 000030ad000030008000000000004000, CDC bootstrap id: dd5ea73b5d384b2c9e
 The CDC bootstrap ids are the ones that should be used with [`setup_universe_replication`](#setup-universe-replication) and [`alter_universe_replication`](#alter-universe-replication).
 {{< /note >}}
 
----
-
 #### get_replication_status
 
-Returns the replication status of all consumer streams. If *producer_universe_uuid* is provided, this will only return streams that belong to an associated universe key.
+Returns the replication status of all consumer streams. If *source_universe_uuid* is provided, this will only return streams that belong to an associated universe key. If *replication_name* is provided, this will only return the stream that belongs to the specified replication.
 
 **Syntax**
 
 ```sh
 yb-admin \
-    -master_addresses <master-addresses> get_replication_status [ <producer_universe_uuid> ]
+    -master_addresses <target-master-addresses> \
+    get_replication_status [ <source_universe_uuid>_<replication_name> ]
 ```
 
-* *producer_universe_uuid*: Optional universe-unique identifier (can be any string, such as a string of a UUID).
+* *source_universe_uuid*: (Optional) The UUID of the source universe.
+* *replication_name*: (Optional) The name of the replication stream.
 
 **Example**
 
@@ -2151,6 +2219,8 @@ statuses {
   }
 }
 ```
+
+---
 
 ### Decommissioning commands
 
@@ -2404,14 +2474,14 @@ yb-admin \
 If the operation is successful you should see output similar to the following:
 
 ```output
-PromoteAutoFlags status: 
+PromoteAutoFlags status:
 New AutoFlags were promoted. Config version: 2
 ```
 
 OR
 
 ```output
-PromoteAutoFlags status: 
+PromoteAutoFlags status:
 No new AutoFlags to promote
 ```
 
@@ -2419,7 +2489,7 @@ No new AutoFlags to promote
 
 Upgrades the YSQL system catalog after a successful [YugabyteDB cluster upgrade](../../manage/upgrade-deployment/).
 
-YSQL upgrades are not required for clusters where [YSQL is not enabled](../../reference/configuration/yb-tserver/#ysql-flags).
+YSQL upgrades are not required for clusters where [YSQL is not enabled](../../reference/configuration/yb-tserver/#ysql).
 
 **Syntax**
 

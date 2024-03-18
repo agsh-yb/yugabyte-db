@@ -33,11 +33,13 @@ Examples are included in the relevant sections below.
 
 Releases in LTS (long-term support) and STS (standard-term support) release series, denoted by `MAJOR.EVEN` versioning, introduce fully tested new features and changes added after the last stable release. A stable release series is based on the preceding preview release series. For example, the v2.16 STS release series is based on the v2.15 preview release series.
 
+Features in stable releases are considered to be {{<badge/ga>}} unless marked otherwise.
+
 Patch and revision releases in a stable release series (`MAJOR.EVEN`) include bug fixes and revisions that do not break backward compatibility.
 
 {{< note title="Important" >}}
 
-- Yugabyte supports *production deployments* on stable YugabyteDB releases and upgrades to newer stable releases. For a list of releases and their support timelines, see [YugabyteDB releases](../release-notes/) and [YugabyteDB Anywhere releases](../yba-releases/).
+- Yugabyte supports *production deployments* on stable YugabyteDB releases and upgrades to newer stable releases. For a list of releases and their support timelines, see [YugabyteDB releases](../ybdb-releases/) and [YugabyteDB Anywhere releases](../yba-releases/).
 - For recommendations on which version to use for development and testing, see [Recommended release series for projects](../../releases/#recommended-release-series-for-projects).
 
 {{< /note >}}
@@ -45,6 +47,8 @@ Patch and revision releases in a stable release series (`MAJOR.EVEN`) include bu
 ### Preview releases
 
 Releases in the preview release series, denoted by `MAJOR.ODD` versioning, are under active development and incrementally introduce new features and changes, and are intended for development, testing, and proof-of-concept projects. The v2.13 preview release series became the basis for the v2.14 LTS release series. **The current preview version is {{< yb-version version="preview" format="">}}**.
+
+Features in preview releases are considered to be {{<badge/tp>}} unless marked otherwise.
 
 Patch releases in the preview release series (`MAJOR.ODD.PATCH`) introduce new features, enhancements, and fixes.
 
@@ -59,20 +63,20 @@ Patch releases in the preview release series (`MAJOR.ODD.PATCH`) introduce new f
 
 YugabyteDB features are made available as one of the following:
 
-- Tech Preview (TP)
-- Early Access (EA)
-- General Availability (GA)
+- {{<badge/tp>}} Tech Preview
+- {{<badge/ea>}} Early Access
+- {{<badge/ga>}} General Availability
 
 Changes for EA and GA are always reported in the Release Notes.
 
-| Description | TP | EA | GA | Deprecated |
+| Description | {{<badge/tp>}} | {{<badge/ea>}} | {{<badge/ga>}} | Deprecated |
 | :--- | :--- | :--- | :--- | :--- |
-| Contact with Product Team | Y | N | N | N/A
+| Contact with Product Team | Y | Recommended | N | N/A |
 | Changes | Subject to change | Backwards compatible | Backwards compatible | N/A |
 | Support | N | Y | Y | N |
 | SLA | N | Y | Y | Y |
 | SLA (YBM) | N | N | Y | Y |
-| In Release Notes | N | Y | Y | Y |
+| In Release Notes | Y | Y | Y | Y |
 | Availability | By invitation or request | Y | Y | Y |
 | Documentation | Limited | Y | Y | N/A |
 
@@ -92,11 +96,11 @@ Documentation (if provided) for TP features is marked as such.
 
 A feature in Early Access (EA) is new or enhanced functionality made available for you to use.
 
-Code is well tested. Enabling the feature is considered safe. Some of these features are enabled by default.
+Code is well tested. Typically these features are not enabled by default. Enabling the feature is considered safe.
 
-Support for the overall feature will not be dropped, though details may change in incompatible ways in a subsequent GA release.
+Support for the overall feature will not be dropped, though details may change in a subsequent GA release.
 
-Recommended only for non-production use.
+For production use cases, it is recommended to validate the use case with the Yugabyte Product team. Refer to product documentation for specific limitations.
 
 Any bug fixes or improvements are managed and fixed with the same timeline and processes as those in GA.
 

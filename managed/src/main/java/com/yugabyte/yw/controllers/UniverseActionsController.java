@@ -34,6 +34,7 @@ import com.yugabyte.yw.forms.UniverseResp;
 import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.common.YbaApi;
 import com.yugabyte.yw.rbac.annotations.AuthzPath;
 import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
 import com.yugabyte.yw.rbac.annotations.RequiredPermissionOnResource;
@@ -59,9 +60,11 @@ public class UniverseActionsController extends AuthenticatedController {
   @Inject private RuntimeConfigFactory runtimeConfigFactory;
 
   @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
       value = "Configure alerts for a universe",
       nickname = "configureUniverseAlerts",
       response = YBPSuccess.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -83,7 +86,12 @@ public class UniverseActionsController extends AuthenticatedController {
     return empty();
   }
 
-  @ApiOperation(value = "Pause a universe", nickname = "pauseUniverse", response = YBPTask.class)
+  @ApiOperation(
+      notes = "Available since YBA version 2.6.0.0.",
+      value = "Pause a universe",
+      nickname = "pauseUniverse",
+      response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.6.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -126,9 +134,11 @@ public class UniverseActionsController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "Available since YBA version 2.6.0.0.",
       value = "Resume a paused universe",
       nickname = "resumeUniverse",
       response = YBPTask.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.6.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -161,9 +171,11 @@ public class UniverseActionsController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
       value = "Set a universe's key",
       nickname = "setUniverseKey",
       response = UniverseResp.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -196,9 +208,11 @@ public class UniverseActionsController extends AuthenticatedController {
   }
 
   @ApiOperation(
+      notes = "WARNING: This is a preview API that could change.",
       value = "Update load balancer config",
       nickname = "updateLoadBalancerConfig",
       response = UpdateLoadBalancerConfig.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.18.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -236,10 +250,12 @@ public class UniverseActionsController extends AuthenticatedController {
    * @return Result
    */
   @ApiOperation(
+      notes = "Available since YBA version 2.2.0.0.",
       value = "Set a universe's backup flag",
       nickname = "setUniverseBackupFlag",
       tags = {"Universe management", "Backups"},
       response = YBPSuccess.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.2.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -268,9 +284,11 @@ public class UniverseActionsController extends AuthenticatedController {
    * @return Result
    */
   @ApiOperation(
-      value = "Flag a universe as Helm 3-compatible",
+      notes = "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.0.</b></p>",
+      value = "Flag a universe as Helm 3-compatible - deprecated",
       nickname = "setUniverseHelm3Compatible",
       response = YBPSuccess.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =
@@ -298,9 +316,11 @@ public class UniverseActionsController extends AuthenticatedController {
    *     failure
    */
   @ApiOperation(
+      notes = "YbaApi Internal.",
       value = "Reset universe version",
       nickname = "resetUniverseVersion",
       response = YBPSuccess.class)
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.6.0.0")
   @AuthzPath({
     @RequiredPermissionOnResource(
         requiredPermission =

@@ -14,6 +14,7 @@ import { RemoteObjSpec, SortOrder, TableHeaderColumn } from 'react-bootstrap-tab
 import { useQuery } from 'react-query';
 import { useSelector } from 'react-redux';
 import Select, { OptionTypeBase } from 'react-select';
+import clsx from 'clsx';
 import { Backup_States, IBackup, IStorageConfig, TIME_RANGE_STATE } from '..';
 import { getBackupsList } from '../common/BackupAPI';
 import { StatusBadge } from '../../common/badge/StatusBadge';
@@ -36,19 +37,22 @@ import { BackupCreateModal } from './BackupCreateModal';
 import { useSearchParam } from 'react-use';
 import { AssignBackupStorageConfig } from './AssignBackupStorageConfig';
 import { formatBytes } from '../../xcluster/ReplicationUtils';
-import clsx from 'clsx';
+
 import { AccountLevelBackupEmpty, UniverseLevelBackupEmpty } from './BackupEmpty';
 import { YBTable } from '../../common/YBTable';
 import { find } from 'lodash';
 import { fetchTablesInUniverse } from '../../../actions/xClusterReplication';
-import { TableTypeLabel } from '../../../redesign/helpers/dtos';
+import { AllowedTasks, TableTypeLabel } from '../../../redesign/helpers/dtos';
 import { ybFormatDate } from '../../../redesign/helpers/DateUtils';
 import BackupRestoreNewModal from './restore/BackupRestoreNewModal';
 import {
   RbacValidator,
+  customPermValidateFunction,
   hasNecessaryPerm
-} from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
+} from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { Action, Resource } from '../../../redesign/features/rbac';
+
 import './BackupList.scss';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -127,9 +131,14 @@ export const DEFAULT_TIME_STATE: TIME_RANGE_STATE = {
 interface BackupListOptions {
   allowTakingBackup?: boolean;
   universeUUID?: string;
+  allowedTasks: AllowedTasks;
 }
 
-export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeUUID }) => {
+export const BackupList: FC<BackupListOptions> = ({
+  allowTakingBackup,
+  universeUUID,
+  allowedTasks
+}) => {
   const [sizePerPage, setSizePerPage] = useState(10);
   const [page, setPage] = useState(1);
   const [searchText, setSearchText] = useState('');
@@ -250,24 +259,19 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
   };
 
   const canCreateBackup = hasNecessaryPerm({
-    onResource: universeUUID,
-    ...UserPermissionMap.createBackup
+    ...ApiPermissionMap.CREATE_BACKUP,
+    onResource: universeUUID ?? ''
   });
 
-  const canDeleteBackup = hasNecessaryPerm({
-    onResource: 'CUSTOMER_ID',
-    ...UserPermissionMap.deleteBackup
-  });
+  const canDeleteBackup = hasNecessaryPerm(ApiPermissionMap.DELETE_BACKUP);
 
-  const canRestoreBackup = hasNecessaryPerm({
-    onResource: universeUUID,
-    ...UserPermissionMap.restoreBackup
-  });
+  const canRestoreBackup = customPermValidateFunction(
+    (userPerm) =>
+      find(userPerm, { actions: [Action.BACKUP_RESTORE], resourceType: Resource.UNIVERSE }) !==
+      undefined
+  );
 
-  const canChangeRetentionPeriod = hasNecessaryPerm({
-    onResource: 'CUSTOMER_ID',
-    ...UserPermissionMap.changeRetentionPeriod
-  });
+  const canChangeRetentionPeriod = hasNecessaryPerm(ApiPermissionMap.EDIT_BACKUP);
 
   const getActions = (row: IBackup) => {
     if (row.commonBackupInfo.state === Backup_States.DELETED) {
@@ -296,10 +300,12 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         onClick={(e) => e.stopPropagation()}
       >
         <RbacValidator
-          accessRequiredOn={{
-            onResource: universeUUID,
-            ...UserPermissionMap.restoreBackup
-          }}
+          customValidateFunction={(userPerm) =>
+            find(userPerm, {
+              actions: [Action.BACKUP_RESTORE],
+              resourceType: Resource.UNIVERSE
+            }) !== undefined
+          }
           isControl
           overrideStyle={{ display: 'block' }}
         >
@@ -327,10 +333,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           </MenuItem>
         </RbacValidator>
         <RbacValidator
-          accessRequiredOn={{
-            onResource: 'CUSTOMER_ID',
-            ...UserPermissionMap.deleteBackup
-          }}
+          accessRequiredOn={ApiPermissionMap.DELETE_BACKUP}
           isControl
           overrideStyle={{ display: 'block' }}
         >
@@ -348,10 +351,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           </MenuItem>
         </RbacValidator>
         <RbacValidator
-          accessRequiredOn={{
-            onResource: 'CUSTOMER_ID',
-            ...UserPermissionMap.editBackup
-          }}
+          accessRequiredOn={ApiPermissionMap.EDIT_BACKUP}
           isControl
           overrideStyle={{ display: 'block' }}
         >
@@ -407,6 +407,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
             setShowBackupCreateModal(false);
           }}
           currentUniverseUUID={universeUUID}
+          allowedTasks={allowedTasks}
         />
       </>
     ) : (
@@ -512,13 +513,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
             defaultValue={TIME_RANGE_OPTIONS.find((t) => t.label === 'All time')}
             maxMenuHeight={300}
           ></Select>
-          <RbacValidator
-            accessRequiredOn={{
-              onResource: 'CUSTOMER_ID',
-              ...UserPermissionMap.deleteBackup
-            }}
-            isControl
-          >
+          <RbacValidator accessRequiredOn={ApiPermissionMap.DELETE_BACKUP} isControl>
             <YBButton
               btnText="Delete"
               btnIcon="fa fa-trash-o"
@@ -531,7 +526,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
               <RbacValidator
                 accessRequiredOn={{
                   onResource: universeUUID,
-                  ...UserPermissionMap.createBackup
+                  ...ApiPermissionMap.CREATE_BACKUP
                 }}
                 isControl
               >
@@ -719,6 +714,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
       {!isNewRestoreModalEnabled && restoreDetails && (
         <BackupRestoreModal
           backup_details={restoreDetails}
+          allowedTasks={allowedTasks}
           visible={showRestoreModal}
           isRestoreEntireBackup={isRestoreEntireBackup}
           onHide={() => {
@@ -736,6 +732,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         onHide={() => {
           setShowBackupCreateModal(false);
         }}
+        allowedTasks={allowedTasks}
         currentUniverseUUID={universeUUID}
       />
       <AssignBackupStorageConfig
@@ -746,6 +743,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         }}
       />
       <BackupCreateModal
+        allowedTasks={allowedTasks}
         visible={showEditBackupModal}
         onHide={() => setShowEditBackupModal(false)}
         currentUniverseUUID={selectedBackups[0]?.universeUUID}

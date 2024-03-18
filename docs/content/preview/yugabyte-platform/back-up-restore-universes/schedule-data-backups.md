@@ -7,11 +7,13 @@ headContent: Create backup schedules to regularly back up universe data
 aliases:
   - /preview/back-up-restore-universes/schedule-data-backups/ycql/
   - /preview/back-up-restore-universes/schedule-data-backups/ysql/
+  - /preview/yugabyte-platform/back-up-restore-universes/schedule-data-backups/ysql/
+  - /preview/yugabyte-platform/back-up-restore-universes/schedule-data-backups/ycql/
 menu:
   preview_yugabyte-platform:
     identifier: schedule-data-backups
     parent: back-up-restore-universes
-    weight: 40
+    weight: 15
 type: docs
 ---
 

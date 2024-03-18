@@ -44,6 +44,7 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/sysinfo.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/errno.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
@@ -513,7 +514,7 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
   int length_at_submit = total_queued_tasks_++;
 
   guard.Unlock();
-  not_empty_.Signal();
+  YB_PROFILE(not_empty_.Signal());
 
   if (metrics_.queue_length_stats) {
     metrics_.queue_length_stats->Increment(length_at_submit);
@@ -645,7 +646,7 @@ void ThreadPool::DispatchThread(bool permanent) {
       }
     }
     if (--active_threads_ == 0) {
-      idle_cond_.Broadcast();
+      YB_PROFILE(idle_cond_.Broadcast());
     }
   }
 
@@ -695,24 +696,29 @@ Status TaskRunner::Init(int concurrency) {
   return builder.Build(&thread_pool_);
 }
 
-Status TaskRunner::Wait() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  cond_.wait(lock, [this] { return running_tasks_ == 0; });
+Status TaskRunner::Wait(StopWaitIfFailed stop_wait_if_failed) {
+  UniqueLock lock(mutex_);
+  WaitOnConditionVariable(&cond_, &lock, [this, &stop_wait_if_failed] {
+    return (running_tasks_ == 0 || (stop_wait_if_failed && failed_.load()));
+  });
   return first_failure_;
 }
 
 void TaskRunner::CompleteTask(const Status& status) {
+  bool is_first_failure = false;
   if (!status.ok()) {
     bool expected = false;
     if (failed_.compare_exchange_strong(expected, true)) {
+      is_first_failure = true;
+      std::lock_guard lock(mutex_);
       first_failure_ = status;
     } else {
       LOG(WARNING) << status.message() << std::endl;
     }
   }
-  if (--running_tasks_ == 0) {
+  if (--running_tasks_ == 0 || is_first_failure) {
     std::lock_guard lock(mutex_);
-    cond_.notify_one();
+    YB_PROFILE(cond_.notify_one());
   }
 }
 

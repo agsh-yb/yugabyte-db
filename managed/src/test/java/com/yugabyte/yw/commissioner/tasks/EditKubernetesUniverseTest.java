@@ -9,12 +9,10 @@ import static com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesWaitForPod.C
 import static com.yugabyte.yw.common.ApiUtils.getTestUserIntent;
 import static com.yugabyte.yw.common.AssertHelper.assertJsonEqual;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
-import static com.yugabyte.yw.models.TaskInfo.State.Failure;
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -22,7 +20,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static play.inject.Bindings.bind;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -32,11 +29,10 @@ import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.RegexMatcher;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.TestUtils;
-import com.yugabyte.yw.common.operator.NoOpOperatorStatusUpdater;
-import com.yugabyte.yw.common.operator.OperatorStatusUpdaterFactory;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent.K8SNodeResourceSpec;
 import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.RuntimeConfigEntry;
@@ -56,22 +52,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InjectMocks;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.IsServerReadyResponse;
 import org.yb.client.YBClient;
-import play.inject.guice.GuiceApplicationBuilder;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
 public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
-  @InjectMocks private EditKubernetesUniverse editUniverse;
+  private EditKubernetesUniverse editUniverse;
 
   private Universe defaultUniverse;
 
@@ -80,14 +75,15 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
   private Map<String, String> config = new HashMap<>();
 
-  protected OperatorStatusUpdaterFactory mockStatusUpdaterFactory =
-      mock(OperatorStatusUpdaterFactory.class);
-
-  @Override
-  protected GuiceApplicationBuilder configureApplication(GuiceApplicationBuilder builder) {
-    when(mockStatusUpdaterFactory.create()).thenReturn(mock(NoOpOperatorStatusUpdater.class));
-    return super.configureApplication(builder)
-        .overrides(bind(OperatorStatusUpdaterFactory.class).toInstance(mockStatusUpdaterFactory));
+  @Before
+  public void setUp() {
+    super.setUp();
+    setFollowerLagMock();
+    setUnderReplicatedTabletsMock();
+    when(mockOperatorStatusUpdaterFactory.create()).thenReturn(mockOperatorStatusUpdater);
+    this.editUniverse =
+        new EditKubernetesUniverse(
+            mockBaseTaskDependencies, null, mockOperatorStatusUpdaterFactory);
   }
 
   private void setup() {
@@ -115,6 +111,7 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     }
     when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
+    RuntimeConfigEntry.upsertGlobal("yb.checks.leaderless_tablets.enabled", "false");
   }
 
   private void setupUniverseSingleAZ(boolean setMasters) {
@@ -154,6 +151,7 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
   private static final List<TaskType> KUBERNETES_ADD_POD_TASKS =
       ImmutableList.of(
+          TaskType.FreezeUniverse,
           TaskType.KubernetesCommandExecutor,
           TaskType.KubernetesCheckNumPod,
           TaskType.KubernetesCommandExecutor,
@@ -167,7 +165,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
   private List<JsonNode> getExpectedAddPodTaskResults() {
     return ImmutableList.of(
-        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
         Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_PODS.name())),
@@ -183,10 +180,12 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
   private static final List<TaskType> KUBERNETES_REMOVE_POD_TASKS =
       ImmutableList.of(
+          TaskType.FreezeUniverse,
           TaskType.UpdatePlacementInfo,
           TaskType.WaitForDataMove,
           TaskType.KubernetesCommandExecutor,
           TaskType.KubernetesCheckNumPod,
+          TaskType.KubernetesCommandExecutor,
           TaskType.ModifyBlackList,
           TaskType.KubernetesCommandExecutor,
           TaskType.UpdateUniverseIntent,
@@ -197,9 +196,9 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     return ImmutableList.of(
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
         Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_PODS.name())),
-        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
@@ -210,19 +209,26 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
 
   private static final List<TaskType> KUBERNETES_CHANGE_INSTANCE_TYPE_TASKS =
       ImmutableList.of(
+          TaskType.FreezeUniverse,
           TaskType.UpdatePlacementInfo,
+          TaskType.CheckUnderReplicatedTablets,
           TaskType.KubernetesCommandExecutor,
           TaskType.KubernetesWaitForPod,
           TaskType.WaitForServer,
           TaskType.WaitForServerReady,
+          TaskType.CheckFollowerLag,
+          TaskType.CheckUnderReplicatedTablets,
           TaskType.KubernetesCommandExecutor,
           TaskType.KubernetesWaitForPod,
           TaskType.WaitForServer,
           TaskType.WaitForServerReady,
+          TaskType.CheckFollowerLag,
+          TaskType.CheckUnderReplicatedTablets,
           TaskType.KubernetesCommandExecutor,
           TaskType.KubernetesWaitForPod,
           TaskType.WaitForServer,
           TaskType.WaitForServerReady,
+          TaskType.CheckFollowerLag,
           TaskType.KubernetesCommandExecutor,
           TaskType.UpdateUniverseIntent,
           TaskType.SwamperTargetsFileUpdate,
@@ -231,16 +237,23 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
   private List<JsonNode> getExpectedChangeInstaceTypeResults() {
     return ImmutableList.of(
         Json.toJson(ImmutableMap.of()),
-        Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
-        Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
         Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
         Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
+        Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of()),
+        Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
+        Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
+        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
@@ -255,11 +268,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
       List<JsonNode> resultList,
       String type) {
     int position = 0;
-    // Since we create two empty subGroupTasks for add (namespace create and apply secret)
-    // they need to skipped over.
-    if (type.equals("add")) {
-      position = 2;
-    }
     for (TaskType task : taskList) {
       List<TaskInfo> tasks = subTasksByPosition.get(position);
       // In the case of adding and wait for server, we need to ensure that
@@ -276,11 +284,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
           tasks.stream().map(TaskInfo::getDetails).collect(Collectors.toList());
       assertJsonEqual(expectedResults, taskDetails.get(0));
       position++;
-
-      // Similar to add, we expect two empty subGroupTasks (namespace and volume delete).
-      if (position == 3 && type.equals("remove")) {
-        position += 2;
-      }
     }
   }
 
@@ -485,22 +488,22 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     String overrideFileRegex = "(.*)" + defaultUniverse.getUniverseUUID() + "(.*).yml";
     String podsString =
         "{\"items\": [{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
-            + "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"},"
+            + "\"podIP\": \"1.2.3.0\"}, \"spec\": {\"hostname\": \"yb-master-0\"},"
             + " \"metadata\": {\"namespace\": \""
             + NODE_PREFIX
             + "\"}},"
             + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
-            + "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"},"
+            + "\"podIP\": \"1.2.2.0\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"},"
             + " \"metadata\": {\"namespace\": \""
             + NODE_PREFIX
             + "\"}},"
             + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
-            + "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-tserver-1\"},"
+            + "\"podIP\": \"1.2.2.1\"}, \"spec\": {\"hostname\": \"yb-tserver-1\"},"
             + " \"metadata\": {\"namespace\": \""
             + NODE_PREFIX
             + "\"}},"
             + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
-            + "\"podIP\": \"1.2.3.4\"}, \"spec\": {\"hostname\": \"yb-tserver-2\"},"
+            + "\"podIP\": \"1.2.2.2\"}, \"spec\": {\"hostname\": \"yb-tserver-2\"},"
             + " \"metadata\": {\"namespace\": \""
             + NODE_PREFIX
             + "\"}}]}";
@@ -555,21 +558,63 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
   }
 
   @Test
-  public void testVolumeDecreaseIsForbidden() {
+  public void testEditKubernetesUniverseRetry() {
     setupUniverseSingleAZ(/* Create Masters */ true);
+    String podsString =
+        "{\"items\": [{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}},"
+            + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}},"
+            + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-tserver-1\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}},"
+            + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-master-1\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}},"
+            + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-master-2\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}},"
+            + "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", "
+            + "\"podIP\": \"1.2.3.4\"}, \"spec\": {\"hostname\": \"yb-tserver-2\"},"
+            + " \"metadata\": {\"namespace\": \""
+            + NODE_PREFIX
+            + "\"}}]}";
+    List<Pod> pods = TestUtils.deserialize(podsString, PodList.class).getItems();
+    when(mockKubernetesManager.getPodInfos(any(), any(), any())).thenReturn(pods);
+
     UniverseDefinitionTaskParams taskParams = new UniverseDefinitionTaskParams();
     taskParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
     taskParams.expectedUniverseVersion = 3;
     taskParams.nodeDetailsSet = defaultUniverse.getUniverseDetails().nodeDetailsSet;
     UniverseDefinitionTaskParams.UserIntent newUserIntent =
         defaultUniverse.getUniverseDetails().getPrimaryCluster().userIntent.clone();
-    newUserIntent.instanceType = "c5.xlarge";
-    newUserIntent.deviceInfo.volumeSize--;
-    RuntimeConfigEntry.upsertGlobal("yb.edit.allow_volume_decrease", "true");
+    newUserIntent.tserverK8SNodeResourceSpec = new K8SNodeResourceSpec();
+    newUserIntent.masterK8SNodeResourceSpec = new K8SNodeResourceSpec();
+
     PlacementInfo pi = defaultUniverse.getUniverseDetails().getPrimaryCluster().placementInfo;
-    TaskInfo taskInfo = submitTask(taskParams, newUserIntent, pi);
-    assertEquals(Failure, taskInfo.getTaskState());
-    assertTrue(
-        taskInfo.getErrorMessage().contains("Cannot decrease disk size in a Kubernetes cluster"));
+    pi.cloudList.get(0).regionList.get(0).azList.get(0).numNodesInAZ = 3;
+    taskParams.upsertPrimaryCluster(newUserIntent, pi);
+    taskParams.nodePrefix = NODE_PREFIX;
+    taskParams.getPrimaryCluster().uuid =
+        defaultUniverse.getUniverseDetails().getPrimaryCluster().uuid;
+    super.verifyTaskRetries(
+        defaultCustomer,
+        CustomerTask.TaskType.Edit,
+        CustomerTask.TargetType.Universe,
+        defaultUniverse.getUniverseUUID(),
+        TaskType.EditKubernetesUniverse,
+        taskParams);
   }
 }

@@ -57,6 +57,8 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
   // This allows passing extra tserver options to the underlying mini cluster.
   virtual std::vector<tserver::TabletServerOptions> ExtraTServerOptions();
 
+  PGConnSettings MakeConnSettings(const std::string& dbname = std::string()) const;
+
   Result<PGConn> Connect() const {
     return ConnectToDB(std::string() /* db_name */);
   }
@@ -64,6 +66,8 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
   Result<PGConn> ConnectToDB(const std::string& dbname) const;
 
   Status RestartCluster();
+
+  Status RestartMaster();
 
   const HostPort& pg_host_port() const {
     return pg_host_port_;
@@ -76,6 +80,8 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
   void FlushAndCompactTablets();
 
   virtual Status SetupConnection(PGConn* conn) const;
+
+  void EnableFailOnConflict();
 
  private:
   Result<PgProcessConf> CreatePgProcessConf(uint16_t port);

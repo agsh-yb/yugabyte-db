@@ -1,3 +1,10 @@
+import {
+  NodeAggregation,
+  SplitMode,
+  SplitType,
+  TimeAggregation
+} from '../../components/metrics/dtos';
+import { MetricName } from '../../components/xcluster/constants';
 import { YBTableRelationType } from './constants';
 import { DeepPartial } from './types';
 
@@ -16,6 +23,7 @@ export interface HostInfo {
         project: string;
       }
     | string;
+  azu: {} | string;
 }
 
 export interface SuggestedKubernetesConfig {
@@ -137,6 +145,7 @@ export interface UserIntent {
   masterGFlags: FlagsObject | FlagsArray;
   tserverGFlags: FlagsObject | FlagsArray;
   instanceTags: FlagsObject | FlagsArray;
+  imageBundleUUID: string;
 }
 
 export const ClusterType = {
@@ -214,11 +223,13 @@ export interface UniverseDetails {
   clusterOperation?: 'CREATE' | 'EDIT' | 'DELETE';
   allowInsecure: boolean;
   backupInProgress: boolean;
+  mastersInDefaultRegion?: boolean;
   capability: 'READ_ONLY' | 'EDITS_ALLOWED';
   clusters: Cluster[];
   communicationPorts: CommunicationPorts;
   cmkArn: string;
   deviceInfo: DeviceInfo | null;
+  masterDeviceInfo: DeviceInfo | null;
   encryptionAtRestConfig: EncryptionAtRestConfig;
   extraDependencies: {
     installNodeExporter: boolean;
@@ -231,7 +242,9 @@ export interface UniverseDetails {
   nodeDetailsSet: NodeDetails[];
   nodePrefix: string;
   resetAZConfig: boolean;
-  rootCA: string | null;
+  rootCA: string;
+  clientRootCA: string;
+  rootAndClientRootCASame: boolean;
   xclusterInfo: {
     sourceRootCertDirPath: string;
     sourceXClusterConfigs: string[];
@@ -241,6 +254,15 @@ export interface UniverseDetails {
   updateInProgress: boolean;
   updateSucceeded: boolean;
   userAZSelected: boolean;
+  enableYbc: boolean;
+  updateOptions: string[];
+  useSpotInstance: boolean;
+  universePaused: boolean;
+}
+
+export interface AllowedTasks {
+  restricted: boolean;
+  taskIds: string[];
 }
 
 export type UniverseConfigure = DeepPartial<UniverseDetails>;
@@ -255,6 +277,7 @@ export interface Universe {
   universeDetails: UniverseDetails;
   universeUUID: string;
   version: number;
+  allowedTasks: AllowedTasks;
 }
 
 export const TableType = {
@@ -266,14 +289,23 @@ export const TableType = {
 export type TableType = typeof TableType[keyof typeof TableType];
 
 export interface YBTable {
+  colocated: boolean;
+  colocationParentId: string;
   isIndexTable: boolean;
   keySpace: string;
   pgSchemaName: string;
   relationType: YBTableRelationType;
   sizeBytes: number;
+  tableID: string; // UUID without `-`
   tableName: string;
   tableType: TableType;
-  tableUUID: string;
+  tableUUID: string; // UUID with `-`
+  walSizeBytes: number;
+
+  // mainTableUUID is provided for index tables when the
+  // query param `xClusterSupportedOnly` is true
+  mainTableUUID?: string;
+  indexTableIDs?: string[];
 }
 
 export interface UniverseNamespace {
@@ -397,27 +429,6 @@ export interface PitrConfig {
   uuid: string;
 }
 
-export interface HAPlatformInstance {
-  uuid: string;
-  config_uuid: string;
-  address: string;
-  is_leader: boolean;
-  is_local: boolean;
-  last_backup: string | null;
-}
-
-export interface HAConfig {
-  uuid: string;
-  cluster_key: string;
-  last_failover: number;
-  instances: HAPlatformInstance[];
-}
-
-export interface HAReplicationSchedule {
-  frequency_milliseconds: number;
-  is_running: boolean;
-}
-
 export const TableTypeLabel: Record<TableType, string> = {
   YQL_TABLE_TYPE: 'YCQL',
   PGSQL_TABLE_TYPE: 'YSQL',
@@ -442,20 +453,92 @@ export interface GraphFilter {
   currentSelectedNodeType: string | null;
 }
 
+/**
+ * Source: managed/src/main/java/com/yugabyte/yw/metrics/MetricSettings.java
+ */
 export interface MetricSettings {
   metric: string;
-  splitTopNodes: number;
+
+  nodeAggregation?: NodeAggregation;
+  timeAggregation?: TimeAggregation;
+  splitMode?: SplitMode;
+  splitType?: SplitType;
+  // splitCount is ignored when constructing the metric query if splitMode is
+  // SplitMode.NONE.
+  splitCount?: number;
+  returnAggregatedValue?: boolean;
 }
 
-export interface MetricQueryParams {
-  metricsWithSettings: MetricSettings[];
+/**
+ * Source: managed/src/main/java/com/yugabyte/yw/forms/MetricQueryParams.java
+ */
+export interface MetricsQueryParams {
   start: string;
-  end: string;
-  nodePrefix: string;
-  nodeNames: string[];
+
+  availabilityZones?: string[];
+  clusterUuids?: string[];
+  end?: string;
+  isRecharts?: boolean;
+  // `metrics` gets added to `metricsSettingsMap` on the backend
+  // with default settings.
+  // See MetricsQueryHelper.java for details.
+  metrics?: MetricName[];
+  metricsWithSettings?: MetricSettings[];
+  namespaceId?: string;
+  nodeNames?: string[];
+  nodePrefix?: string;
+  regionCode?: string[];
+  serverType?: string;
+  streamId?: string;
+  tableId?: string;
+  tableName?: string;
+  xClusterConfigUuid?: string;
 }
 
-// TODO: Need to move the above enums to global dtos file under src/redesign/utils as part of PLAT-7010
+// ---------------------------------------------------------------------------
+// Metric Respose Types
+// Source:
+// - Response JSON from MetricsQueryExecutor.java
+export interface MetricTrace {
+  name: string;
+  type: string;
+  x: number[];
+  y: string[] | number[];
+
+  instanceName?: string;
+  tableId?: string;
+  tableName?: string;
+  namespaceId?: string;
+  namespaceName?: string;
+  mode?: string;
+  line?: {
+    dash: string;
+    width: number;
+  };
+}
+
+export interface Metric {
+  data: MetricTrace[];
+  directURLs: string[];
+  layout: {
+    title: string;
+    xaxis: {
+      alias: { [x: string]: string };
+      type: string;
+    };
+    yaxis: {
+      alias: { [x: string]: string };
+      ticksuffix: string;
+    };
+  };
+  metricsLinkUseBrowserFqdn: boolean;
+  queryKey: string;
+}
+
+export type MetricsQueryResponse = {
+  [metricName in MetricName]?: Metric;
+};
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Platform Result Types

@@ -52,9 +52,15 @@ type: indexpage
     </a>
   </li>
 
+   <li>
+    <a href="rust/rust-postgres-reference/" class="orange">
+      <i class="icon-rust"></i>
+      Rust
+    </a>
+  </li>
 </ul>
 
-### Other languages
+### Additional drivers
 
 <div class="row">
 
@@ -62,7 +68,7 @@ type: indexpage
     <a class="section-link icon-offset" href="ysql-client-drivers/">
       <div class="head">
         <img class="icon" src="/images/section_icons/api/ysql.png" aria-hidden="true" />
-        <div class="title">Client drivers for YSQL API</div>
+        <div class="title">Additional drivers for YSQL API</div>
       </div>
       <div class="body">
         Find a supported client driver to connect to and interact with YugabyteDB using the YSQL API.

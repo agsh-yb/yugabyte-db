@@ -6,20 +6,24 @@ import { toast } from 'react-toastify';
 import { useMutation, useQuery, useQueryClient } from 'react-query';
 
 import { YBInput, YBModal, YBModalProps, YBTooltip } from '../../../../redesign/components';
+import { YBErrorIndicator, YBLoading } from '../../../common/indicators';
+import { YBBanner, YBBannerVariant } from '../../../common/descriptors';
 import { api, drConfigQueryKey, universeQueryKey } from '../../../../redesign/helpers/api';
 import { fetchTaskUntilItCompletes } from '../../../../actions/xClusterReplication';
+import { isActionFrozen } from '../../../../redesign/helpers/utils';
 import { handleServerError } from '../../../../utils/errorHandlingUtils';
-import { YBErrorIndicator, YBLoading } from '../../../common/indicators';
-import { ReactComponent as InfoIcon } from '../../../../redesign/assets/info-message.svg';
-import { YBBanner, YBBannerVariant } from '../../../common/descriptors';
-
+import { AllowedTasks } from '../../../../redesign/helpers/dtos';
 import { DrConfig } from '../dtos';
+import { UNIVERSE_TASKS } from '../../../../redesign/helpers/constants';
 
 import toastStyles from '../../../../redesign/styles/toastStyles.module.scss';
+
+import InfoIcon from '../../../../redesign/assets/info-message.svg';
 
 interface InitiateSwitchoverModalProps {
   drConfig: DrConfig;
   modalProps: YBModalProps;
+  allowedTasks: AllowedTasks;
 }
 
 const useStyles = makeStyles((theme) => ({
@@ -48,22 +52,30 @@ const useStyles = makeStyles((theme) => ({
   infoBanner: {
     marginTop: 'auto'
   },
+  confirmTextInputBox: {
+    width: '400px'
+  },
   dialogContentRoot: {
     display: 'flex',
     flexDirection: 'column'
   }
 }));
 
+const MODAL_NAME = 'InitiateSwitchoverModal';
 const TRANSLATION_KEY_PREFIX = 'clusterDetail.disasterRecovery.switchover.initiateModal';
 
-export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitchoverModalProps) => {
+export const InitiateSwitchoverModal = ({
+  drConfig,
+  modalProps,
+  allowedTasks
+}: InitiateSwitchoverModalProps) => {
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [confirmationText, setConfirmationText] = useState<string>('');
   const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
   const classes = useStyles();
   const queryClient = useQueryClient();
 
-  const targetUniverseUuid = drConfig.xClusterConfig.targetUniverseUUID;
+  const targetUniverseUuid = drConfig.drReplicaUniverseUuid;
   const targetUniverseQuery = useQuery(
     universeQueryKey.detail(targetUniverseUuid),
     () => api.fetchUniverse(targetUniverseUuid),
@@ -71,7 +83,11 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
   );
 
   const initiateSwitchoverMutation = useMutation(
-    (drConfig: DrConfig) => api.initiateSwitchover(drConfig.uuid),
+    (drConfig: DrConfig) =>
+      api.initiateSwitchover(drConfig.uuid, {
+        primaryUniverseUuid: drConfig.drReplicaUniverseUuid ?? '',
+        drReplicaUniverseUuid: drConfig.primaryUniverseUuid ?? ''
+      }),
     {
       onSuccess: (response, drConfig) => {
         const invalidateQueries = () => {
@@ -80,14 +96,12 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
 
           // The `drConfigUuidsAsSource` and `drConfigUuidsAsTarget` fields will need to be updated as
           // we switched roles for both universes.
-          queryClient.invalidateQueries(
-            universeQueryKey.detail(drConfig.xClusterConfig.sourceUniverseUUID),
-            { exact: true }
-          );
-          queryClient.invalidateQueries(
-            universeQueryKey.detail(drConfig.xClusterConfig.targetUniverseUUID),
-            { exact: true }
-          );
+          queryClient.invalidateQueries(universeQueryKey.detail(drConfig.primaryUniverseUuid), {
+            exact: true
+          });
+          queryClient.invalidateQueries(universeQueryKey.detail(drConfig.drReplicaUniverseUuid), {
+            exact: true
+          });
         };
         const handleTaskCompletion = (error: boolean) => {
           if (error) {
@@ -109,9 +123,7 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
                   <Trans
                     i18nKey={`${TRANSLATION_KEY_PREFIX}.success.taskSuccess`}
                     components={{
-                      universeLink: (
-                        <a href={`/universes/${drConfig.xClusterConfig.targetUniverseUUID}`} />
-                      ),
+                      universeLink: <a href={`/universes/${drConfig.drReplicaUniverseUuid}`} />,
                       bold: <b />
                     }}
                     values={{ sourceUniverseName: targetUniverseQuery.data?.name }}
@@ -131,42 +143,6 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
     }
   );
 
-  if (!drConfig.xClusterConfig.sourceUniverseUUID || !drConfig.xClusterConfig.targetUniverseUUID) {
-    const i18nKey = drConfig.xClusterConfig.sourceUniverseUUID
-      ? 'undefinedTargetUniverseUuid'
-      : 'undefinedSourceUniverseUuid';
-    return (
-      <YBErrorIndicator
-        customErrorMessage={t(i18nKey, {
-          keyPrefix: 'clusterDetail.xCluster.error'
-        })}
-      />
-    );
-  }
-  if (targetUniverseQuery.isError) {
-    return (
-      <YBErrorIndicator
-        customErrorMessage={t('faliedToFetchTargetuniverse', {
-          keyPrefix: 'clusterDetail.xCluster.error'
-        })}
-      />
-    );
-  }
-  if (targetUniverseQuery.isLoading || targetUniverseQuery.isIdle) {
-    return <YBLoading />;
-  }
-
-  const resetModal = () => {
-    setIsSubmitting(false);
-    setConfirmationText('');
-  };
-  const onSubmit = () => {
-    setIsSubmitting(true);
-    initiateSwitchoverMutation.mutate(drConfig, { onSettled: () => resetModal() });
-  };
-
-  const targetUniverseName = targetUniverseQuery.data.name;
-  const isFormDisabled = isSubmitting || confirmationText !== targetUniverseName;
   const modalTitle = (
     <Typography variant="h4" component="span" className={classes.modalTitle}>
       {t('title')}
@@ -180,10 +156,63 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
           </Typography>
         }
       >
-        <InfoIcon className={classes.infoIcon} />
+        <img src={InfoIcon} alt={t('infoIcon', { keyPrefix: 'imgAltText' })} />
       </YBTooltip>
     </Typography>
   );
+  const cancelLabel = t('cancel', { keyPrefix: 'common' });
+  if (
+    !drConfig.primaryUniverseUuid ||
+    !drConfig.drReplicaUniverseUuid ||
+    targetUniverseQuery.isError
+  ) {
+    const customErrorMessage = !drConfig.primaryUniverseUuid
+      ? t('undefinedDrPrimaryUniveresUuid', {
+          keyPrefix: 'clusterDetail.disasterRecovery.error'
+        })
+      : !drConfig.drReplicaUniverseUuid
+      ? t('undefinedDrReplicaUniveresUuid', {
+          keyPrefix: 'clusterDetail.disasterRecovery.error'
+        })
+      : targetUniverseQuery.isError
+      ? t('failedToFetchDrReplicaUniverse', {
+          keyPrefix: 'queryError',
+          universeUuid: drConfig.drReplicaUniverseUuid
+        })
+      : '';
+
+    return (
+      <YBModal
+        customTitle={modalTitle}
+        cancelLabel={cancelLabel}
+        submitTestId={`${MODAL_NAME}-SubmitButton`}
+        cancelTestId={`${MODAL_NAME}-CancelButton`}
+        size="md"
+        {...modalProps}
+      >
+        <YBErrorIndicator customErrorMessage={customErrorMessage} />
+      </YBModal>
+    );
+  }
+
+  if (targetUniverseQuery.isLoading || targetUniverseQuery.isIdle) {
+    return <YBLoading />;
+  }
+
+  const resetModal = () => {
+    setIsSubmitting(false);
+    setConfirmationText('');
+  };
+  const onSubmit = () => {
+    setIsSubmitting(true);
+    initiateSwitchoverMutation.mutate(drConfig, { onSettled: () => resetModal() });
+  };
+
+  const isSwitchoverActionFrozen = isActionFrozen(allowedTasks, UNIVERSE_TASKS.SWITCHIVER_DR);
+  const targetUniverseName = targetUniverseQuery.data.name;
+  const isFormDisabled =
+    isSubmitting || confirmationText !== targetUniverseName || isSwitchoverActionFrozen;
+
   return (
     <YBModal
       customTitle={modalTitle}
@@ -206,12 +235,23 @@ export const InitiateSwitchoverModal = ({ drConfig, modalProps }: InitiateSwitch
           <Trans i18nKey={`${TRANSLATION_KEY_PREFIX}.noDataLoss`} components={{ bold: <b /> }} />
         </Typography>
       </div>
-      <Box marginTop={4}>
+      <Box marginTop={2}>
+        <Typography variant="body2">
+          <Trans
+            i18nKey={`${TRANSLATION_KEY_PREFIX}.switchoverConfirmation`}
+            values={{ drReplicaName: targetUniverseName }}
+            components={{
+              bold: <b />
+            }}
+          />
+        </Typography>
+      </Box>
+      <Box marginTop={3}>
         <Typography variant="body2" className={classes.fieldLabel}>
           {t('confirmationInstructions')}
         </Typography>
         <YBInput
-          fullWidth
+          className={classes.confirmTextInputBox}
           placeholder={targetUniverseName}
           value={confirmationText}
           onChange={(event) => setConfirmationText(event.target.value)}

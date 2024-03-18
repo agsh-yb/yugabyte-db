@@ -31,17 +31,21 @@
 //
 #pragma once
 
+#include <atomic>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
-#include <atomic>
 
 #include "yb/common/common_util.h"
 #include "yb/common/pg_catversions.h"
 #include "yb/consensus/metadata.pb.h"
-#include "yb/cdc/cdc_fwd.h"
+#include "yb/cdc/xrepl_types.h"
 #include "yb/cdc/cdc_consumer.fwd.h"
 #include "yb/client/client_fwd.h"
 #include "yb/rpc/rpc_fwd.h"
@@ -54,6 +58,7 @@
 #include "yb/server/webserver_options.h"
 #include "yb/tserver/db_server_base.h"
 #include "yb/tserver/pg_mutation_counter.h"
+#include "yb/tserver/remote_bootstrap_service.h"
 #include "yb/tserver/tserver_shared_mem.h"
 #include "yb/tserver/tablet_server_interface.h"
 #include "yb/tserver/tablet_server_options.h"
@@ -73,12 +78,24 @@ namespace yb {
 
 class Env;
 class MaintenanceManager;
-class AutoFlagsManager;
+
+namespace cdc {
+
+class CDCServiceImpl;
+
+}
+
+namespace cdc {
+
+class CDCServiceImpl;
+
+}
 
 namespace tserver {
 
-class XClusterConsumer;
+class TserverAutoFlagsManager;
 class PgClientServiceImpl;
+class XClusterConsumerIf;
 
 class TabletServer : public DbServerBase, public TabletServerIf {
  public:
@@ -114,7 +131,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   std::string ToString() const override;
 
   uint32_t GetAutoFlagConfigVersion() const override;
-  Status SetAutoFlagConfig(const AutoFlagsConfigPB new_config);
+  void HandleMasterHeartbeatResponse(
+      HybridTime heartbeat_sent_time, std::optional<AutoFlagsConfigPB> new_config);
+
+  Result<uint32> ValidateAndGetAutoFlagsConfigVersion() const;
 
   AutoFlagsConfigPB TEST_GetAutoFlagConfig() const;
 
@@ -223,11 +243,20 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     }
   }
 
+  std::optional<bool> catalog_version_table_in_perdb_mode() const {
+    std::lock_guard l(lock_);
+    return catalog_version_table_in_perdb_mode_;
+  }
+
   Status get_ysql_db_oid_to_cat_version_info_map(
       const tserver::GetTserverCatalogVersionInfoRequestPB& req,
       tserver::GetTserverCatalogVersionInfoResponsePB* resp) const override;
 
   void UpdateTransactionTablesVersion(uint64_t new_version);
+
+  rpc::Messenger* GetMessenger(ash::Component component) const override;
+
+  void SetCQLServer(yb::server::RpcAndWebServerBase* server) override;
 
   virtual Env* GetEnv();
 
@@ -277,12 +306,13 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   encryption::UniverseKeyManager* GetUniverseKeyManager();
 
-  Status SetConfigVersionAndConsumerRegistry(
-      int32_t cluster_config_version, const cdc::ConsumerRegistryPB* consumer_registry);
+  Status XClusterHandleMasterHeartbeatResponse(const master::TSHeartbeatResponsePB& resp);
 
   Status ValidateAndMaybeSetUniverseUuid(const UniverseUuid& universe_uuid);
 
-  XClusterConsumer* GetXClusterConsumer() const;
+  Status ClearUniverseUuid();
+
+  XClusterConsumerIf* GetXClusterConsumer() const;
 
   // Mark the CDC service as enabled via heartbeat.
   Status SetCDCServiceEnabled();
@@ -294,16 +324,27 @@ class TabletServer : public DbServerBase, public TabletServerIf {
     return pg_client_service_.lock().get();
   }
 
+  RemoteBootstrapServiceImpl* GetRemoteBootstrapService() {
+    if (auto service_ptr = remote_bootstrap_service_.lock()) {
+      return service_ptr.get();
+    }
+    return nullptr;
+  }
+
   void SetXClusterDDLOnlyMode(bool is_xcluster_read_only_mode);
 
   std::optional<uint64_t> GetCatalogVersionsFingerprint() const {
     return catalog_versions_fingerprint_.load(std::memory_order_acquire);
   }
 
-  std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const { return cdc_service_; }
+  std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const override { return cdc_service_; }
 
   key_t GetYsqlConnMgrStatsShmemKey() { return ysql_conn_mgr_stats_shmem_key_; }
   void SetYsqlConnMgrStatsShmemKey(key_t shmem_key) { ysql_conn_mgr_stats_shmem_key_ = shmem_key; }
+
+  void WriteServerMetaCacheAsJson(JsonWriter* writer) override;
+
+  void ClearAllMetaCachesOnServer() override;
 
  protected:
   virtual Status RegisterServices();
@@ -315,7 +356,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   Status ValidateMasterAddressResolution() const;
 
   MonoDelta default_client_timeout() override;
-  void SetupAsyncClientInit(client::AsyncClientInitialiser* async_client_init) override;
+  void SetupAsyncClientInit(client::AsyncClientInitializer* async_client_init) override;
 
   Status SetupMessengerBuilder(rpc::MessengerBuilder* builder) override;
 
@@ -329,7 +370,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // The options passed at construction time, and will be updated if master config changes.
   TabletServerOptions opts_;
 
-  std::unique_ptr<AutoFlagsManager> auto_flags_manager_;
+  std::unique_ptr<TserverAutoFlagsManager> auto_flags_manager_;
 
   // Manager for tablets which are available on this server.
   std::unique_ptr<TSTabletManager> tablet_manager_;
@@ -373,6 +414,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   uint64_t ysql_catalog_version_ = 0;
   uint64_t ysql_last_breaking_catalog_version_ = 0;
   tserver::DbOidToCatalogVersionInfoMap ysql_db_catalog_version_map_;
+  // See same variable comments in CatalogManager.
+  std::optional<bool> catalog_version_table_in_perdb_mode_{std::nullopt};
 
   // Fingerprint of the catalog versions map.
   std::atomic<std::optional<uint64_t>> catalog_versions_fingerprint_;
@@ -390,6 +433,10 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // is shut down.
   std::weak_ptr<TabletServiceImpl> tablet_server_service_;
 
+  // An instance to remote bootstrap service. This pointer is no longer valid after
+  // RpcAndWebServerBase is shut down.
+  std::weak_ptr<RemoteBootstrapServiceImpl> remote_bootstrap_service_;
+
   // An instance to pg client service. This pointer is no longer valid after RpcAndWebServerBase
   // is shut down.
   std::weak_ptr<PgClientServiceImpl> pg_client_service_;
@@ -402,10 +449,6 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   void AutoInitServiceFlags();
 
   void InvalidatePgTableCache();
-
-  Result<std::unordered_set<uint32_t>> GetPgDatabaseOids();
-
-  void ScheduleCheckObjectIdAllocators();
 
   std::string log_prefix_;
 
@@ -420,20 +463,22 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   PgConfigReloader pg_config_reloader_;
 
-  Status CreateXClusterConsumer() REQUIRES(xcluster_consumer_mutex_);
+  Status CreateXClusterConsumer() EXCLUDES(xcluster_consumer_mutex_);
 
   std::unique_ptr<rpc::SecureContext> secure_context_;
   std::vector<CertificateReloader> certificate_reloaders_;
 
   // xCluster consumer.
   mutable std::mutex xcluster_consumer_mutex_;
-  std::unique_ptr<XClusterConsumer> xcluster_consumer_ GUARDED_BY(xcluster_consumer_mutex_);
+  std::unique_ptr<XClusterConsumerIf> xcluster_consumer_ GUARDED_BY(xcluster_consumer_mutex_);
 
   // CDC service.
   std::shared_ptr<cdc::CDCServiceImpl> cdc_service_;
 
   std::unique_ptr<rocksdb::Env> rocksdb_env_;
   std::unique_ptr<encryption::UniverseKeyManager> universe_key_manager_;
+
+  std::atomic<yb::server::RpcAndWebServerBase*> cql_server_{nullptr};
 
   DISALLOW_COPY_AND_ASSIGN(TabletServer);
 };

@@ -114,6 +114,7 @@
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
 #include "executor/nodeYbBatchedNestloop.h"
+#include "executor/nodeYbBitmapTablescan.h"
 #include "executor/nodeYbSeqscan.h"
 #include "nodes/nodeFuncs.h"
 #include "miscadmin.h"
@@ -239,6 +240,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_BitmapHeapScan:
 			result = (PlanState *) ExecInitBitmapHeapScan((BitmapHeapScan *) node,
 														  estate, eflags);
+			break;
+
+		case T_YbBitmapTableScan:
+			result = (PlanState *) ExecInitYbBitmapTableScan((YbBitmapTableScan *) node,
+															 estate, eflags);
 			break;
 
 		case T_TidScan:
@@ -459,16 +465,6 @@ ExecProcNodeFirst(PlanState *node)
 	return node->ExecProcNode(node);
 }
 
-
-/*
- * Update Yugabyte specific run-time statistics.
- */
-static void
-YbUpdateInstrument(PlanState *node)
-{
-	YbUpdateSessionStats(&node->instrument->yb_instr);
-}
-
 /*
  * ExecProcNode wrapper that performs instrumentation calls.  By keeping
  * this a separate function, we avoid overhead in the normal case where
@@ -484,7 +480,7 @@ ExecProcNodeInstr(PlanState *node)
 	result = node->ExecProcNodeReal(node);
 
 	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
-	YbUpdateInstrument(node);
+	YbUpdateSessionStats(&node->instrument->yb_instr);
 
 	return result;
 }
@@ -542,6 +538,13 @@ MultiExecProcNode(PlanState *node)
 			result = NULL;
 			break;
 	}
+
+	/*
+	 * Specifically this is required after the MultiExecBitmapIndexScan, but it
+	 * doesn't hurt to call it here after any of the above.
+	 */
+	if (IsYugaByteEnabled() && node->instrument)
+		YbUpdateSessionStats(&node->instrument->yb_instr);
 
 	return result;
 }
@@ -654,6 +657,10 @@ ExecEndNode(PlanState *node)
 
 		case T_BitmapHeapScanState:
 			ExecEndBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_YbBitmapTableScanState:
+			ExecEndYbBitmapTableScan((YbBitmapTableScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -935,6 +942,18 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 		gstate->tuples_needed = tuples_needed;
 
 		ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+	}
+	else if (IsA(child_node, YbBatchedNestLoopState))
+	{
+		YbBatchedNestLoopState *bnl_state =
+			(YbBatchedNestLoopState *) child_node;
+		if (bnl_state->bnl_is_sorted)
+		{
+			if (tuples_needed < 0)
+				bnl_state->bound = 0;
+			else
+				bnl_state->bound = tuples_needed;
+		}
 	}
 
 	/*

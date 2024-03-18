@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -55,6 +56,7 @@
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/substitute.h"
 
+#include "yb/integration-tests/external_yb_controller.h"
 #include "yb/integration-tests/mini_cluster_base.h"
 
 #include "yb/server/server_fwd.h"
@@ -64,11 +66,13 @@
 #include "yb/tserver/tserver_types.pb.h"
 
 #include "yb/util/curl_util.h"
+#include "yb/util/env.h"
 #include "yb/util/jsonreader.h"
 #include "yb/util/metrics.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/path_util.h"
 #include "yb/util/status.h"
 #include "yb/util/tsan_util.h"
 
@@ -81,6 +85,7 @@ class ExternalDaemon;
 class ExternalMaster;
 class ExternalTabletServer;
 class HostPort;
+class HybridTime;
 class OpIdPB;
 class NodeInstancePB;
 class Subprocess;
@@ -274,7 +279,7 @@ class ExternalMiniCluster : public MiniClusterBase {
   // Return a non-leader master index
   Result<size_t> GetFirstNonLeaderMasterIndex();
 
-  Result<size_t> GetTabletLeaderIndex(const yb::TableId& tablet_id);
+  Result<size_t> GetTabletLeaderIndex(const yb::TabletId& tablet_id, bool require_lease = false);
 
   // The comma separated string of the master adresses host/ports from current list of masters.
   std::string GetMasterAddresses() const;
@@ -365,6 +370,9 @@ class ExternalMiniCluster : public MiniClusterBase {
 
   // Return all tablet servers.
   std::vector<ExternalTabletServer*> tserver_daemons() const;
+
+  // Return all YBController servers.
+  std::vector<ExternalYbController*> yb_controller_daemons() const;
 
   // Get tablet server host.
   HostPort pgsql_hostport(int node_index) const;
@@ -472,6 +480,14 @@ class ExternalMiniCluster : public MiniClusterBase {
   // Sets the given flag on all tablet servers.
   Status SetFlagOnTServers(const std::string& flag, const std::string& value);
 
+  // Adds the given flag to the extra flags on all tablet servers. A restart is required
+  // to get any effect of that change.
+  void AddExtraFlagOnTServers(const std::string& flag, const std::string& value);
+
+  // Removes the given flag from the extra flags on all tablet servers. A restart is required
+  // to get any effect of that change.
+  void RemoveExtraFlagOnTServers(const std::string& flag);
+
   // Allocates a free port and stores a file lock guarding access to that port into an internal
   // array of file locks.
   uint16_t AllocateFreePort();
@@ -518,6 +534,11 @@ class ExternalMiniCluster : public MiniClusterBase {
   // Return a pointer to the flags used for tserver.  Modifying these flags will only
   // take effect on new tserver creation.
   std::vector<std::string>* mutable_extra_tserver_flags() { return &opts_.extra_tserver_flags; }
+
+  // Wait for LB to become idle.
+  // LB related tests should call this function before performing test logic to stabilize tests.
+  Status WaitForLoadBalancerToBecomeIdle(
+      const std::unique_ptr<yb::client::YBClient>& client, MonoDelta timeout);
 
  protected:
   FRIEND_TEST(MasterFailoverTest, TestKillAnyMaster);
@@ -579,6 +600,8 @@ class ExternalMiniCluster : public MiniClusterBase {
 
   std::vector<scoped_refptr<ExternalMaster> > masters_;
   std::vector<scoped_refptr<ExternalTabletServer> > tablet_servers_;
+
+  std::vector<scoped_refptr<ExternalYbController>> yb_controller_servers_;
 
   rpc::Messenger* messenger_ = nullptr;
   std::unique_ptr<rpc::Messenger> messenger_holder_;
@@ -763,6 +786,13 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
 
   // Get the current value of the flag for the given daemon.
   Result<std::string> GetFlag(const std::string& flag);
+  Result<HybridTime> GetServerTime();
+
+  // Add a flag to the extra flags. A restart is required to get any effect of that change.
+  void AddExtraFlag(const std::string& flag, const std::string& value);
+
+  // Remove a flag from the extra flags. A restart is required to get any effect of that change.
+  size_t RemoveExtraFlag(const std::string& flag);
 
  protected:
   friend class RefCountedThreadSafe<ExternalDaemon>;
@@ -815,7 +845,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   DISALLOW_COPY_AND_ASSIGN(ExternalDaemon);
 };
 
-// Utility class for waiting for logging events.
+// Utility class for waiting for logging events. There can only be one LogWaiter at a time.
 class LogWaiter : public ExternalDaemon::StringListener {
  public:
   LogWaiter(ExternalDaemon* daemon, const std::string& string_to_wait);
@@ -913,6 +943,10 @@ class ExternalTabletServer : public ExternalDaemon {
   const std::string& bind_host() const {
     return bind_host_;
   }
+
+  // Postmaster helper functions
+  Result<pid_t> PostmasterPid();
+  Result<int> SignalPostmaster(int signal);
 
   // Assigned ports.
   uint16_t rpc_port() const {

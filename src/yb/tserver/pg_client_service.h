@@ -24,6 +24,8 @@
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/server/server_base_options.h"
+
 #include "yb/tserver/tserver_fwd.h"
 #include "yb/tserver/pg_client.service.h"
 #include "yb/tserver/xcluster_context.h"
@@ -38,9 +40,12 @@ class PgMutationCounter;
 
 // Forwards call to corresponding PgClientSession sync method (see PG_CLIENT_SESSION_METHODS).
 #define YB_PG_CLIENT_METHODS \
+    (ActiveSessionHistory) \
     (AlterDatabase) \
     (AlterTable) \
     (BackfillIndex) \
+    (CancelTransaction) \
+    (CheckIfPitrActive) \
     (CreateDatabase) \
     (CreateReplicationSlot) \
     (CreateSequencesDataTable) \
@@ -52,14 +57,19 @@ class PgMutationCounter;
     (DropReplicationSlot) \
     (DropTable) \
     (DropTablegroup) \
+    (FetchData) \
     (FetchSequenceTuple) \
     (FinishTransaction) \
+    (GetActiveTransactionList) \
     (GetCatalogMasterVersion) \
     (GetDatabaseInfo) \
     (GetIndexBackfillProgress) \
     (GetLockStatus) \
+    (GetReplicationSlot) \
+    (GetReplicationSlotStatus) \
     (GetTableDiskSize) \
     (GetTablePartitionList) \
+    (GetTserverCatalogVersionInfo) \
     (Heartbeat) \
     (InsertSequenceTuple) \
     (IsInitDbDone) \
@@ -76,11 +86,7 @@ class PgMutationCounter;
     (TruncateTable) \
     (UpdateSequenceTuple) \
     (ValidatePlacement) \
-    (CheckIfPitrActive) \
-    (GetTserverCatalogVersionInfo) \
     (WaitForBackendsCatalogVersion) \
-    (CancelTransaction) \
-    (GetActiveTransactionList) \
     /**/
 
 // Forwards call to corresponding PgClientSession async method (see
@@ -98,7 +104,9 @@ class PgClientServiceImpl : public PgClientServiceIf {
       TransactionPoolProvider transaction_pool_provider,
       const std::shared_ptr<MemTracker>& parent_mem_tracker,
       const scoped_refptr<MetricEntity>& entity,
-      rpc::Scheduler* scheduler,
+      rpc::Messenger* messenger,
+      const std::string& permanent_uuid,
+      const server::ServerBaseOptions* tablet_server_opts,
       const std::optional<XClusterContext>& xcluster_context = std::nullopt,
       PgMutationCounter* pg_node_level_mutation_counter = nullptr);
 
@@ -108,7 +116,6 @@ class PgClientServiceImpl : public PgClientServiceIf {
       const PgPerformRequestPB* req, PgPerformResponsePB* resp, rpc::RpcContext context) override;
 
   void InvalidateTableCache();
-  void CheckObjectIdAllocators(const std::unordered_set<uint32_t>& db_oids);
 
   size_t TEST_SessionsCount();
 

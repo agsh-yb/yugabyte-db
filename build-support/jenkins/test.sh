@@ -76,6 +76,7 @@ echo "Build script ${BASH_SOURCE[0]} is running"
 # -------------------------------------------------------------------------------------------------
 # Functions
 
+# shellcheck disable=SC2317
 cleanup() {
   if [[ -n ${BUILD_ROOT:-} && ${DONT_DELETE_BUILD_ROOT} == "0" ]]; then
     log "Running the script to clean up build artifacts..."
@@ -206,8 +207,23 @@ export NO_REBUILD_THIRDPARTY=1
 THIRDPARTY_BIN=$YB_SRC_ROOT/thirdparty/installed/bin
 export PPROF_PATH=$THIRDPARTY_BIN/pprof
 
-# Configure the build
-#
+# Check for available YBC
+ybc_tar=""
+if [[ -d /opt/yb-build/ybc ]]; then
+  ybc_tar=$(find /opt/yb-build/ybc/ -type f | sort -V | tail -1)
+fi
+ybc_dest="$YB_SRC_ROOT/build/ybc"
+if [[ -n ${ybc_tar} ]]; then
+  log "Unpacking ${ybc_tar} binaries to ${ybc_dest}/"
+  log "  and setting YB_TEST_YB_CONTROLLER=1"
+  mkdir -p "${ybc_dest}"
+  tar xf "$ybc_tar"
+  cp ./ybc-*/bin/* "${ybc_dest}/"
+  ( set -x; ls -l "${ybc_dest}/")
+  export YB_TEST_YB_CONTROLLER=1
+else
+  log "Did not find YBC tarfile. Not setting YB_TEST_YB_CONTROLLER."
+fi
 
 cd "$BUILD_ROOT"
 
@@ -244,6 +260,10 @@ if [[ ${YB_BUILD_CPP} == "1" ]] && ! which ctest >/dev/null; then
 fi
 
 export YB_SKIP_INITIAL_SYS_CATALOG_SNAPSHOT=1
+
+if [[ ${YB_ENABLE_YSQL_CONN_MGR:-} == "1" ]]; then
+  export YB_ENABLE_YSQL_CONN_MGR_IN_TESTS=true
+fi
 
 # -------------------------------------------------------------------------------------------------
 # Running initdb

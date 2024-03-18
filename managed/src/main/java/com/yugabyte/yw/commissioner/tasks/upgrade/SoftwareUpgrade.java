@@ -9,16 +9,16 @@ import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.XClusterUniverseService;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.forms.SoftwareUpgradeParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import javax.inject.Inject;
-import org.apache.commons.lang3.tuple.Pair;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * This task will be deprecated for upgrading universe having version greater or equal to 2.20.x,
@@ -26,6 +26,7 @@ import org.apache.commons.lang3.tuple.Pair;
  */
 @Retryable
 @Abortable
+@Slf4j
 public class SoftwareUpgrade extends SoftwareUpgradeTaskBase {
 
   private final XClusterUniverseService xClusterUniverseService;
@@ -53,13 +54,24 @@ public class SoftwareUpgrade extends SoftwareUpgradeTaskBase {
   }
 
   @Override
+  protected MastersAndTservers calculateNodesToBeRestarted() {
+    String newVersion = taskParams().ybSoftwareVersion;
+    MastersAndTservers allNodes = fetchNodes(taskParams().upgradeOption);
+    return filterOutAlreadyProcessedNodes(getUniverse(), allNodes, newVersion);
+  }
+
+  @Override
   public void run() {
     runUpgrade(
         () -> {
-          Pair<List<NodeDetails>, List<NodeDetails>> nodes = fetchNodes(taskParams().upgradeOption);
-          Set<NodeDetails> allNodes = toOrderedSet(nodes);
+          MastersAndTservers nodesToApply = getNodesToBeRestarted();
+          Set<NodeDetails> allNodes = toOrderedSet(fetchNodes(taskParams().upgradeOption).asPair());
           Universe universe = getUniverse();
           String newVersion = taskParams().ybSoftwareVersion;
+
+          createUpdateUniverseSoftwareUpgradeStateTask(
+              UniverseDefinitionTaskParams.SoftwareUpgradeState.Upgrading);
+
           if (!universe
               .getUniverseDetails()
               .xClusterInfo
@@ -73,11 +85,13 @@ public class SoftwareUpgrade extends SoftwareUpgradeTaskBase {
                   && !isUniverseOnPremManualProvisioned
                   && universe.getUniverseDetails().getPrimaryCluster().userIntent.useSystemd;
 
-          // Download software to all nodes.
-          createDownloadTasks(allNodes, newVersion);
+          // Download software to nodes which does not have either master or tserver with new
+          // version.
+          createDownloadTasks(toOrderedSet(nodesToApply.asPair()), newVersion);
+
           // Install software on nodes.
           createUpgradeTaskFlowTasks(
-              nodes,
+              nodesToApply,
               newVersion,
               getUpgradeContext(taskParams().ybSoftwareVersion),
               reProvisionRequired);
@@ -110,6 +124,9 @@ public class SoftwareUpgrade extends SoftwareUpgradeTaskBase {
           // Update software version in the universe metadata.
           createUpdateSoftwareVersionTask(newVersion, false /*isSoftwareUpdateViaVm*/)
               .setSubTaskGroupType(getTaskSubGroupType());
+
+          createUpdateUniverseSoftwareUpgradeStateTask(
+              UniverseDefinitionTaskParams.SoftwareUpgradeState.Ready);
         });
   }
 }

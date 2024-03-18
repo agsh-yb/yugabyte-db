@@ -5,7 +5,9 @@ package com.yugabyte.yw.commissioner;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.typesafe.config.Config;
+import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleConfigureServers;
 import com.yugabyte.yw.common.KubernetesUtil;
+import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.NodeUniverseManager;
 import com.yugabyte.yw.common.PlatformScheduler;
 import com.yugabyte.yw.common.ShellProcessContext;
@@ -17,6 +19,8 @@ import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.services.YbcClientService;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
+import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskSubType;
+import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskType;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
@@ -55,6 +59,7 @@ public class YbcUpgrade {
   private final YbcManager ybcManager;
   private final NodeUniverseManager nodeUniverseManager;
   private final Config config;
+  private final NodeManager nodeManager;
 
   public static final String YBC_UPGRADE_INTERVAL = "ybc.upgrade.scheduler_interval";
   public static final String YBC_UNIVERSE_UPGRADE_BATCH_SIZE_PATH =
@@ -62,11 +67,15 @@ public class YbcUpgrade {
   public static final String YBC_ALLOW_SCHEDULED_UPGRADE_PATH =
       "ybc.upgrade.allow_scheduled_upgrade";
   public static final String YBC_NODE_UPGRADE_BATCH_SIZE_PATH = "ybc.upgrade.node_batch_size";
+  public static final String MAX_YBC_UPGRADE_POLL_RESULT_TRIES_PATH =
+      "ybc.upgrade.poll_result_tries";
+  public static final String YBC_UPGRADE_POLL_RESULT_SLEEP_MS_PATH =
+      "ybc.upgrade.poll_result_sleep_ms";
 
   private final int YBC_UNIVERSE_UPGRADE_BATCH_SIZE;
   private final int YBC_NODE_UPGRADE_BATCH_SIZE;
-  public final int MAX_YBC_UPGRADE_POLL_RESULT_TRIES = 10;
-  public final long YBC_UPGRADE_POLL_RESULT_SLEEP_MS = 10000;
+  public final int MAX_YBC_UPGRADE_POLL_RESULT_TRIES;
+  public final long YBC_UPGRADE_POLL_RESULT_SLEEP_MS;
   private final long YBC_REMOTE_TIMEOUT_SEC = 60;
   private final String PACKAGE_PERMISSIONS = "755";
 
@@ -83,7 +92,8 @@ public class YbcUpgrade {
       RuntimeConfGetter confGetter,
       YbcClientService ybcClientService,
       YbcManager ybcManager,
-      NodeUniverseManager nodeUniverseManager) {
+      NodeUniverseManager nodeUniverseManager,
+      NodeManager nodeManager) {
     this.config = config;
     this.platformScheduler = platformScheduler;
     this.confGetter = confGetter;
@@ -92,6 +102,9 @@ public class YbcUpgrade {
     this.nodeUniverseManager = nodeUniverseManager;
     this.YBC_UNIVERSE_UPGRADE_BATCH_SIZE = getYBCUniverseBatchSize();
     this.YBC_NODE_UPGRADE_BATCH_SIZE = getYBCNodeBatchSize();
+    this.MAX_YBC_UPGRADE_POLL_RESULT_TRIES = getMaxYBCUpgradePollResultTries();
+    this.YBC_UPGRADE_POLL_RESULT_SLEEP_MS = getYBCUpgradePollResultSleepMs();
+    this.nodeManager = nodeManager;
   }
 
   public void start() {
@@ -112,6 +125,14 @@ public class YbcUpgrade {
 
   private int getYBCNodeBatchSize() {
     return confGetter.getGlobalConf(GlobalConfKeys.ybcNodeBatchSize);
+  }
+
+  private int getMaxYBCUpgradePollResultTries() {
+    return confGetter.getGlobalConf(GlobalConfKeys.maxYbcUpgradePollResultTries);
+  }
+
+  private long getYBCUpgradePollResultSleepMs() {
+    return confGetter.getGlobalConf(GlobalConfKeys.ybcUpgradePollResultSleepMs);
   }
 
   public synchronized void setYBCUpgradeProcess(UUID universeUUID) {
@@ -339,7 +360,12 @@ public class YbcUpgrade {
           KubernetesUtil.getKubernetesConfigPerPodName(primaryPI, primaryTservers);
       for (NodeDetails primaryTserver : primaryTservers) {
         Map<String, String> config = k8sConfigMap.get(primaryTserver.nodeName);
-        ybcManager.copyYbcPackagesOnK8s(config, universe, primaryTserver, ybcVersion);
+        ybcManager.copyYbcPackagesOnK8s(
+            config,
+            universe,
+            primaryTserver,
+            ybcVersion,
+            universe.getUniverseDetails().getPrimaryCluster().userIntent.ybcFlags);
         ybcManager.performActionOnYbcK8sNode(config, primaryTserver, commandArgs);
       }
 
@@ -351,7 +377,8 @@ public class YbcUpgrade {
         k8sConfigMap = KubernetesUtil.getKubernetesConfigPerPodName(readOnlyPI, readOnlyTservers);
         for (NodeDetails readOnlyTserver : readOnlyTservers) {
           Map<String, String> config = k8sConfigMap.get(readOnlyTserver.nodeName);
-          ybcManager.copyYbcPackagesOnK8s(config, universe, readOnlyTserver, ybcVersion);
+          ybcManager.copyYbcPackagesOnK8s(
+              config, universe, readOnlyTserver, ybcVersion, readOnlyCluster.userIntent.ybcFlags);
           ybcManager.performActionOnYbcK8sNode(config, readOnlyTserver, commandArgs);
         }
       }
@@ -381,6 +408,14 @@ public class YbcUpgrade {
       checkCronStatus(universe, node);
     }
     log.info("Placing ybc package on db node: {}", node.cloudInfo.private_ip);
+    AnsibleConfigureServers.Params params =
+        this.ybcManager.getAnsibleConfigureYbcServerTaskParams(
+            universe,
+            node,
+            universe.getUniverseDetails().getClusterByUuid(node.placementUuid).userIntent.ybcFlags,
+            UpgradeTaskType.YbcGFlags,
+            UpgradeTaskSubType.YbcGflagsUpdate);
+    nodeManager.nodeCommand(NodeManager.NodeCommandType.Configure, params).processErrors();
     placeYbcPackageOnDBNode(universe, node, ybcVersion);
     int ybcPort = universe.getUniverseDetails().communicationPorts.ybControllerrRpcPort;
     String certFile = universe.getCertificateNodetoNode();

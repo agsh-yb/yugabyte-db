@@ -255,7 +255,7 @@ TEST_F(PgWrapperTest, TestCompactHistoryWithTxn) {
   std::thread read_txn_thread([this]{
     LOG(INFO) << "Starting transaction to read data and wait";
     RunPsqlCommand(
-        "BEGIN; "
+        "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; "
         "SELECT * FROM mytbl WHERE k = 100; "
         "SELECT pg_sleep(30); "
         "SELECT * FROM mytbl WHERE k = 100; "
@@ -447,7 +447,7 @@ TEST_F(PgWrapperSingleNodeLongTxnTest, RestartMidApply) {
   ASSERT_OK(pg_ts->Restart(/* start_cql_proxy= */ false));
 
   auto conn = ASSERT_RESULT(ConnectToDB(kDbName));
-  auto count = ASSERT_RESULT(conn.FetchValue<PGUint64>("SELECT COUNT(*) FROM mytbl"));
+  auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>("SELECT COUNT(*) FROM mytbl"));
   ASSERT_EQ(kNumRows, count);
 }
 
@@ -589,9 +589,19 @@ TEST_F(PgWrapperFlagsTest, YB_DISABLE_TEST_IN_TSAN(VerifyGFlagRuntimeTag)) {
   ASSERT_OK(SetFlagOnAllTServers("ysql_yb_locks_max_transactions", "32"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_max_transactions", "32"));
 
-  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "true"));
-  ASSERT_OK(SetFlagOnAllTServers("ysql_yb_enable_replication_commands", "false"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_txn_locks_per_tablet", "200"));
+  ASSERT_OK(SetFlagOnAllTServers("ysql_yb_locks_txn_locks_per_tablet", "500"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_txn_locks_per_tablet", "500"));
+
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "false"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replica_identity", "false"));
+  ASSERT_OK(SetFlagOnAllTServers(
+      "allowed_preview_flags_csv",
+      "ysql_yb_enable_replication_commands,ysql_yb_enable_replica_identity"));
+  ASSERT_OK(SetFlagOnAllTServers("ysql_yb_enable_replication_commands", "true"));
+  ASSERT_OK(SetFlagOnAllTServers("ysql_yb_enable_replica_identity", "true"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "true"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replica_identity", "true"));
 
   // Verify changing non-runtime flag fails
   ASSERT_NOK(SetFlagOnAllTServers("max_connections", "47"));
@@ -608,7 +618,12 @@ class PgWrapperOverrideFlagsTest : public PgWrapperFlagsTest {
     options->extra_tserver_flags.emplace_back("--ysql_yb_enable_pg_locks=false");
     options->extra_tserver_flags.emplace_back("--ysql_yb_locks_min_txn_age=100");
     options->extra_tserver_flags.emplace_back("--ysql_yb_locks_max_transactions=3");
-    options->extra_tserver_flags.emplace_back("--ysql_yb_enable_replication_commands=false");
+    options->extra_tserver_flags.emplace_back("--ysql_yb_locks_txn_locks_per_tablet=1000");
+    options->extra_tserver_flags.emplace_back(
+        "--allowed_preview_flags_csv=ysql_yb_enable_replication_commands,ysql_yb_enable_replica_"
+        "identity");
+    options->extra_tserver_flags.emplace_back("--ysql_yb_enable_replication_commands=true");
+    options->extra_tserver_flags.emplace_back("--ysql_yb_enable_replica_identity=true");
   }
 };
 
@@ -621,7 +636,9 @@ TEST_F_EX(
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_pg_locks", "false"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_min_txn_age", "100"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_max_transactions", "3"));
-  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "false"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_locks_txn_locks_per_tablet", "1000"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "true"));
+  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replica_identity", "true"));
 }
 
 class PgWrapperAutoFlagsTest : public PgWrapperFlagsTest {
@@ -654,7 +671,6 @@ TEST_F_EX(
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_pushdown_strict_inequality", "true"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_pushdown_is_not_null", "true"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_pg_locks", "true"));
-  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "true"));
 
   ASSERT_NO_FATALS(CheckAutoFlagValues(true /* expect_target_value */));
 }
@@ -676,7 +692,6 @@ TEST_F_EX(
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_pushdown_strict_inequality", "false"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_pushdown_is_not_null", "false"));
   ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_pg_locks", "false"));
-  ASSERT_NO_FATALS(ValidateCurrentGucValue("ysql_yb_enable_replication_commands", "false"));
 
   ASSERT_NO_FATALS(CheckAutoFlagValues(false /* expect_target_value */));
 }

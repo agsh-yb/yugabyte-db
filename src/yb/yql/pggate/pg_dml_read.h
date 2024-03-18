@@ -72,8 +72,13 @@ class PgDmlRead : public PgDml {
   // Set forward (or backward) scan.
   void SetForwardScan(const bool is_forward_scan);
 
+  bool KeepOrder() const;
+
   // Set prefix length, in columns, of distinct index scans.
   void SetDistinctPrefixLength(const int distinct_prefix_length);
+
+  // Set scan bounds
+  void SetHashBounds(const uint16_t low_bound, const uint16_t high_bound);
 
   // Bind a range column with a BETWEEN condition.
   Status BindColumnCondBetween(int attr_num, PgExpr *attr_value,
@@ -89,6 +94,12 @@ class PgDmlRead : public PgDml {
 
   Status BindHashCode(const std::optional<Bound>& start, const std::optional<Bound>& end);
 
+  // Limit scan to specific ybctid range for parallel scan.
+  // Sets underlying request's bounds to specified values, also resets any psql operations
+  // remaining from the previous range scan.
+  Status BindRange(const Slice &start_value, bool start_inclusive,
+                   const Slice &end_value, bool end_inclusive);
+
   // Add a lower bound to the scan. If a lower bound has already been added
   // this call will set the lower bound to the stricter of the two bounds.
   Status AddRowLowerBound(YBCPgStatement handle, int n_col_values,
@@ -101,6 +112,11 @@ class PgDmlRead : public PgDml {
 
   // Execute.
   virtual Status Exec(const PgExecParameters *exec_params);
+  Status SetRequestedYbctids(const std::vector<Slice> *ybctids);
+  Status RetrieveYbctidsFromSecondaryIndex(const PgExecParameters *exec_params,
+                                           std::vector<Slice> *ybctids,
+                                           bool *exceeded_work_mem);
+  Status InitDocOpWithRowMark();
 
   void SetCatalogCacheVersion(std::optional<PgOid> db_oid, uint64_t version) override {
     DoSetCatalogCacheVersion(read_req_.get(), db_oid, version);
@@ -146,8 +162,10 @@ class PgDmlRead : public PgDml {
   bool IsConcreteRowRead() const;
   Status ProcessEmptyPrimaryBinds();
   [[nodiscard]] bool IsAllPrimaryKeysBound() const;
-  Result<std::vector<std::string>> BuildYbctidsFromPrimaryBinds();
-  Status SubstitutePrimaryBindsWithYbctids(const PgExecParameters* exec_params);
+  Result<std::vector<Slice>> BuildYbctidsFromPrimaryBinds();
+
+  Status SubstitutePrimaryBindsWithYbctids(const PgExecParameters* exec_params,
+                                           const std::vector<Slice> ybctids);
   Result<dockv::DocKey> EncodeRowKeyForBound(
       YBCPgStatement handle, size_t n_col_values, PgExpr **col_values, bool for_lower_bound);
 

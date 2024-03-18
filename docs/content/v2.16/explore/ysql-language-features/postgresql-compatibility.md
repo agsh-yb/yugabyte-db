@@ -2,7 +2,6 @@
 title: PostgreSQL compatibility
 linkTitle: PostgreSQL compatibility
 description: Summary of YugabyteDB's PostgreSQL compatibility
-image: /images/section_icons/secure/create-roles.png
 menu:
   v2.16:
     identifier: explore-ysql-postgresql-compatibility
@@ -30,7 +29,6 @@ The following PostgreSQL features are not supported in YugabyteDB:
 | GiST indexes | [1337](https://github.com/yugabyte/yugabyte-db/issues/1337)|
 | Kerberos/GSSAPI | [7854](https://github.com/yugabyte/yugabyte-db/issues/7854)|
 | Events (Listen/Notify) | [1872](https://github.com/yugabyte/yugabyte-db/issues/1872)|
-| Drop primary key constraints |[8735](https://github.com/yugabyte/yugabyte-db/issues/8735)|
 | XML Functions | [1043](https://github.com/yugabyte/yugabyte-db/issues/1043)|
 | XA syntax | [11084](https://github.com/yugabyte/yugabyte-db/issues/11084)|
 | ALTER TYPE | [1893](https://github.com/yugabyte/yugabyte-db/issues/1893)|

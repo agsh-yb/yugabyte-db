@@ -26,6 +26,7 @@ import static org.mockito.Mockito.when;
 import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.FORBIDDEN;
 import static play.mvc.Http.Status.OK;
+import static play.mvc.Http.Status.PRECONDITION_FAILED;
 import static play.test.Helpers.contentAsString;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -148,14 +149,14 @@ public class BackupsControllerTest extends FakeDBApplication {
     restoreBackupParams.backupStorageInfoList.add(storageInfo);
     ObjectMapper mapper = new ObjectMapper();
     JsonNode bodyJson = mapper.valueToTree(restoreBackupParams);
-    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup);
+    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup, null);
     taskInfo.setDetails(bodyJson);
     taskInfo.setOwner("");
     UUID restoreTaskUUID = UUID.randomUUID();
     taskInfo.setTaskUUID(restoreTaskUUID);
     taskInfo.save();
 
-    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb);
+    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb, null);
     taskInfoSub.setDetails(bodyJson);
     taskInfoSub.setOwner("");
     UUID taskUUIDSub = UUID.randomUUID();
@@ -739,10 +740,13 @@ public class BackupsControllerTest extends FakeDBApplication {
   @Test
   public void testCreateBackupValidationFailed() {
     CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST25");
+    CustomerConfigService mockCCS = mock(CustomerConfigService.class);
+    when(mockCCS.getOrBadRequest(any(), any())).thenReturn(customerConfig);
     when(mockBackupHelper.createBackupTask(any(), any())).thenCallRealMethod();
-    doThrow(new PlatformServiceException(BAD_REQUEST, "error"))
+    doThrow(new PlatformServiceException(PRECONDITION_FAILED, "error"))
         .when(mockBackupHelper)
-        .validateBackupRequest(any(), any(), any());
+        .validateStorageConfig(any());
+    ReflectionTestUtils.setField(mockBackupHelper, "customerConfigService", mockCCS);
     ObjectNode bodyJson = Json.newObject();
     bodyJson.put("universeUUID", defaultUniverse.getUniverseUUID().toString());
     bodyJson.put("storageConfigUUID", customerConfig.getConfigUUID().toString());
@@ -750,7 +754,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     Result r = assertPlatformException(() -> createBackupYb(bodyJson, null));
     JsonNode resultJson = Json.parse(contentAsString(r));
     assertValue(resultJson, "error", "error");
-    assertEquals(BAD_REQUEST, r.status());
+    assertEquals(PRECONDITION_FAILED, r.status());
     verify(mockCommissioner, times(0)).submit(any(), any());
   }
 
@@ -1342,7 +1346,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     Process process = processBuilderObject.start();
     Util.setPID(defaultBackup.getBackupUUID(), process);
 
-    taskInfo = new TaskInfo(TaskType.CreateTable);
+    taskInfo = new TaskInfo(TaskType.CreateTable, null);
     taskInfo.setDetails(Json.newObject());
     taskInfo.setOwner("");
     taskInfo.setTaskUUID(taskUUID);
@@ -1379,7 +1383,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     Process process = processBuilderObject.start();
     Util.setPID(defaultBackup.getBackupUUID(), process);
 
-    taskInfo = new TaskInfo(TaskType.CreateTable);
+    taskInfo = new TaskInfo(TaskType.CreateTable, null);
     taskInfo.setDetails(Json.newObject());
     taskInfo.setOwner("");
     taskInfo.setTaskUUID(taskUUID);
@@ -1425,7 +1429,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     Process process = processBuilderObject.start();
     Util.setPID(defaultBackup.getBackupUUID(), process);
     when(mockBackupHelper.stopBackup(any(), any())).thenCallRealMethod();
-    taskInfo = new TaskInfo(TaskType.CreateTable);
+    taskInfo = new TaskInfo(TaskType.CreateTable, null);
     taskInfo.setDetails(Json.newObject());
     taskInfo.setOwner("");
     taskInfo.setTaskUUID(taskUUID);
@@ -1935,7 +1939,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     restoreBackupParams.backupStorageInfoList.add(storageInfo);
     ObjectMapper mapper = new ObjectMapper();
     JsonNode bodyJson = mapper.valueToTree(restoreBackupParams);
-    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup);
+    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup, null);
     taskInfo.setDetails(bodyJson);
     taskInfo.setOwner("");
     taskInfo.setTaskState(TaskInfo.State.Success);
@@ -1943,7 +1947,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     taskInfo.setTaskUUID(taskUUID);
     taskInfo.save();
 
-    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb);
+    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb, null);
     taskInfoSub.setDetails(bodyJson);
     taskInfoSub.setOwner("");
     UUID taskUUIDSub = UUID.randomUUID();
@@ -2036,7 +2040,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     restoreBackupParams.backupStorageInfoList.add(storageInfo);
     ObjectMapper mapper = new ObjectMapper();
     JsonNode bodyJson = mapper.valueToTree(restoreBackupParams);
-    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup);
+    TaskInfo taskInfo = new TaskInfo(TaskType.RestoreBackup, null);
     taskInfo.setDetails(bodyJson);
     taskInfo.setOwner("");
     taskInfo.setTaskState(TaskInfo.State.Success);
@@ -2044,7 +2048,7 @@ public class BackupsControllerTest extends FakeDBApplication {
     taskInfo.setTaskUUID(taskUUID);
     taskInfo.save();
 
-    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb);
+    TaskInfo taskInfoSub = new TaskInfo(TaskType.RestoreBackupYb, null);
     taskInfoSub.setDetails(bodyJson);
     taskInfoSub.setOwner("");
     UUID taskUUIDSub = UUID.randomUUID();

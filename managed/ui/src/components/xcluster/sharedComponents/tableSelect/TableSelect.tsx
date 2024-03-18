@@ -1,16 +1,14 @@
 import { useState } from 'react';
 import {
   BootstrapTable,
-  ExpandColumnComponentProps,
   Options,
   SortOrder as ReactBSTableSortOrder,
   TableHeaderColumn
 } from 'react-bootstrap-table';
 import { useQueries, useQuery, UseQueryResult } from 'react-query';
 import Select, { ValueType } from 'react-select';
-import clsx from 'clsx';
-import { Field } from 'formik';
-import { Box } from '@material-ui/core';
+import { Box, Typography, useTheme } from '@material-ui/core';
+import { Trans, useTranslation } from 'react-i18next';
 
 import {
   fetchTablesInUniverse,
@@ -26,18 +24,20 @@ import { YBCheckBox, YBControlledSelect, YBInputField } from '../../../common/fo
 import { YBErrorIndicator, YBLoading } from '../../../common/indicators';
 import { hasSubstringMatch } from '../../../queries/helpers/queriesHelper';
 import {
-  formatUuidForXCluster,
   formatBytes,
-  getAllXClusterConfigs,
   getSharedXClusterConfigs,
   tableSort,
-  isTableSelectable
+  hasLinkedXClusterConfig,
+  isTableToggleable,
+  formatUuidForXCluster
 } from '../../ReplicationUtils';
 import {
   TRANSACTIONAL_ATOMICITY_YB_SOFTWARE_VERSION_THRESHOLD,
   XClusterConfigAction,
   XCLUSTER_REPLICATION_DOCUMENTATION_URL,
-  XCLUSTER_TABLE_INELIGIBLE_STATUSES
+  XCLUSTER_SUPPORTED_TABLE_TYPES,
+  XCLUSTER_TABLE_INELIGIBLE_STATUSES,
+  XCLUSTER_UNIVERSE_TABLE_FILTERS
 } from '../../constants';
 import YBPagination from '../../../tables/YBPagination/YBPagination';
 import { CollapsibleNote } from '../CollapsibleNote';
@@ -53,6 +53,9 @@ import { DEFAULT_RUNTIME_GLOBAL_SCOPE } from '../../../../actions/customers';
 import { YBTooltip } from '../../../../redesign/components';
 import InfoMessageIcon from '../../../../redesign/assets/info-message.svg';
 import { compareYBSoftwareVersions, getPrimaryCluster } from '../../../../utils/universeUtilsTyped';
+import { ExpandColumnComponent } from './ExpandColumnComponent';
+import { getTableUuid } from '../../../../utils/tableUtils';
+import { YBBanner, YBBannerVariant } from '../../../common/descriptors';
 
 import {
   TableType,
@@ -61,16 +64,18 @@ import {
   UniverseNamespace,
   YBTable
 } from '../../../../redesign/helpers/dtos';
-import { XClusterTableType } from '../../XClusterTypes';
+import {
+  IndexTableReplicationCandidate,
+  TableReplicationCandidate,
+  XClusterTableType
+} from '../../XClusterTypes';
 import { XClusterConfig } from '../../dtos';
 import {
   EligibilityDetails,
-  KeyspaceItem,
-  KeyspaceRow,
+  NamespaceItem,
   ReplicationItems,
-  XClusterTableCandidate
+  MainTableReplicationCandidate
 } from '../..';
-import { isColocatedParentTable } from '../../../../utils/tableUtils';
 
 import styles from './TableSelect.module.scss';
 
@@ -79,12 +84,13 @@ interface CommonTableSelectProps {
   targetUniverseUUID: string;
   selectedTableUUIDs: string[];
   setSelectedTableUUIDs: (tableUUIDs: string[]) => void;
+  isDrInterface: boolean;
   isFixedTableType: boolean;
-  isDrConfig: boolean;
   tableType: XClusterTableType;
   setTableType: (tableType: XClusterTableType) => void;
-  selectedKeyspaces: string[];
-  setSelectedKeyspaces: (selectedKeyspaces: string[]) => void;
+  initialNamespaceUuids: string[];
+  selectedNamespaceUuids: string[];
+  setSelectedNamespaceUuids: (selectedNamespaceUuids: string[]) => void;
   selectionError: { title?: string; body?: string } | undefined;
   selectionWarning: { title: string; body: string } | undefined;
 }
@@ -106,7 +112,6 @@ const DEFAULT_TABLE_TYPE_OPTION = {
   value: TableType.PGSQL_TABLE_TYPE,
   label: TableTypeLabel[TableType.PGSQL_TABLE_TYPE]
 } as const;
-
 const TABLE_TYPE_OPTIONS = [
   DEFAULT_TABLE_TYPE_OPTION,
   { value: TableType.YQL_TABLE_TYPE, label: TableTypeLabel[TableType.YQL_TABLE_TYPE] }
@@ -127,15 +132,14 @@ const TABLE_TYPE_SELECT_STYLES = {
 };
 
 const NOTE_CONTENT = (
-  <p>
-    <b>Note!</b>
+  <div>
     <p>
+      <b>Note! </b>
       Tables in an xCluster configuration must all be of the same type (YCQL or YSQL). Please create
       a separate xCluster configuration if you wish to replicate tables of a different type.
     </p>
     <p>
-      Index tables are not shown. Replication for these tables will automatically be set up if the
-      main table is selected.
+      Selecting or deselecting main tables will select and deselect their associated index tables.
     </p>
     <p>
       If a YSQL database contains any tables considered ineligible for replication, it will not be
@@ -150,7 +154,7 @@ const NOTE_CONTENT = (
         replication is desired.
       </b>
     </p>
-  </p>
+  </div>
 );
 
 const NOTE_EXPAND_CONTENT = (
@@ -179,18 +183,18 @@ const NOTE_EXPAND_CONTENT = (
     </p>
     <p>
       Please be aware that we currently do not support backup/restore at table-level granularity for
-      YSQL. The bootstrapping step involves a backup/restore of the source universe data, and
-      initiating a restart replication task from the UI will involve bootstrapping. For a smooth
+      YSQL. The full copy step involves a backup/restore of the source universe data, and initiating
+      a restart replication task from the UI will involve creating a full copy. For a smooth
       experience managing the xCluster configuration from the UI, we do not recommend creating
       xCluster configurations for a subset of the tables in a YSQL database.
     </p>
   </div>
 );
-const TABLE_DESCRIPTOR = 'List of databases and tables in the source universe';
+const TRANSLATION_KEY_PREFIX = 'clusterDetail.xCluster.selectTable';
 
 /**
  * Input component for selecting tables for xCluster configuration.
- * The state of selected tables and keyspaces is controlled externally.
+ * The state of selected tables and namespaces is controlled externally.
  */
 export const TableSelect = (props: TableSelectProps) => {
   const {
@@ -199,21 +203,24 @@ export const TableSelect = (props: TableSelectProps) => {
     selectedTableUUIDs,
     setSelectedTableUUIDs,
     tableType,
-    isDrConfig,
+    isDrInterface,
     isFixedTableType,
     setTableType,
-    selectedKeyspaces,
-    setSelectedKeyspaces,
+    initialNamespaceUuids,
+    selectedNamespaceUuids,
+    setSelectedNamespaceUuids,
     selectionError,
     selectionWarning
   } = props;
-  const [keyspaceSearchTerm, setKeyspaceSearchTerm] = useState('');
+  const [namespaceSearchTerm, setNamespaceSearchTerm] = useState('');
   const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0]);
   const [activePage, setActivePage] = useState(1);
-  const [sortField, setSortField] = useState<keyof KeyspaceRow>('name');
+  const [sortField, setSortField] = useState<keyof NamespaceItem>('name');
   const [sortOrder, setSortOrder] = useState<ReactBSTableSortOrder>(SortOrder.ASCENDING);
   const [isTooltipOpen, setIsTooltipOpen] = useState<boolean>(false);
   const [isMouseOverTooltip, setIsMouseOverTooltip] = useState<boolean>(false);
+  const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
+  const theme = useTheme();
 
   const sourceUniverseNamespaceQuery = useQuery<UniverseNamespace[]>(
     universeQueryKey.namespaces(sourceUniverseUUID),
@@ -221,24 +228,23 @@ export const TableSelect = (props: TableSelectProps) => {
   );
 
   const sourceUniverseTablesQuery = useQuery<YBTable[]>(
-    universeQueryKey.tables(sourceUniverseUUID, { excludeColocatedTables: true }),
+    universeQueryKey.tables(sourceUniverseUUID, XCLUSTER_UNIVERSE_TABLE_FILTERS),
     () =>
-      fetchTablesInUniverse(sourceUniverseUUID, { excludeColocatedTables: true }).then(
+      fetchTablesInUniverse(sourceUniverseUUID, XCLUSTER_UNIVERSE_TABLE_FILTERS).then(
+        (response) => response.data
+      )
+  );
+  const targetUniverseTablesQuery = useQuery<YBTable[]>(
+    universeQueryKey.tables(targetUniverseUUID, XCLUSTER_UNIVERSE_TABLE_FILTERS),
+    () =>
+      fetchTablesInUniverse(targetUniverseUUID, XCLUSTER_UNIVERSE_TABLE_FILTERS).then(
         (response) => response.data
       )
   );
 
-  const targetUniverseTablesQuery = useQuery<YBTable[]>(
-    universeQueryKey.tables(targetUniverseUUID, { excludeColocatedTables: true }),
-    () =>
-      fetchTablesInUniverse(targetUniverseUUID, { excludeColocatedTables: true }).then(
-        (response) => response.data
-      )
-  );
   const sourceUniverseQuery = useQuery<Universe>(universeQueryKey.detail(sourceUniverseUUID), () =>
     api.fetchUniverse(sourceUniverseUUID)
   );
-
   const targetUniverseQuery = useQuery<Universe>(universeQueryKey.detail(targetUniverseUUID), () =>
     api.fetchUniverse(targetUniverseUUID)
   );
@@ -247,7 +253,6 @@ export const TableSelect = (props: TableSelectProps) => {
     sourceUniverseQuery?.data && targetUniverseQuery?.data
       ? getSharedXClusterConfigs(sourceUniverseQuery.data, targetUniverseQuery.data)
       : [];
-
   /**
    * Queries for shared xCluster config UUIDs
    */
@@ -286,92 +291,108 @@ export const TableSelect = (props: TableSelectProps) => {
     sourceUniverseTablesQuery.isError ||
     sourceUniverseQuery.isError
   ) {
-    return <YBErrorIndicator message="Error fetching source universe information." />;
+    const sourceUniverseLabel = isDrInterface ? 'DR primary universe' : 'source universe';
+    return (
+      <YBErrorIndicator customErrorMessage={`Error fetching ${sourceUniverseLabel} information.`} />
+    );
   }
   if (targetUniverseTablesQuery.isError || targetUniverseQuery.isError) {
-    return <YBErrorIndicator message="Error fetching target universe information." />;
+    const targetUniverseLabel = isDrInterface ? 'DR replica universe' : 'source universe';
+    return (
+      <YBErrorIndicator customErrorMessage={`Error fetching ${targetUniverseLabel} information.`} />
+    );
   }
   if (globalRuntimeConfigQuery.isError) {
-    return <YBErrorIndicator message="Error fetching runtime configurations." />;
+    return <YBErrorIndicator customErrorMessage="Error fetching runtime configurations." />;
   }
 
-  const toggleTableGroup = (isSelected: boolean, rows: XClusterTableCandidate[]) => {
+  const toggleTableGroup = (
+    isSelected: boolean,
+    tableReplicationCandidates: TableReplicationCandidate[]
+  ) => {
     if (isSelected) {
-      const tableUUIDsToAdd: string[] = [];
-      const currentSelectedTableUUIDs = new Set(selectedTableUUIDs);
+      const currentSelectedTableUuids = new Set(selectedTableUUIDs);
 
-      rows.forEach((row) => {
-        if (!currentSelectedTableUUIDs.has(row.tableUUID)) {
-          tableUUIDsToAdd.push(row.tableUUID);
+      tableReplicationCandidates.forEach((tableReplicationCandidate) => {
+        currentSelectedTableUuids.add(getTableUuid(tableReplicationCandidate));
+
+        if (tableReplicationCandidate.isIndexTable && tableReplicationCandidate.mainTableUUID) {
+          currentSelectedTableUuids.add(
+            formatUuidForXCluster(tableReplicationCandidate.mainTableUUID)
+          );
         }
+        tableReplicationCandidate.indexTableIDs?.forEach((indexTableId) =>
+          currentSelectedTableUuids.add(indexTableId)
+        );
       });
-
-      setSelectedTableUUIDs([...selectedTableUUIDs, ...tableUUIDsToAdd]);
+      setSelectedTableUUIDs(Array.from(currentSelectedTableUuids));
     } else {
-      const removedTables = new Set(rows.map((row) => row.tableUUID));
-
+      const removedTableUuids = new Set();
+      tableReplicationCandidates.forEach((tableReplicationCandidate) => {
+        removedTableUuids.add(getTableUuid(tableReplicationCandidate));
+        tableReplicationCandidate.indexTableIDs?.forEach((indexTableId) =>
+          removedTableUuids.add(indexTableId)
+        );
+      });
       setSelectedTableUUIDs(
-        selectedTableUUIDs.filter((tableUUID) => !removedTables.has(tableUUID))
+        selectedTableUUIDs.filter((tableUUID) => !removedTableUuids.has(tableUUID))
       );
     }
   };
 
-  const handleAllTableSelect = (isSelected: boolean, rows: XClusterTableCandidate[]) => {
+  const handleTableGroupToggle = (isSelected: boolean, rows: TableReplicationCandidate[]) => {
     toggleTableGroup(isSelected, rows);
     return true;
   };
 
-  const handleTableSelect = (row: XClusterTableCandidate, isSelected: boolean) => {
-    if (isSelected) {
-      setSelectedTableUUIDs([...selectedTableUUIDs, row.tableUUID]);
-    } else {
-      setSelectedTableUUIDs([
-        ...selectedTableUUIDs.filter((tableUUID: string) => tableUUID !== row.tableUUID)
-      ]);
-    }
+  const handleTableToggle = (
+    tableReplicationCandidate: TableReplicationCandidate,
+    isSelected: boolean
+  ) => {
+    toggleTableGroup(isSelected, [tableReplicationCandidate]);
   };
 
-  const toggleKeyspaceGroup = (isSelected: boolean, rows: KeyspaceRow[]) => {
+  const toggleNamespaceGroup = (isSelected: boolean, namespaceItems: NamespaceItem[]) => {
     if (isSelected) {
-      const keyspacesToAdd: string[] = [];
-      const currentSelectedKeyspaces = new Set(selectedKeyspaces);
+      const currentSelectedNamespaces = new Set(selectedNamespaceUuids);
 
-      rows.forEach((row) => {
-        if (!currentSelectedKeyspaces.has(row.keyspace)) {
-          keyspacesToAdd.push(row.keyspace);
-        }
+      namespaceItems.forEach((namespaceItem) => {
+        currentSelectedNamespaces.add(namespaceItem.uuid);
       });
-      setSelectedKeyspaces([...selectedKeyspaces, ...keyspacesToAdd]);
+      setSelectedNamespaceUuids(Array.from(currentSelectedNamespaces));
     } else {
-      const removedKeyspaces = new Set(rows.map((row) => row.keyspace));
+      const removedNamespaceUuids = new Set(
+        namespaceItems.map((namespaceItem) => namespaceItem.uuid)
+      );
 
-      setSelectedKeyspaces(
-        selectedKeyspaces.filter((keyspace: string) => !removedKeyspaces.has(keyspace))
+      setSelectedNamespaceUuids(
+        selectedNamespaceUuids.filter(
+          (namespaceUuid: string) => !removedNamespaceUuids.has(namespaceUuid)
+        )
       );
     }
   };
 
-  const handleAllKeyspaceSelect = (isSelected: boolean, rows: KeyspaceRow[]) => {
-    const selectableTables = rows.reduce((table: XClusterTableCandidate[], row) => {
-      return table.concat(
-        row.tables.filter((table) => isTableSelectable(table, props.configAction))
-      );
-    }, []);
+  const handleNamespaceGroupToggle = (isSelected: boolean, namespaceItems: NamespaceItem[]) => {
+    const selectableTables = namespaceItems.reduce(
+      (table: MainTableReplicationCandidate[], namespaceItem) => {
+        return table.concat(
+          namespaceItem.tables.filter((table) => isTableToggleable(table, props.configAction))
+        );
+      },
+      []
+    );
 
-    toggleKeyspaceGroup(isSelected, rows);
+    toggleNamespaceGroup(isSelected, namespaceItems);
     toggleTableGroup(isSelected, selectableTables);
     return true;
   };
 
-  const handleKeyspaceSelect = (row: KeyspaceRow, isSelected: boolean) => {
-    if (isSelected) {
-      setSelectedKeyspaces([...selectedKeyspaces, row.keyspace]);
-    } else {
-      setSelectedKeyspaces(selectedKeyspaces.filter((keyspace) => keyspace !== row.keyspace));
-    }
+  const handleNamespaceToggle = (namespaceItem: NamespaceItem, isSelected: boolean) => {
+    toggleNamespaceGroup(isSelected, [namespaceItem]);
     toggleTableGroup(
       isSelected,
-      row.tables.filter((table) => isTableSelectable(table, props.configAction))
+      namespaceItem.tables.filter((table) => isTableToggleable(table, props.configAction))
     );
   };
 
@@ -382,7 +403,7 @@ export const TableSelect = (props: TableSelectProps) => {
 
       // Clear current item selection.
       // Form submission should only contain tables of the same type (YSQL or YCQL).
-      setSelectedKeyspaces([]);
+      setSelectedNamespaceUuids([]);
       setSelectedTableUUIDs([]);
     }
   };
@@ -404,34 +425,37 @@ export const TableSelect = (props: TableSelectProps) => {
       ? getReplicationItemsFromTables(
           sourceUniverseNamespaceQuery.data,
           sourceUniverseTablesQuery.data,
-          targetUniverseTablesQuery.data,
           sharedXClusterConfigs,
           props.xClusterConfigUUID
         )
       : getReplicationItemsFromTables(
           sourceUniverseNamespaceQuery.data,
           sourceUniverseTablesQuery.data,
-          targetUniverseTablesQuery.data,
           sharedXClusterConfigs
         );
-  const bootstrapTableData = Object.entries(replicationItems[tableType].keyspaces)
-    .filter(([_, keyspaceItem]) => hasSubstringMatch(keyspaceItem.name, keyspaceSearchTerm))
-    .map(([keyspaceUuid, keyspaceItem]) => ({ keyspace: keyspaceUuid, ...keyspaceItem }));
-  const unselectableKeyspaces = getUnselectableKeyspaces(
+  const namespaceItems = Object.entries(replicationItems[tableType].namespaces)
+    .filter(([_, namespaceItem]) => hasSubstringMatch(namespaceItem.name, namespaceSearchTerm))
+    .map(([_, namespaceItem]) => namespaceItem);
+  const untoggleableNamespaceUuids = getUntoggleableNamespaceUuids(
     props.configAction,
-    replicationItems[tableType].keyspaces,
+    namespaceItems,
+    initialNamespaceUuids,
+    selectedNamespaceUuids,
     tableType
   );
   const tableOptions: Options = {
     sortName: sortField,
     sortOrder: sortOrder,
     onSortChange: (sortName: string | number | symbol, sortOrder: ReactBSTableSortOrder) => {
-      // Each row of the table is of type KeyspaceRow.
-      setSortField(sortName as keyof KeyspaceRow);
+      // Each row of the table is of type NamespaceItem.
+      setSortField(sortName as keyof NamespaceItem);
       setSortOrder(sortOrder);
     }
   };
 
+  const tableDescriptor = isDrInterface
+    ? t('selectionDescriptorDr')
+    : t('selectionDescriptorXCluster');
   const runtimeConfigEntries = globalRuntimeConfigQuery.data.configEntries ?? [];
   const isTransactionalAtomicityEnabled = runtimeConfigEntries.some(
     (config: any) =>
@@ -440,23 +464,26 @@ export const TableSelect = (props: TableSelectProps) => {
   );
   const ybSoftwareVersion = getPrimaryCluster(sourceUniverseQuery.data.universeDetails.clusters)
     ?.userIntent.ybSoftwareVersion;
-  const hasExisitingReplicationConfig =
-    [
-      ...getAllXClusterConfigs(sourceUniverseQuery.data),
-      ...getAllXClusterConfigs(targetUniverseQuery.data)
-    ].length > 0;
+
+  const participantsHaveLinkedXClusterConfig = hasLinkedXClusterConfig([
+    sourceUniverseQuery.data,
+    targetUniverseQuery.data
+  ]);
   const isTransactionalAtomicitySupported =
     !!ybSoftwareVersion &&
-    compareYBSoftwareVersions(
-      TRANSACTIONAL_ATOMICITY_YB_SOFTWARE_VERSION_THRESHOLD,
-      ybSoftwareVersion,
-      true
+    compareYBSoftwareVersions({
+      versionA: TRANSACTIONAL_ATOMICITY_YB_SOFTWARE_VERSION_THRESHOLD,
+      versionB: ybSoftwareVersion,
+      options: {
+        suppressFormatError: true
+      }
+    }
     ) < 0 &&
-    !hasExisitingReplicationConfig;
+    !participantsHaveLinkedXClusterConfig;
   return (
     <>
       {isTransactionalAtomicityEnabled &&
-        !isDrConfig &&
+        !isDrInterface &&
         props.configAction === XClusterConfigAction.CREATE &&
         tableType === TableType.PGSQL_TABLE_TYPE && (
           <Box display="flex" gridGap="5px">
@@ -500,59 +527,65 @@ export const TableSelect = (props: TableSelectProps) => {
             </YBTooltip>
           </Box>
         )}
-      <div className={styles.tableDescriptor}>{TABLE_DESCRIPTOR}</div>
-      <div className={styles.tableToolbar}>
-        {!isDrConfig && (
+      <div className={styles.tableDescriptor}>{tableDescriptor}</div>
+      {!isDrInterface && (
+        <div className={styles.tableToolbar}>
           <Select
             styles={TABLE_TYPE_SELECT_STYLES}
             options={TABLE_TYPE_OPTIONS}
             onChange={handleTableTypeChange}
             value={{ value: tableType, label: TableTypeLabel[tableType] }}
-            isOptionDisabled={(option) => isFixedTableType && option.value !== tableType}
+            isDisabled={isFixedTableType}
           />
-        )}
-        <YBInputField
-          containerClassName={styles.keyspaceSearchInput}
-          placeHolder="Search for databases.."
-          onValueChanged={(searchTerm: string) => setKeyspaceSearchTerm(searchTerm)}
-        />
-      </div>
+          <YBInputField
+            containerClassName={styles.namespaceSearchInput}
+            placeHolder="Search for databases.."
+            onValueChanged={(searchTerm: string) => setNamespaceSearchTerm(searchTerm)}
+          />
+        </div>
+      )}
       <div className={styles.bootstrapTableContainer}>
         <BootstrapTable
           tableContainerClass={styles.bootstrapTable}
           maxHeight="450px"
-          data={bootstrapTableData
-            .sort((a, b) => tableSort<KeyspaceRow>(a, b, sortField, sortOrder, 'keyspace'))
+          data={namespaceItems
+            .sort((a, b) => tableSort<NamespaceItem>(a, b, sortField, sortOrder, 'uuid'))
             .slice((activePage - 1) * pageSize, activePage * pageSize)}
-          expandableRow={(row: KeyspaceRow) => {
-            return row.tables.length > 0;
+          expandableRow={(namespaceItem: NamespaceItem) => {
+            return namespaceItem.tables.length > 0;
           }}
-          expandComponent={(row: KeyspaceRow) => (
+          expandComponent={(namespaceItem: NamespaceItem) => (
             <ExpandedTableSelect
-              row={row}
+              row={namespaceItem}
+              isSelectable={
+                tableType === TableType.YQL_TABLE_TYPE ||
+                (props.configAction === XClusterConfigAction.MANAGE_TABLE &&
+                  initialNamespaceUuids.includes(namespaceItem.uuid) &&
+                  selectedNamespaceUuids.includes(namespaceItem.uuid))
+              }
               selectedTableUUIDs={selectedTableUUIDs}
               tableType={tableType}
               xClusterConfigAction={props.configAction}
-              handleTableSelect={handleTableSelect}
-              handleAllTableSelect={handleAllTableSelect}
+              handleTableSelect={handleTableToggle}
+              handleTableGroupSelect={handleTableGroupToggle}
             />
           )}
           expandColumnOptions={{
             expandColumnVisible: true,
-            expandColumnComponent: expandColumnComponent,
+            expandColumnComponent: ExpandColumnComponent,
             columnWidth: 25
           }}
           selectRow={{
             mode: 'checkbox',
             clickToExpand: true,
-            onSelect: handleKeyspaceSelect,
-            onSelectAll: handleAllKeyspaceSelect,
-            selected: selectedKeyspaces,
-            unselectable: unselectableKeyspaces
+            onSelect: handleNamespaceToggle,
+            onSelectAll: handleNamespaceGroupToggle,
+            selected: selectedNamespaceUuids,
+            unselectable: untoggleableNamespaceUuids
           }}
           options={tableOptions}
         >
-          <TableHeaderColumn dataField="keyspace" isKey={true} hidden={true} />
+          <TableHeaderColumn dataField="uuid" isKey={true} hidden={true} />
           <TableHeaderColumn dataField="name" dataSort={true}>
             Database
           </TableHeaderColumn>
@@ -566,7 +599,7 @@ export const TableSelect = (props: TableSelectProps) => {
           </TableHeaderColumn>
         </BootstrapTable>
       </div>
-      {bootstrapTableData.length > TABLE_MIN_PAGE_SIZE && (
+      {namespaceItems.length > TABLE_MIN_PAGE_SIZE && (
         <div className={styles.paginationControls}>
           <YBControlledSelect
             className={styles.pageSizeInput}
@@ -579,8 +612,8 @@ export const TableSelect = (props: TableSelectProps) => {
             onInputChanged={(event: any) => setPageSize(event.target.value)}
           />
           <YBPagination
-            className={styles.yBPagination}
-            numPages={Math.ceil(bootstrapTableData.length / pageSize)}
+            className={styles.ybPagination}
+            numPages={Math.ceil(namespaceItems.length / pageSize)}
             onChange={(newPageNum: number) => {
               setActivePage(newPageNum);
             }}
@@ -588,97 +621,126 @@ export const TableSelect = (props: TableSelectProps) => {
           />
         </div>
       )}
-      {tableType === TableType.PGSQL_TABLE_TYPE ? (
-        <div>
-          Tables in {selectedKeyspaces.length} of{' '}
-          {Object.keys(replicationItems.PGSQL_TABLE_TYPE.keyspaces).length} database(s) selected
-        </div>
+      {tableType === TableType.YQL_TABLE_TYPE ||
+      props.configAction === XClusterConfigAction.MANAGE_TABLE ? (
+        <Typography variant="body2">
+          {t('tableSelectionCount', {
+            selectedTableCount: selectedTableUUIDs.length,
+            availableTableCount: replicationItems[tableType].tableCount
+          })}
+        </Typography>
       ) : (
-        <div>
-          {selectedTableUUIDs.length} of {replicationItems[tableType].tableCount} table(s) selected
-        </div>
+        <Typography variant="body2">
+          {t('databaseSelectionCount', {
+            selectedDatabaseCount: selectedNamespaceUuids.length,
+            availableDatabaseCount: Object.keys(replicationItems.PGSQL_TABLE_TYPE.namespaces).length
+          })}
+        </Typography>
       )}
       {(selectionError || selectionWarning) && (
         <div className={styles.validationContainer}>
           {selectionError && (
-            <div className={clsx(styles.validation, styles.error)}>
-              <i className="fa fa-exclamation-triangle" aria-hidden="true" />
-              <div className={styles.message}>
-                <h5>{selectionError.title}</h5>
-                <p>{selectionError.body}</p>
-              </div>
-            </div>
+            <YBBanner variant={YBBannerVariant.DANGER}>
+              <Typography variant="body1">{selectionError.title}</Typography>
+              <Typography variant="body2" component="p">
+                {selectionError.body}
+              </Typography>
+            </YBBanner>
           )}
           {selectionWarning && (
-            <div className={clsx(styles.validation, styles.warning)}>
-              <i className="fa fa-exclamation-triangle" aria-hidden="true" />
-              <div className={styles.message}>
-                <h5>{selectionWarning.title}</h5>
-                <p>{selectionWarning.body}</p>
-              </div>
-            </div>
+            <YBBanner variant={YBBannerVariant.WARNING}>
+              <Typography variant="body1">{selectionWarning.title}</Typography>
+              <Typography variant="body2" component="p">
+                {selectionWarning.body}
+              </Typography>
+            </YBBanner>
           )}
         </div>
       )}
-      {!isDrConfig && (
-        <CollapsibleNote noteContent={NOTE_CONTENT} expandContent={NOTE_EXPAND_CONTENT} />
-      )}
+      <Box display="flex" flexDirection="column" marginTop={2} gridGap={theme.spacing(2)}>
+        <YBBanner variant={YBBannerVariant.INFO}>
+          <Typography variant="body2">
+            <Trans
+              i18nKey={`${TRANSLATION_KEY_PREFIX}.${
+                props.isDrInterface ? 'matchingTableNoteDr' : 'matchingTableNoteXCluster'
+              }`}
+              components={{ bold: <b /> }}
+            />
+          </Typography>
+        </YBBanner>
+        {!isDrInterface && (
+          <CollapsibleNote noteContent={NOTE_CONTENT} expandContent={NOTE_EXPAND_CONTENT} />
+        )}
+      </Box>
     </>
   );
 };
 
-const expandColumnComponent = ({ isExpandableRow, isExpanded }: ExpandColumnComponentProps) => {
-  if (!isExpandableRow) {
-    return '';
-  }
-  return (
-    <div>
-      {isExpanded ? (
-        <i className="fa fa-caret-up" aria-hidden="true" />
-      ) : (
-        <i className="fa fa-caret-down" aria-hidden="true" />
-      )}
-    </div>
-  );
-};
-
 /**
- * Group tables by {@link TableType} and then by keyspace/database name.
+ * Group tables by {@link TableType} and then by namespace name.
  */
-function getReplicationItemsFromTables(
+const getReplicationItemsFromTables = (
   sourceUniverseNamespaces: UniverseNamespace[],
   sourceUniverseTables: YBTable[],
-  targetUniverseTables: YBTable[],
   sharedXClusterConfigs: XClusterConfig[],
   currentXClusterConfigUUID?: string
-): ReplicationItems {
-  const namespaceToNamespaceUuid = Object.fromEntries(
+): ReplicationItems => {
+  const namespaceNameToNamespaceUuid = Object.fromEntries(
     sourceUniverseNamespaces.map((namespace) => [namespace.name, namespace.namespaceUUID])
+  );
+  const tableUuidToTable = Object.fromEntries(
+    sourceUniverseTables.map((table) => [getTableUuid(table), table])
   );
 
   return sourceUniverseTables.reduce(
     (items: ReplicationItems, sourceTable) => {
-      const tableEligibility = getXClusterTableEligibilityDetails(
-        sourceTable,
-        targetUniverseTables,
-        sharedXClusterConfigs,
-        currentXClusterConfigUUID
-      );
-      const xClusterTable: XClusterTableCandidate = {
-        eligibilityDetails: tableEligibility,
-        ...sourceTable
-      };
-      const { tableType, keySpace: keyspace, sizeBytes, eligibilityDetails } = xClusterTable;
-      const keyspaceId = namespaceToNamespaceUuid[keyspace] ?? keyspace;
-      // We only support `PGSQL_TABLE_TYPE` and `YQL_TABLE_TYPE` for now.
-      // We also drop index tables from selection because replication will be
-      // automatically set up if the main table is selected.
+      // Filter out index tables because we will add them as a field under the main table.
       if (
-        xClusterTable.relationType !== YBTableRelationType.INDEX_TABLE_RELATION &&
-        (tableType === TableType.PGSQL_TABLE_TYPE || tableType === TableType.YQL_TABLE_TYPE)
+        sourceTable.relationType !== YBTableRelationType.INDEX_TABLE_RELATION &&
+        (XCLUSTER_SUPPORTED_TABLE_TYPES as readonly TableType[]).includes(sourceTable.tableType)
       ) {
-        items[tableType].keyspaces[keyspaceId] = items[tableType].keyspaces[keyspaceId] ?? {
-          name: keyspace,
+        const mainTableReplicationEligibility = getXClusterTableEligibilityDetails(
+          sourceTable,
+          sharedXClusterConfigs,
+          currentXClusterConfigUUID
+        );
+
+        // Add information about associated index tables if applicable.
+        const indexTables = [] as IndexTableReplicationCandidate[];
+        let indexTablesTotalSize = 0;
+        sourceTable.indexTableIDs?.forEach((indexTableId) => {
+          const indexTable = tableUuidToTable[indexTableId];
+          const indexTableReplicationEligibility = getXClusterTableEligibilityDetails(
+            indexTable,
+            sharedXClusterConfigs,
+            currentXClusterConfigUUID
+          );
+          const indexTableReplicationCandidate = {
+            ...indexTable,
+            eligibilityDetails: indexTableReplicationEligibility,
+            tableUUID: getTableUuid(indexTable)
+          };
+          indexTables.push(indexTableReplicationCandidate);
+          indexTablesTotalSize += indexTable.sizeBytes;
+        });
+
+        const mainTableReplicationCandidate: MainTableReplicationCandidate = {
+          ...sourceTable,
+          eligibilityDetails: mainTableReplicationEligibility,
+          tableUUID: getTableUuid(sourceTable),
+          indexTables: indexTables
+        };
+        const {
+          tableType,
+          keySpace: namespace,
+          sizeBytes,
+          eligibilityDetails
+        } = mainTableReplicationCandidate;
+        const namespaceUuid = namespaceNameToNamespaceUuid[namespace] ?? namespace;
+
+        items[tableType].namespaces[namespaceUuid] = items[tableType].namespaces[namespaceUuid] ?? {
+          uuid: namespaceUuid,
+          name: namespace,
           tableEligibilityCount: {
             ineligible: 0,
             eligibleInCurrentConfig: 0
@@ -686,77 +748,48 @@ function getReplicationItemsFromTables(
           sizeBytes: 0,
           tables: []
         };
-        items[tableType].keyspaces[keyspaceId].sizeBytes += sizeBytes;
-        items[tableType].keyspaces[keyspaceId].tables.push(xClusterTable);
-        items[tableType].tableCount += 1;
+
+        // Push table and update metadata
+        items[tableType].namespaces[namespaceUuid].tables.push(mainTableReplicationCandidate);
+        items[tableType].namespaces[namespaceUuid].sizeBytes += sizeBytes + indexTablesTotalSize;
+        items[tableType].tableCount += 1 + (mainTableReplicationCandidate.indexTables?.length ?? 0);
         if (XCLUSTER_TABLE_INELIGIBLE_STATUSES.includes(eligibilityDetails.status)) {
-          items[tableType].keyspaces[keyspaceId].tableEligibilityCount.ineligible += 1;
+          items[tableType].namespaces[namespaceUuid].tableEligibilityCount.ineligible += 1;
         } else if (
           eligibilityDetails.status === XClusterTableEligibility.ELIGIBLE_IN_CURRENT_CONFIG
         ) {
-          items[tableType].keyspaces[keyspaceId].tableEligibilityCount.eligibleInCurrentConfig += 1;
+          items[tableType].namespaces[
+            namespaceUuid
+          ].tableEligibilityCount.eligibleInCurrentConfig += 1;
         }
       }
       return items;
     },
     {
       [TableType.PGSQL_TABLE_TYPE]: {
-        keyspaces: {},
+        namespaces: {},
         tableCount: 0
       },
       [TableType.YQL_TABLE_TYPE]: {
-        keyspaces: {},
+        namespaces: {},
         tableCount: 0
       }
     }
   );
-}
-
-// Colocated parent tables have table.tablename in the following format:
-//   <uuid>.colocation.parent.tablename
-// We return colocation.parent.tablename for colocated parent tables and
-// table.tablename otherwise.
-const getTableNameIdentifier = (table: YBTable) =>
-  isColocatedParentTable(table)
-    ? table.tableName.slice(table.tableName.indexOf('.') + 1)
-    : table.tableName;
-
-// Comma is not a valid identifier:
-// https://www.postgresql.org/docs/9.2/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
-// https://cassandra.apache.org/doc/latest/cassandra/cql/definitions.html
-// Hence, by joining with commas, we avoid issues where the fields are unique individually
-// but result in a string that not unique.
-const getTableIdentifier = (table: YBTable): string =>
-  `${table.keySpace},${table.pgSchemaName},${getTableNameIdentifier(table)}`;
+};
 
 /**
- * A table is eligible for replication if all of the following holds true:
- * - There exists another table with same keyspace, table name, and schema name
- *   in target universe OR the user is selecting tables for a new xCluster config (YBA will do a backup/restore
- *   to handle it during xCluster config creation).
- * - The table is NOT part of another existing xCluster config between the same universes
- *   in the same direction.
+ * A table is eligible for replication if table is NOT part of another existing
+ * xCluster config between the same universes in the same direction.
  */
-function getXClusterTableEligibilityDetails(
+const getXClusterTableEligibilityDetails = (
   sourceTable: YBTable,
-  targetUniverseTables: YBTable[],
   sharedXClusterConfigs: XClusterConfig[],
   currentXClusterConfigUUID?: string
-): EligibilityDetails {
-  if (currentXClusterConfigUUID) {
-    // Adding a table to an existing xCluster config requires that there exists another table
-    // with same keyspace, table name, and schema name on the target universe.
-    const targetUniverseTableIds = new Set(
-      targetUniverseTables.map((table) => getTableIdentifier(table))
-    );
-    if (!targetUniverseTableIds.has(getTableIdentifier(sourceTable))) {
-      return { status: XClusterTableEligibility.INELIGIBLE_NO_MATCH };
-    }
-  }
-
+): EligibilityDetails => {
   for (const xClusterConfig of sharedXClusterConfigs) {
     const xClusterConfigTables = new Set(xClusterConfig.tables);
-    if (xClusterConfigTables.has(formatUuidForXCluster(sourceTable.tableUUID))) {
+    if (xClusterConfigTables.has(sourceTable.tableID)) {
       return {
         status:
           xClusterConfig.uuid === currentXClusterConfigUUID
@@ -768,37 +801,53 @@ function getXClusterTableEligibilityDetails(
   }
 
   return { status: XClusterTableEligibility.ELIGIBLE_UNUSED };
-}
+};
 
 /**
- * - YSQL keyspaces are unselectable if they contain at least one ineligible table or
+ * Return the list of namespace UUIDs which are untoggleable.
+ *
+ * Add Table
+ * - YSQL namespaces are untoggleable if they contain at least one ineligible table or
  *   no unused eligible table.
- * - YCQL keyspaces are unselectable if they contain no unused eligible table.
+ * - YCQL namespaces are untoggleable if they contain no unused eligible table.
+ *
+ * Edit Table
+ * - Always allow removing namespaces.
+ * - Allow selecing namespaces which do not contain ineligible tables.
  */
-function getUnselectableKeyspaces(
+const getUntoggleableNamespaceUuids = (
   xClusterConfigAction: XClusterConfigAction,
-  keyspaceItems: Record<string, KeyspaceItem>,
+  namespaceItems: NamespaceItem[],
+  initialNamespaces: string[],
+  selectedNamespaces: string[],
   tableType: XClusterTableType
-): string[] {
-  return Object.entries(keyspaceItems)
-    .filter(([_, keyspaceItem]) => {
+): string[] =>
+  namespaceItems
+    .filter((namespaceItem) => {
+      if (xClusterConfigAction === XClusterConfigAction.MANAGE_TABLE) {
+        // We want to allow removing a namespace with ineligible tables
+        // if they got into that state some how.
+        return !(
+          (initialNamespaces.includes(namespaceItem.uuid) &&
+            selectedNamespaces.includes(namespaceItem.uuid)) ||
+          namespaceItem.tableEligibilityCount.ineligible === 0
+        );
+      }
       switch (tableType) {
         case TableType.PGSQL_TABLE_TYPE:
           return (
-            keyspaceItem.tableEligibilityCount.ineligible > 0 ||
-            (xClusterConfigAction !== XClusterConfigAction.MANAGE_TABLE &&
-              keyspaceItem.tableEligibilityCount.eligibleInCurrentConfig ===
-                keyspaceItem.tables.length)
+            namespaceItem.tableEligibilityCount.ineligible > 0 ||
+            namespaceItem.tableEligibilityCount.eligibleInCurrentConfig ===
+              namespaceItem.tables.length
           );
         case TableType.YQL_TABLE_TYPE:
           return (
-            keyspaceItem.tableEligibilityCount.ineligible +
-              keyspaceItem.tableEligibilityCount.eligibleInCurrentConfig ===
-            keyspaceItem.tables.length
+            namespaceItem.tableEligibilityCount.ineligible +
+              namespaceItem.tableEligibilityCount.eligibleInCurrentConfig ===
+            namespaceItem.tables.length
           );
         default:
           return assertUnreachableCase(tableType);
       }
     })
-    .map(([keyspace, _]) => keyspace);
-}
+    .map((namespaceItem) => namespaceItem.uuid);

@@ -8,7 +8,7 @@ menu:
   stable:
     identifier: architecture-read-committed
     parent: architecture-acid-transactions
-    weight: 1153
+    weight: 50
 type: docs
 rightNav:
   hideH4: true
@@ -77,7 +77,7 @@ The validation steps are as follows:
   * On commit of any conflicting transaction, traverse the chain of updates, as described in validation step 1, and re-evaluate the latest version of the row for any conflict. If there is no conflict, insert the original row. Otherwise, perform the `DO UPDATE` part on the latest version of the row.
 * `ON CONFLICT DO NOTHING`: if a conflict occurs, do not do anything.
 
-Note that the preceding methodology in PostgreSQL can lead to two different visible semantics. One is the common case, and the other is a degenerate situation that can never be seen in practice, but is nevertheless possible and still upholds the semantics of Read Committed isolation. The common case is as follows:
+Note that the preceding methodology in PostgreSQL can lead to two different visible semantics. One is the common case; the other is a degenerate situation that can never be seen in practice, but is nevertheless possible and still upholds the semantics of Read Committed isolation. The common case is as follows:
 
 ```sql
 CREATE TABLE test (k int primary key, v int);
@@ -1583,7 +1583,7 @@ Adding this new isolation level does not affect the performance of existing isol
 
 ### Performance tuning
 
-If a statement in the Read Committed isolation level faces a conflict, it is retried with exponential backoff until the statement times out. The following parameters control the backoff:
+If a statement in the Read Committed isolation level faces a conflict, it is retried. If using [Fail-on-Conflict](../concurrency-control/#fail-on-conflict) concurrency control mode, the retries are done with exponential backoff until the statement times out or the `yb_max_query_layer_retries` are exhausted, whichever happens first. The following parameters control the backoff:
 
 * `retry_max_backoff` is the maximum backoff in milliseconds between retries.
 * `retry_min_backoff` is the minimum backoff in milliseconds between retries.

@@ -16,11 +16,11 @@ import { FlexContainer, FlexShrink } from '../../common/flexbox/YBFlexBox';
 import { YBPanelItem } from '../../panels';
 
 import { StorageConfigDeleteModal } from './StorageConfigDeleteModal';
-import {
-  RbacValidator,
-  hasNecessaryPerm
-} from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
+import { RbacValidator, hasNecessaryPerm } from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { userhavePermInRoleBindings } from '../../../redesign/features/rbac/common/RbacUtils';
+import { Action, Resource } from '../../../redesign/features/rbac';
+
 
 /**
  * This method is used to return the current in-use status
@@ -54,10 +54,7 @@ const header = (currTab, onCreateBackup) => (
     <FlexContainer className="pull-right">
       <FlexShrink>
         <RbacValidator
-          accessRequiredOn={{
-            onResource: 'CUSTOMER_ID',
-            ...UserPermissionMap.createStorageConfiguration
-          }}
+          accessRequiredOn={ApiPermissionMap.CREATE_CUSTOMER_CONFIG}
           isControl
         >
           <Button bsClass="btn btn-orange btn-config" onClick={onCreateBackup}>
@@ -100,10 +97,7 @@ export const BackupList = (props) => {
           pullRight
         >
           <RbacValidator
-            accessRequiredOn={{
-              onResource: 'CUSTOMER_ID',
-              ...UserPermissionMap.editStorageConfiguration
-            }}
+            accessRequiredOn={ApiPermissionMap.EDIT_CUSTOMER_CONFIG}
             isControl
             overrideStyle={{ display: 'block' }}
           >
@@ -118,33 +112,20 @@ export const BackupList = (props) => {
           </RbacValidator>
           <MenuItem
             onClick={(e) => {
-              if (
-                !hasNecessaryPerm({
-                  onResource: 'CUSTOMER_ID',
-                  ...UserPermissionMap.listBackup
-                })
-              ) {
+              if (!hasNecessaryPerm(ApiPermissionMap.GET_BACKUP)) {
                 return;
               }
               e.stopPropagation();
               setShowAssociatedBackups(true);
               setConfigData({ configUUID, configName });
             }}
-            disabled={
-              !hasNecessaryPerm({
-                onResource: 'CUSTOMER_ID',
-                ...UserPermissionMap.listBackup
-              })
-            }
+            disabled={!hasNecessaryPerm(ApiPermissionMap.GET_BACKUP)}
             data-testid={`${currTab}-BackupList-ShowAssociatedBackups`}
           >
             Show associated backups
           </MenuItem>
           <RbacValidator
-            accessRequiredOn={{
-              onResource: 'CUSTOMER_ID',
-              ...UserPermissionMap.deleteStorageConfiguration
-            }}
+            accessRequiredOn={ApiPermissionMap.DELETE_CUSTOMER_CONFIG}
             isControl
             overrideStyle={{ display: 'block' }}
           >
@@ -179,16 +160,22 @@ export const BackupList = (props) => {
               deleteStorageConfig(configData);
             }}
           />
-          <MenuItem
-            onClick={() => {
-              setConfigData(configName);
-              setUniverseDetails([...universeDetails]);
-              setIsUniverseVisible(true);
-            }}
-            data-testid={`${currTab}-BackupList-ShowUniverses`}
+          <RbacValidator
+            customValidateFunction={() => userhavePermInRoleBindings(Resource.UNIVERSE, Action.READ)}
+            isControl
+            overrideStyle={{ display: 'block' }}
           >
-            Show Universes
-          </MenuItem>
+            <MenuItem
+              onClick={() => {
+                setConfigData(configName);
+                setUniverseDetails([...universeDetails]);
+                setIsUniverseVisible(true);
+              }}
+              data-testid={`${currTab}-BackupList-ShowUniverses`}
+            >
+              Show Universes
+            </MenuItem>
+          </RbacValidator>
         </DropdownButton>
       </>
     );

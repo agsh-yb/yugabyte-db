@@ -66,6 +66,7 @@ bool		log_lock_waits = false;
 int			RetryMaxBackoffMsecs;
 int			RetryMinBackoffMsecs;
 double		RetryBackoffMultiplier;
+int yb_max_query_layer_retries;
 
 /* Pointer to this process's PGPROC and PGXACT structs, if any */
 PGPROC	   *MyProc = NULL;
@@ -84,6 +85,7 @@ NON_EXEC_STATIC slock_t *ProcStructLock = NULL;
 PROC_HDR   *ProcGlobal = NULL;
 NON_EXEC_STATIC PGPROC *AuxiliaryProcs = NULL;
 PGPROC	   *PreparedXactProcs = NULL;
+PGPROC	   *KilledProcToClean = NULL;
 int *yb_too_many_conn = NULL;
 
 /* If we are waiting for a lock, this points to the associated LOCALLOCK */
@@ -235,6 +237,7 @@ InitProcGlobal(void)
 			procs[i].sem = PGSemaphoreCreate();
 			InitSharedLatch(&(procs[i].procLatch));
 			LWLockInitialize(&(procs[i].backendLock), LWTRANCHE_PROC);
+			LWLockInitialize(&(procs[i].yb_ash_metadata_lock), LWTRANCHE_YB_ASH_METADATA);
 		}
 		procs[i].pgprocno = i;
 
@@ -375,6 +378,15 @@ InitProcess(void)
 		MarkPostmasterChildActive();
 
 	/*
+	* If the process is killed before this point, it does not have a pid set.
+	* The postmaster will not be able to identify the corresponding MyProc, so
+	* it will restart anyways.
+	*/
+	MyProc->ybInitializationCompleted = false;
+	MyProc->ybTerminationStarted = false;
+	MyProc->ybEnteredCriticalSection = false;
+
+	/*
 	 * Initialize all fields of MyProc, except for those previously
 	 * initialized by InitProcGlobal.
 	 */
@@ -437,7 +449,17 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PGPROCNO);
 
-	MyProc->ybAnyLockAcquired = false;
+	MyProc->ybLWLockAcquired = false;
+	MyProc->ybSpinLocksAcquired = 0;
+
+	MemSet(MyProc->yb_ash_metadata.root_request_id, 0,
+		   sizeof(MyProc->yb_ash_metadata.root_request_id));
+	MyProc->yb_ash_metadata.query_id = 0;
+	MemSet(MyProc->yb_ash_metadata.client_addr, 0,
+		   sizeof(MyProc->yb_ash_metadata.client_addr));
+	MyProc->yb_ash_metadata.client_port = 0;
+	MyProc->yb_ash_metadata.addr_family = AF_UNSPEC;
+	MyProc->yb_is_ash_metadata_set = false;
 
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
@@ -582,6 +604,7 @@ InitAuxiliaryProcess(void)
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
+	MyProc->yb_is_ash_metadata_set = false;
 #ifdef USE_ASSERT_CHECKING
 	{
 		int			i;
@@ -820,6 +843,8 @@ ProcKill(int code, Datum arg)
 	PGPROC	   *proc;
 
 	Assert(MyProc != NULL);
+
+	MyProc->ybTerminationStarted = true;
 
 	/* Make sure we're out of the sync rep lists */
 	SyncRepCleanupAtProcExit(MyProc);

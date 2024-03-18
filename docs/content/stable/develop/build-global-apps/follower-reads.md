@@ -2,7 +2,7 @@
 title: Follower Reads for global applications
 headerTitle: Follower reads
 linkTitle: Follower reads
-description: Reducing Read Latency for global applications
+description: Reduce read latency using Follower reads
 headcontent: Reduce read latency for global applications
 menu:
   stable:
@@ -53,14 +53,16 @@ In this scenario, the read latency for the application in `us-west` drops drasti
 
 As replicas may not be up-to-date (by design), this might return slightly stale data (the default staleness is 30 seconds). This is the case even if the read goes to a leader.
 
-You can change the staleness value using the following setting:
+You can change the staleness value using the following configuration parameter:
 
 ```plpgsql
 SET yb_follower_read_staleness_ms = 10000; -- 10s
 ```
 
+Although the default is recommended, you can set the staleness to a shorter value. The tradeoff is the shorter the staleness, the more likely some reads may be redirected to the leader if the follower isn't sufficiently caught up. You shouldn't set `yb_follower_read_staleness_ms` to less than 2x the [raft_heartbeat_interval_ms](../../../reference/configuration/yb-tserver/#raft-heartbeat-interval-ms) (which by default is 500 ms).
+
 {{<note>}}
-This is only for reads. All writes still go to the leader.
+Follower reads only affect reads. All writes are still handled by the leader.
 {{</note>}}
 
 ## Failover

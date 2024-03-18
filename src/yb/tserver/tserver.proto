@@ -89,6 +89,8 @@ message WriteRequestPB {
   optional int64 leader_term = 21;
 
   optional uint64 start_time_micros = 22;
+
+  optional AshMetadataPB ash_metadata = 23;
 }
 
 message WriteResponsePB {
@@ -224,6 +226,10 @@ message ReadRequestPB {
   optional double rejection_score = 13;
 
   optional uint64 batch_idx = 14;
+
+  optional uint64 start_time_micros = 16;
+
+  optional AshMetadataPB ash_metadata = 17;
 }
 
 message ReadResponsePB {
@@ -347,4 +353,30 @@ message GetCompatibleSchemaVersionRequestPB {
 message GetCompatibleSchemaVersionResponsePB {
   optional TabletServerErrorPB error = 1;
   optional uint32 compatible_schema_version = 2;
+}
+
+message CheckTserverTabletHealthRequestPB {
+  repeated bytes tablet_ids = 1;
+}
+
+message CheckTserverTabletHealthResponsePB {
+  message TabletHealthPB {
+    optional bytes tablet_id = 1;
+    optional PeerRole role = 2;
+    // Only valid if role is not LEADER.
+    optional int64 follower_lag_ms = 3;
+  }
+  optional TabletServerErrorPB error = 1;
+  repeated TabletHealthPB tablet_healths = 2;
+}
+
+message ClearAllMetaCachesOnServerRequestPB {}
+
+message ClearAllMetaCachesOnServerResponsePB {}
+
+message ClearUniverseUuidRequestPB {
+}
+
+message ClearUniverseUuidResponsePB {
+  optional TabletServerErrorPB error = 1;
 }

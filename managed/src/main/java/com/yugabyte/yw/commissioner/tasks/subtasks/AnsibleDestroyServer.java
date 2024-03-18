@@ -27,9 +27,8 @@ import lombok.extern.slf4j.Slf4j;
 public class AnsibleDestroyServer extends NodeTaskBase {
 
   @Inject
-  protected AnsibleDestroyServer(
-      BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected AnsibleDestroyServer(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -41,6 +40,8 @@ public class AnsibleDestroyServer extends NodeTaskBase {
     public boolean deleteRootVolumes = false;
     // IP of node to be deleted.
     public String nodeIP = null;
+    // Flag, indicating OpenTelemetry Collector is installed on the DB node.
+    public boolean otelCollectorInstalled = false;
   }
 
   @Override
@@ -71,6 +72,8 @@ public class AnsibleDestroyServer extends NodeTaskBase {
 
   @Override
   public void run() {
+    boolean cleanupFailed = false;
+
     // Execute the ansible command.
     try {
       getNodeManager()
@@ -80,6 +83,7 @@ public class AnsibleDestroyServer extends NodeTaskBase {
       if (!taskParams().isForceDelete) {
         throw e;
       } else {
+        cleanupFailed = true;
         log.debug(
             "Ignoring error deleting instance {} due to isForceDelete being set.",
             taskParams().nodeName,
@@ -131,13 +135,20 @@ public class AnsibleDestroyServer extends NodeTaskBase {
       // Free up the node.
       try {
         NodeInstance providerNode = NodeInstance.getByName(taskParams().nodeName);
-        providerNode.clearNodeDetails();
+        if (cleanupFailed) {
+          log.info(
+              "Failed to clean node instance {}. Setting to decommissioned state",
+              taskParams().nodeName);
+          providerNode.setToFailedCleanup(u, univNodeDetails);
+        } else {
+          providerNode.clearNodeDetails();
+          log.info("Marked node instance {} as available", taskParams().nodeName);
+        }
       } catch (Exception e) {
         if (!taskParams().isForceDelete) {
           throw e;
         }
       }
-      log.info("Marked node instance {} as available", taskParams().nodeName);
     }
 
     if (taskParams().deleteNode) {

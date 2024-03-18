@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Map;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import play.libs.Json;
 
 @Slf4j
@@ -46,7 +46,7 @@ public class BackupTable extends AbstractTaskBase {
     if (taskParams().backupUuid != null) {
       backup = Backup.get(taskParams().customerUuid, taskParams().backupUuid);
     } else {
-      List<Backup> backups = Backup.fetchAllBackupsByTaskUUID(userTaskUUID);
+      List<Backup> backups = Backup.fetchAllBackupsByTaskUUID(getUserTaskUUID());
       if (backups.size() == 1) {
         backup = backups.get(0);
       } else {

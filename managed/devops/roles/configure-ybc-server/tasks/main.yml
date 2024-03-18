@@ -4,6 +4,10 @@
       - systemd_option is defined
       - _mount_points is defined
 
+- set_fact:
+    server_gflags: {}
+  tags: ybc-install
+
 - name: Download ybc package
   include: download-ybc-package.yml
   become: yes
@@ -59,22 +63,33 @@
     tags:
       - ybc-install
 
-  - name: Remove existing ybc conf file
+  - name: Setup | Create ybc config directory
     file:
-      path: "{{ ybc_conf_file }}"
-      state: absent
+      path: "{{ ybc_conf_dir }}"
+      state: directory
+      mode: 0755
+      owner: "{{ user_name }}"
+      group: "{{ user_name }}"
     tags:
-      - override_ybc_gflags
       - ybc-install
+
+  - name: Configure | Create ybc gflags
+    set_fact:
+      server_gflags: "{{ server_gflags | combine (ybc_flags | default({})) }}"
+    tags:
+      - ybc-install
+      - override_ybc_gflags
     when: ybc_flags is defined
 
-  - name: Configure | Set ybc flags
-    lineinfile:
+  # This overwrites the existing file at once.
+  - name: Configure | Copy ybc gflags conf file
+    template:
+      src: "roles/configure-cluster-server/templates/yb-server-gflags.conf.j2"
       dest: "{{ ybc_conf_file }}"
-      regexp: "^--{{ item.key }}=(.*)"
-      line: "--{{item.key}}={{item.value}}"
-      create: yes
-    with_dict: "{{ ybc_flags }}"
+      force: yes
+      mode: 0644
+      owner: "{{ user_name }}"
+      group: "{{ user_name }}"
     tags:
       - ybc-install
       - override_ybc_gflags
@@ -129,8 +144,8 @@
 
   - name: Determine system or user scope
     stat:
-      path: /etc/systemd/system/yb-controller.service
-    register: systemd_system
+      path: "{{ yb_home_dir | default('/home/yugabyte') }}/.config/systemd/user/yb-controller.service"
+    register: user_systemd
 
   - name: User mode systemd
     block:
@@ -170,7 +185,7 @@
         state: started
         enabled: yes
         scope: user
-    when: not systemd_system.stat.exists
+    when: user_systemd.stat.exists
 
   - name: System systemd units
     block:
@@ -194,7 +209,7 @@
     - name: Run yb-controller.service to start the yb-controller
       shell:
         cmd: "sudo systemctl start yb-controller"
-    when: systemd_system.stat.exists
+    when: not user_systemd.stat.exists
 
   tags:
     - systemd_upgrade

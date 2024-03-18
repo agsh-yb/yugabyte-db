@@ -5,7 +5,6 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.ShellResponse;
-import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.helpers.NodeConfigValidator;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -17,18 +16,13 @@ public class PreflightNodeCheck extends NodeTaskBase {
 
   @Inject
   protected PreflightNodeCheck(
-      BaseTaskDependencies baseTaskDependencies,
-      NodeManager nodeManager,
-      NodeConfigValidator nodeConfigValidator) {
-    super(baseTaskDependencies, nodeManager);
+      BaseTaskDependencies baseTaskDependencies, NodeConfigValidator nodeConfigValidator) {
+    super(baseTaskDependencies);
     this.nodeConfigValidator = nodeConfigValidator;
   }
 
   // Parameters for precheck task.
-  public static class Params extends NodeTaskParams {
-    // Whether nodes should remain reserved or not.
-    public boolean reserveNodes = true;
-  }
+  public static class Params extends NodeTaskParams {}
 
   @Override
   protected Params taskParams() {
@@ -42,15 +36,15 @@ public class PreflightNodeCheck extends NodeTaskBase {
         getNodeManager().nodeCommand(NodeManager.NodeCommandType.Precheck, taskParams());
     try {
       PrecheckNodeDetached.processPreflightResponse(
-          nodeConfigValidator, taskParams().getProvider(), taskParams().nodeUuid, false, response);
+          nodeConfigValidator,
+          taskParams().getProvider(),
+          taskParams().nodeUuid,
+          taskParams().getNodeName(),
+          false,
+          response);
     } catch (RuntimeException e) {
       log.error(
           "Failed preflight checks for node {}:\n{}", taskParams().nodeName, response.message);
-      // TODO this may not be applicable now.
-      if (!taskParams().reserveNodes) {
-        NodeInstance node = NodeInstance.getByName(taskParams().nodeName);
-        node.clearNodeDetails();
-      }
       throw e;
     }
   }

@@ -10,8 +10,11 @@ import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.XClusterUniverseService;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.common.gflags.GFlagsValidation;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
@@ -23,12 +26,15 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import play.mvc.Http;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonDeserialize(converter = GFlagsUpgradeParams.Converter.class)
 @Slf4j
 public class GFlagsUpgradeParams extends UpgradeWithGFlags {
+
+  protected RuntimeConfGetter runtimeConfGetter;
 
   @Override
   public boolean isKubernetesUpgradeSupported() {
@@ -38,13 +44,26 @@ public class GFlagsUpgradeParams extends UpgradeWithGFlags {
   @Override
   public void verifyParams(Universe universe, boolean isFirstTry) {
     super.verifyParams(universe, isFirstTry);
+
+    runtimeConfGetter = StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+
+    if (!universe.getUniverseDetails().softwareUpgradeState.equals(SoftwareUpgradeState.Ready)
+        && !runtimeConfGetter.getConfForScope(
+            universe, UniverseConfKeys.allowGFlagsOverrideDuringPreFinalize)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          "Cannot upgrade gflags on universe in state "
+              + universe.getUniverseDetails().softwareUpgradeState);
+    }
     if (masterGFlags == null) {
       masterGFlags = new HashMap<>();
     }
     if (tserverGFlags == null) {
       tserverGFlags = new HashMap<>();
     }
-    verifyGFlags(universe, isFirstTry);
+    if (!verifyGFlagsHasChanges(universe) && isFirstTry) {
+      throw new PlatformServiceException(Http.Status.BAD_REQUEST, SPECIFIC_GFLAGS_NO_CHANGES_ERROR);
+    }
   }
 
   public void checkXClusterAutoFlags(

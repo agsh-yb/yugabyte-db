@@ -637,6 +637,16 @@ _outBitmapHeapScan(StringInfo str, const BitmapHeapScan *node)
 }
 
 static void
+_outYbBitmapTableScan(StringInfo str, const YbBitmapTableScan *node)
+{
+	WRITE_NODE_TYPE("YBBITMAPTABLESCAN");
+
+	_outScanInfo(str, (const Scan *) node);
+
+	WRITE_NODE_FIELD(bitmapqualorig);
+}
+
+static void
 _outTidScan(StringInfo str, const TidScan *node)
 {
 	WRITE_NODE_TYPE("TIDSCAN");
@@ -793,6 +803,31 @@ _outYbBatchedNestLoop(StringInfo str, const YbBatchedNestLoop *node)
 		appendStringInfoString(str, " ");
 		outNode(str, node->hashClauseInfos[i].outerParamExpr);
 	}
+
+	appendStringInfoString(str, " :orig_expr");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+	{
+		appendStringInfoString(str, " ");
+		outNode(str, node->hashClauseInfos[i].orig_expr);
+	}
+
+	WRITE_INT_FIELD(numSortCols);
+
+	appendStringInfoString(str, " :sortColIdx");
+	for (int i = 0; i < node->numSortCols; i++)
+		appendStringInfo(str, " %d", node->sortColIdx[i]);
+
+	appendStringInfoString(str, " :sortOperators");
+	for (int i = 0; i < node->numSortCols; i++)
+		appendStringInfo(str, " %u", node->sortOperators[i]);
+
+	appendStringInfoString(str, " :collations");
+	for (int i = 0; i < node->numSortCols; i++)
+		appendStringInfo(str, " %u", node->collations[i]);
+
+	appendStringInfoString(str, " :nullsFirst");
+	for (int i = 0; i < node->numSortCols; i++)
+		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
 }
 
 static void
@@ -1927,6 +1962,16 @@ static void
 _outBitmapHeapPath(StringInfo str, const BitmapHeapPath *node)
 {
 	WRITE_NODE_TYPE("BITMAPHEAPPATH");
+
+	_outPathInfo(str, (const Path *) node);
+
+	WRITE_NODE_FIELD(bitmapqual);
+}
+
+static void
+_outYbBitmapTablePath(StringInfo str, const YbBitmapTablePath *node)
+{
+	WRITE_NODE_TYPE("YBBITMAPTABLEPATH");
 
 	_outPathInfo(str, (const Path *) node);
 
@@ -3774,9 +3819,9 @@ _outYbExprColrefDesc(StringInfo str, const YbExprColrefDesc *node)
 	WRITE_NODE_TYPE("YBEXPRCOLREFDESC");
 
 	WRITE_INT_FIELD(attno);
-	WRITE_INT_FIELD(typid);
+	WRITE_OID_FIELD(typid);
 	WRITE_INT_FIELD(typmod);
-	WRITE_INT_FIELD(collid);
+	WRITE_OID_FIELD(collid);
 }
 
 /*
@@ -3865,6 +3910,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_BitmapHeapScan:
 				_outBitmapHeapScan(str, obj);
+				break;
+			case T_YbBitmapTableScan:
+				_outYbBitmapTableScan(str, obj);
 				break;
 			case T_TidScan:
 				_outTidScan(str, obj);
@@ -4126,6 +4174,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_BitmapHeapPath:
 				_outBitmapHeapPath(str, obj);
+				break;
+			case T_YbBitmapTablePath:
+				_outYbBitmapTablePath(str, obj);
 				break;
 			case T_BitmapAndPath:
 				_outBitmapAndPath(str, obj);

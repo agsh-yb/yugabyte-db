@@ -258,6 +258,32 @@ Status MiniCluster::StartAsync(
     }
   }
 
+  if (UseYbController()) {
+    // We need 1 yb controller server for each tserver.
+    // YB Controller uses the same IP as corresponding tserver.
+    yb_controllers_.reserve(options_.num_tablet_servers);
+    // All YB Controller servers need to be on the same port.
+    const auto server_port = port_picker_.AllocateFreePort();
+    for (size_t i = 0; i < options_.num_tablet_servers; ++i) {
+      const auto yb_controller_log_dir = JoinPathSegments(GetYbControllerServerFsRoot(i), "logs");
+      const auto yb_controller_tmp_dir = JoinPathSegments(GetYbControllerServerFsRoot(i), "tmp");
+      RETURN_NOT_OK(Env::Default()->CreateDirs(yb_controller_log_dir));
+      RETURN_NOT_OK(Env::Default()->CreateDirs(yb_controller_tmp_dir));
+      const auto server_address = mini_tablet_servers_[i]->bound_http_addr().address().to_string();
+      scoped_refptr<ExternalYbController> yb_controller = new ExternalYbController(
+          yb_controller_log_dir, yb_controller_tmp_dir, server_address, GetToolPath("yb-admin"),
+          GetToolPath("../../../bin", "yb-ctl"), GetToolPath("../../../bin", "ycqlsh"),
+          GetPgToolPath("ysql_dump"), GetPgToolPath("ysql_dumpall"), GetPgToolPath("ysqlsh"),
+          server_port, master_web_ports_[0], tserver_web_ports_[i], server_address,
+          GetYbcToolPath("yb-controller-server"), /*extra_flags*/ {});
+
+      RETURN_NOT_OK_PREPEND(
+          yb_controller->Start(),
+          "Failed to start YB Controller at index " + std::to_string(i + 1));
+      yb_controllers_.push_back(yb_controller);
+    }
+  }
+
   running_ = true;
   return Status::OK();
 }
@@ -326,6 +352,14 @@ Status MiniCluster::RestartSync() {
     LOG(INFO) << "Waiting for catalog manager at " << master_server->permanent_uuid();
     CHECK_OK(master_server->WaitForCatalogManagerInit());
   }
+
+  if (UseYbController()) {
+    LOG(INFO) << "Restart YB Controller server(s)...";
+    for (const auto& yb_controller : yb_controllers_) {
+      CHECK_OK(yb_controller->Restart());
+    }
+  }
+
   LOG(INFO) << string(80, '-');
   LOG(INFO) << __FUNCTION__ << " done";
   LOG(INFO) << string(80, '-');
@@ -373,7 +407,9 @@ Status MiniCluster::AddTabletServer(const tserver::TabletServerOptions& extra_op
   if (options_.ts_env) {
     tablet_server->options()->env = options_.ts_env;
   }
+
   RETURN_NOT_OK(tablet_server->Start(tserver::WaitTabletsBootstrapped::kFalse));
+
   mini_tablet_servers_.push_back(tablet_server);
   return Status::OK();
 }
@@ -575,6 +611,11 @@ void MiniCluster::Shutdown() {
   }
   mini_masters_.clear();
 
+  for (const auto& yb_controller : yb_controllers_) {
+    yb_controller->Shutdown();
+  }
+  yb_controllers_.clear();
+
   running_ = false;
 }
 
@@ -636,6 +677,10 @@ string MiniCluster::GetMasterFsRoot(size_t idx) {
 
 string MiniCluster::GetTabletServerFsRoot(size_t idx) {
   return JoinPathSegments(fs_root_, Substitute("ts-$0-root", idx + 1));
+}
+
+string MiniCluster::GetYbControllerServerFsRoot(size_t idx) {
+  return JoinPathSegments(fs_root_, Substitute("ybc-$0-root", idx + 1));
 }
 
 string MiniCluster::GetTabletServerDrive(size_t idx, int drive_index) {
@@ -1074,7 +1119,7 @@ Result<std::vector<tablet::TabletPeerPtr>> WaitForTableActiveTabletLeadersPeers(
 }
 
 Status WaitUntilTabletHasLeader(
-    MiniCluster* cluster, const string& tablet_id, MonoTime deadline) {
+    MiniCluster* cluster, const TabletId& tablet_id, CoarseTimePoint deadline) {
   return Wait(
       [cluster, &tablet_id] {
         auto tablet_peers = ListTabletPeers(cluster, [&tablet_id](auto peer) {
@@ -1085,6 +1130,19 @@ Status WaitUntilTabletHasLeader(
         return tablet_peers.size() == 1;
       },
       deadline, "Waiting for election in tablet " + tablet_id);
+}
+
+Status WaitForTableLeaders(
+    MiniCluster* cluster, const TableId& table_id, CoarseTimePoint deadline) {
+  for (const auto& tablet_id : ListTabletIdsForTable(cluster, table_id)) {
+    RETURN_NOT_OK(WaitUntilTabletHasLeader(cluster, tablet_id, deadline));
+  }
+  return Status::OK();
+}
+
+Status WaitForTableLeaders(
+    MiniCluster* cluster, const TableId& table_id, CoarseDuration timeout) {
+  return WaitForTableLeaders(cluster, table_id, CoarseMonoClock::Now() + timeout);
 }
 
 Status WaitUntilMasterHasLeader(MiniCluster* cluster, MonoDelta timeout) {
@@ -1110,18 +1168,25 @@ Status WaitForLeaderOfSingleTablet(
 
 Status StepDown(
     tablet::TabletPeerPtr leader, const std::string& new_leader_uuid,
-    ForceStepDown force_step_down) {
+    ForceStepDown force_step_down, MonoDelta timeout) {
   consensus::LeaderStepDownRequestPB req;
   req.set_tablet_id(leader->tablet_id());
   req.set_new_leader_uuid(new_leader_uuid);
   if (force_step_down) {
     req.set_force_step_down(true);
   }
-  consensus::LeaderStepDownResponsePB resp;
-  RETURN_NOT_OK(VERIFY_RESULT(leader->GetConsensus())->StepDown(&req, &resp));
-  if (resp.has_error()) {
-    return STATUS_FORMAT(RuntimeError, "Step down failed: $0", resp);
-  }
+  return WaitFor([&]() -> Result<bool> {
+    consensus::LeaderStepDownResponsePB resp;
+    RETURN_NOT_OK(VERIFY_RESULT(leader->GetConsensus())->StepDown(&req, &resp));
+    if (resp.has_error()) {
+      if (resp.error().code() == tserver::TabletServerErrorPB::LEADER_NOT_READY_TO_STEP_DOWN) {
+        LOG(INFO) << "Leader not ready to step down";
+        return false;
+      }
+      return STATUS_FORMAT(RuntimeError, "Step down failed: $0", resp);
+    }
+    return true;
+  }, timeout, Format("Waiting for step down to $0", new_leader_uuid));
   return Status::OK();
 }
 
@@ -1256,11 +1321,11 @@ size_t CountIntents(MiniCluster* cluster, const TabletPeerFilter& filter) {
     }
     // TEST_CountIntent return non ok status also means shutdown has started.
     auto intents_count_result = participant->TEST_CountIntents();
-    if (intents_count_result.ok() && intents_count_result->first) {
-      result += intents_count_result->first;
+    if (intents_count_result.ok() && intents_count_result->num_intents) {
+      result += intents_count_result->num_intents;
       LOG(INFO) << Format("T $0 P $1: Intents present: $2, transactions: $3", peer->tablet_id(),
-                          peer->permanent_uuid(), intents_count_result->first,
-                          intents_count_result->second);
+                          peer->permanent_uuid(), intents_count_result->num_intents,
+                          intents_count_result->num_transactions);
     }
   }
   return result;
@@ -1402,6 +1467,10 @@ Status WaitAllReplicasSynchronizedWithLeader(
         Format("Wait T $0 P $1 commit $2", peer->tablet_id(), peer->permanent_uuid(), it->second)));
   }
   return Status::OK();
+}
+
+Status WaitAllReplicasSynchronizedWithLeader(MiniCluster* cluster, CoarseDuration timeout) {
+  return WaitAllReplicasSynchronizedWithLeader(cluster, CoarseMonoClock::Now() + timeout);
 }
 
 Status WaitForAnySstFiles(tablet::TabletPeerPtr peer, MonoDelta timeout) {

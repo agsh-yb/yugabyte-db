@@ -13,8 +13,11 @@ import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.TaskExecutor.TaskCache;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.ImageBundleUtil;
 import com.yugabyte.yw.common.NodeManager;
+import com.yugabyte.yw.common.NodeUIApiHelper;
 import com.yugabyte.yw.common.PlatformExecutorFactory;
+import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.RestoreManagerYb;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.TableManager;
@@ -34,6 +37,9 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import play.Application;
@@ -51,10 +57,10 @@ public abstract class AbstractTaskBase implements ITask {
   protected ITaskParams taskParams;
 
   // The UUID of this task.
-  protected UUID taskUUID;
+  private UUID taskUUID;
 
   // The UUID of the top-level user-facing task at the top of Task tree. Eg. CreateUniverse, etc.
-  protected UUID userTaskUUID;
+  private UUID userTaskUUID;
 
   // A field used to send additional information with prometheus metric associated with this task
   public String taskInfo = "";
@@ -73,10 +79,14 @@ public abstract class AbstractTaskBase implements ITask {
   protected final TableManagerYb tableManagerYb;
   private final PlatformExecutorFactory platformExecutorFactory;
   private final TaskExecutor taskExecutor;
+  private final Commissioner commissioner;
   protected final HealthChecker healthChecker;
   protected final NodeManager nodeManager;
   protected final BackupHelper backupHelper;
   protected final AutoFlagUtil autoFlagUtil;
+  protected final NodeUIApiHelper nodeUIApiHelper;
+  protected final ImageBundleUtil imageBundleUtil;
+  protected final ReleaseManager releaseManager;
 
   @Inject
   protected AbstractTaskBase(BaseTaskDependencies baseTaskDependencies) {
@@ -94,10 +104,14 @@ public abstract class AbstractTaskBase implements ITask {
     this.tableManagerYb = baseTaskDependencies.getTableManagerYb();
     this.platformExecutorFactory = baseTaskDependencies.getExecutorFactory();
     this.taskExecutor = baseTaskDependencies.getTaskExecutor();
+    this.commissioner = baseTaskDependencies.getCommissioner();
     this.healthChecker = baseTaskDependencies.getHealthChecker();
     this.nodeManager = baseTaskDependencies.getNodeManager();
     this.backupHelper = baseTaskDependencies.getBackupHelper();
     this.autoFlagUtil = baseTaskDependencies.getAutoFlagUtil();
+    this.nodeUIApiHelper = baseTaskDependencies.getNodeUIApiHelper();
+    this.imageBundleUtil = baseTaskDependencies.getImageBundleUtil();
+    this.releaseManager = baseTaskDependencies.getReleaseManager();
   }
 
   protected ITaskParams taskParams() {
@@ -200,6 +214,10 @@ public abstract class AbstractTaskBase implements ITask {
     return taskExecutor;
   }
 
+  protected Commissioner getCommissioner() {
+    return commissioner;
+  }
+
   // Returns the RunnableTask instance to which SubTaskGroup instances can be added and run.
   protected RunnableTask getRunnableTask() {
     return getTaskExecutor().getRunnableTask(userTaskUUID);
@@ -241,6 +259,39 @@ public abstract class AbstractTaskBase implements ITask {
   // signal is received. It can be a replacement for Thread.sleep in subtasks.
   protected void waitFor(Duration duration) {
     getRunnableTask().waitFor(duration);
+  }
+
+  protected boolean doWithExponentialTimeout(
+      long initialDelayMs, long maxDelayMs, long totalDelayMs, Supplier<Boolean> funct) {
+    AtomicInteger iteration = new AtomicInteger();
+    return doWithModifyingTimeout(
+        (prevDelay) ->
+            Util.getExponentialBackoffDelayMs(
+                initialDelayMs, maxDelayMs, iteration.getAndIncrement()),
+        totalDelayMs,
+        funct);
+  }
+
+  protected boolean doWithModifyingTimeout(
+      Function<Long, Long> delayFunct, long totalDelayMs, Supplier<Boolean> funct) {
+    long currentDelayMs = 0;
+    long startTime = System.currentTimeMillis();
+    do {
+      if (funct.get()) {
+        return true;
+      }
+      currentDelayMs = delayFunct.apply(currentDelayMs);
+      log.debug(
+          "Waiting for {} ms between retries, total delay remaining {} ms",
+          currentDelayMs,
+          (startTime + totalDelayMs - System.currentTimeMillis()));
+      waitFor(Duration.ofMillis(currentDelayMs));
+    } while (System.currentTimeMillis() < startTime + totalDelayMs);
+    return false;
+  }
+
+  protected boolean doWithConstTimeout(long delayMs, long totalDelayMs, Supplier<Boolean> funct) {
+    return doWithModifyingTimeout((prevDelay) -> delayMs, totalDelayMs, funct);
   }
 
   protected UUID getUserTaskUUID() {

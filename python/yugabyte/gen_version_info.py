@@ -34,17 +34,18 @@
 # This script generates a header file which contains definitions
 # for the current YugaByte build (e.g. timestamp, git hash, etc)
 
+import argparse
 import json
 import logging
-import argparse
 import os
-import re
+import platform
 import pwd
+import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
-import socket
 
 from typing import Optional
 
@@ -55,6 +56,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 
 from yugabyte.common_util import get_yb_src_root_from_build_root  # noqa
+from yugabyte import git_util  # noqa
 
 
 def is_git_repo_clean(git_repo_dir: str) -> bool:
@@ -68,13 +70,19 @@ def boolean_to_json_str(bool_flag: bool) -> str:
     return str(bool_flag).lower()
 
 
+def get_glibc_version() -> str:
+    glibc_v = subprocess.check_output('ldd --version', shell=True).decode('utf-8').strip()
+    # We only want the version
+    return glibc_v.split("\n")[0].split()[-1]
+
+
 def get_git_sha1(git_repo_dir: str) -> Optional[str]:
     try:
         sha1 = subprocess.check_output(
             'cd {} && git rev-parse HEAD'.format(shlex.quote(git_repo_dir)), shell=True
         ).decode('utf-8').strip()
 
-        if re.match(r'^[0-9a-f]{40}$', sha1):
+        if git_util.SHA1_RE.match(sha1):
             return sha1
         logging.warning("Invalid git SHA1 in directory '%s': %s", git_repo_dir, sha1)
         return None
@@ -158,6 +166,10 @@ def main() -> int:
     # This will be replaced by the release process.
     build_number = os.getenv("YB_RELEASE_BUILD_NUMBER") or "PRE_RELEASE"
 
+    # Fetch system platform and architecture
+    os_platform = sys.platform
+    architecture = platform.machine()
+
     d = os.path.dirname(output_path)
     if d != "" and not os.path.exists(d):
         os.makedirs(d)
@@ -167,6 +179,7 @@ def main() -> int:
     logging.getLogger('').addHandler(file_log_handler)
 
     data = {
+            "schema": "v1",
             "git_hash": git_hash,
             "build_hostname": hostname,
             "build_timestamp": build_time,
@@ -176,8 +189,15 @@ def main() -> int:
             "build_id": build_id,
             "build_type": build_type,
             "version_number": version_number,
-            "build_number": build_number
+            "build_number": build_number,
+            "platform": os_platform,
+            "architecture": architecture
             }
+
+    # Record our glibc version.  This doesn't apply to mac/darwin.
+    if os_platform == 'linux':
+        data["glibc_v"] = get_glibc_version()
+
     content = json.dumps(data)
 
     # Frequently getting errors here when rebuilding on NFS:

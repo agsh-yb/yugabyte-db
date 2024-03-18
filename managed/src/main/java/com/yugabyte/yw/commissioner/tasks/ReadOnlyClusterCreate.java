@@ -37,36 +37,39 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
   }
 
   @Override
+  protected void createPrecheckTasks(Universe universe) {
+    addBasicPrecheckTasks();
+  }
+
+  @Override
   public void run() {
     log.info("Started {} task for uuid={}", getName(), taskParams().getUniverseUUID());
-
+    Universe universe = null;
     try {
       // Set the 'updateInProgress' flag to prevent other updates from happening.
       Cluster cluster = taskParams().getReadOnlyClusters().get(0);
-      Universe universe =
-          lockUniverseForUpdate(
+      universe =
+          lockAndFreezeUniverseForUpdate(
               taskParams().expectedUniverseVersion,
               u -> {
-                if (isFirstTry()) {
-                  // Fetch the task params from the DB to start from fresh on retry.
-                  // Otherwise, some operations like name assignment can fail.
-                  fetchTaskDetailsFromDB();
-                  preTaskActions(u);
-                  // Set all the in-memory node names.
-                  setNodeNames(u);
-                  // Set non on-prem node UUIDs.
-                  setCloudNodeUuids(u);
-                  // Update on-prem node UUIDs.
-                  updateOnPremNodeUuidsOnTaskParams();
-                  // Set the prepared data to universe in-memory.
-                  updateUniverseNodesAndSettings(u, taskParams(), true);
-                  u.getUniverseDetails()
-                      .upsertCluster(cluster.userIntent, cluster.placementInfo, cluster.uuid);
-                  // There is a rare possibility that this succeeds and
-                  // saving the Universe fails. It is ok because the retry
-                  // will just fail.
-                  updateTaskDetailsInDB(taskParams());
-                }
+                // Fetch the task params from the DB to start from fresh on retry.
+                // Otherwise, some operations like name assignment can fail.
+                fetchTaskDetailsFromDB();
+                preTaskActions(u);
+                // Set all the in-memory node names.
+                setNodeNames(u);
+                // Set non on-prem node UUIDs.
+                setCloudNodeUuids(u);
+                // Update on-prem node UUIDs.
+                updateOnPremNodeUuidsOnTaskParams(true);
+                // Set the prepared data to universe in-memory.
+                updateUniverseNodesAndSettings(u, taskParams(), true);
+                u.getUniverseDetails()
+                    .upsertCluster(cluster.userIntent, cluster.placementInfo, cluster.uuid);
+                // There is a rare possibility that this succeeds and
+                // saving the Universe fails. It is ok because the retry
+                // will just fail.
+                updateTaskDetailsInDB(taskParams());
               });
 
       // Sanity checks for clusters list validity are performed in the controller.
@@ -96,9 +99,19 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
       createProvisionNodeTasks(
           universe,
           nodesToProvision,
-          true /* isShell */,
           false /* ignore node status check */,
-          ignoreUseCustomImageConfig);
+          setupServerParams -> {
+            setupServerParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+          },
+          installSoftwareParams -> {
+            installSoftwareParams.isMasterInShellMode = true;
+            installSoftwareParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+          },
+          gFlagsParams -> {
+            gFlagsParams.isMasterInShellMode = true;
+            gFlagsParams.resetMasterState = true;
+            gFlagsParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+          });
 
       // Set of processes to be started, note that in this case it is same as nodes provisioned.
       Set<NodeDetails> newTservers = PlacementInfoUtil.getTserversToProvision(readOnlyNodes);
@@ -144,17 +157,26 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
       log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
       throw t;
     } finally {
-      // Mark the update of the universe as done. This will allow future edits/updates to the
-      // universe to happen.
-      Universe universe = unlockUniverseForUpdate();
-      if (universe.getConfig().getOrDefault(Universe.USE_CUSTOM_IMAGE, "false").equals("true")) {
-        universe.updateConfig(
-            ImmutableMap.of(
-                Universe.USE_CUSTOM_IMAGE,
-                Boolean.toString(
-                    universe.getUniverseDetails().nodeDetailsSet.stream()
-                        .allMatch(n -> n.ybPrebuiltAmi))));
-        universe.save();
+      if (universe != null) {
+        // Universe is locked by this task.
+        try {
+          // Fetch the latest universe.
+          universe = Universe.getOrBadRequest(universe.getUniverseUUID());
+          if (universe
+              .getConfig()
+              .getOrDefault(Universe.USE_CUSTOM_IMAGE, "false")
+              .equals("true")) {
+            universe.updateConfig(
+                ImmutableMap.of(
+                    Universe.USE_CUSTOM_IMAGE,
+                    Boolean.toString(
+                        universe.getUniverseDetails().nodeDetailsSet.stream()
+                            .allMatch(n -> n.ybPrebuiltAmi))));
+            universe.save();
+          }
+        } finally {
+          unlockUniverseForUpdate();
+        }
       }
     }
     log.info("Finished {} task.", getName());

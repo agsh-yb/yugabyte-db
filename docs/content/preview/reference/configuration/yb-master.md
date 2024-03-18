@@ -159,6 +159,20 @@ Location of .htpasswd file containing usernames and hashed passwords, for authen
 
 Default: `""`
 
+##### --defer_index_backfill
+
+If enabled, yb-master avoids launching any new index-backfill jobs on the cluster for all new YCQL indexes.  
+You will need to run [`yb-admin backfill_indexes_for_table`](../../../admin/yb-admin/#backfill-indexes-for-table) manually for indexes to be functional.
+See [`CREATE DEFERRED INDEX`](../../../api/ycql/ddl_create_index/#deferred-index) for reference.
+
+Default: `false`
+
+##### --allow_batching_non_deferred_indexes
+
+If enabled, indexes on the same (YCQL) table may be batched together during backfill, even if they were not deferred.
+
+Default: `true`
+
 ## YSQL flags
 
 ##### --enable_ysql
@@ -733,6 +747,31 @@ Default: `0` (Use the same default number of tablets as for regular tables.)
 WAL retention time, in seconds, to be used for tables for which a CDC stream was created. Used in both xCluster and CDCSDK.
 
 Default: `14400` (4 hours)
+
+## Metric export flags
+
+##### --export_help_and_type_in_prometheus_metrics
+
+YB-Master metrics are available in Prometheus format at
+`http://localhost:7000/prometheus-metrics`.  This flag controls whether
+#TYPE and #HELP information is included as part of the Prometheus
+metrics output by default.
+
+To override this flag on a per-scrape basis, set the URL parameter
+`show_help` to `true` to include or to `false` to not include type and
+help information.  For example, querying
+`http://localhost:7000/prometheus-metrics?show_help=true` will return
+type and help information regardless of the setting of this flag.
+
+Default: `true`
+
+## Advanced flags
+
+#### ysql_index_backfill_rpc_timeout_ms
+
+Deadline (in milliseconds) for each internal YB-Master to YB-TServer RPC for backfilling a chunk of the index.
+
+Default: 60000 (1 minute)
 
 ## Admin UI
 

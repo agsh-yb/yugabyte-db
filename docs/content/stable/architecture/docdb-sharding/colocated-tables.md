@@ -32,7 +32,7 @@ The decision to use colocating clusters should be based on the specific requirem
 
 Applications with smaller sized datasets may have the following pattern and requirements:
 
-- The size of the entire dataset is small. Typically, this entire database is less than 500 GB in size.
+- The size of the entire dataset is small. Typically, this entire database is less than 50 GB in size.
 - They require a large number of tables, indexes and other relations created in a single database.
 - Need high availability and/or geographic data distribution.
 - Scaling the dataset or the number of IOPS is not an immediate concern.
@@ -102,7 +102,7 @@ You can create a backup of a database that was colocated with the deprecated syn
 All the tables in a colocated database are colocated by default. There is no need to enable colocation when creating tables. You can choose to opt specific tables out of colocation in a colocated database. To do this, use the following command:
 
 ```sql
-CREATE TABLE <name> (WITH COLOCATION = false);
+CREATE TABLE <name> (columns) WITH (COLOCATION = false);
 ```
 
 Note that you cannot create a colocated table in a non-colocated database.
@@ -140,7 +140,7 @@ To view metrics such as table size, use the name of the parent colocation table.
 ## Limitations and considerations
 
 - Creating colocated tables with tablespaces is disallowed. This will be supported in future releases.
-- Metrics for table metrics such as table size are available for the colocation table, not for individual colocated tables that are part of the colocation.
+- Metrics for table metrics such as table size are available for the colocation tablet, not for individual colocated tables that are part of the colocation.
 - Tablet splitting is disabled for colocated tables.
 - You can't configure xCluster replication for colocated tables using the YugabyteDB Anywhere UI in the 2.18.0 release. This functionality will be available in a future release.
 
@@ -151,7 +151,7 @@ For a colocated table, a TRUNCATE / DROP operation may abort due to conflicts if
 
 ## xCluster and colocation
 
-xCluster is supported for colocated tables in v2.18.0 only via [yb-admin](../../../admin/yb-admin/). To set up xCluster for colocated tables, the `colocationid` for a given table needs to match on the source and target universes.
+xCluster is supported for colocated tables and indexes in v2.18.0 only via [yb-admin](../../../admin/yb-admin/). To set up xCluster for colocated tables, the `colocation_id` for a given table or index needs to match on the source and target universes.
 
 To set up xCluster for colocated tables, do the following:
 
@@ -165,6 +165,18 @@ To set up xCluster for colocated tables, do the following:
 
     ```SQL
     CREATE TABLE <name> WITH (COLOCATION = true, COLOCATION_ID = 20000)
+    ```
+
+1. Create the index in the colocated database on the source universe with colocation ID explicitly specified.
+
+    ```SQL
+    CREATE INDEX <index_name> ON TABLE <table_name> WITH (COLOCATION_ID = 20000)
+    ```
+
+1. Create the index in the colocated database on the target universe using the same colocation ID.
+
+    ```SQL
+    CREATE INDEX <index_name> ON TABLE <table_name> WITH (COLOCATION_ID = 20000)
     ```
 
 1. Get the parent table UUID for the colocated database.

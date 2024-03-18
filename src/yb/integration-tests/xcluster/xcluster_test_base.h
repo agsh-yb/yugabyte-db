@@ -21,6 +21,7 @@
 #include "yb/cdc/cdc_types.h"
 
 #include "yb/client/transaction_manager.h"
+#include "yb/client/client.h"
 
 #include "yb/integration-tests/cdc_test_util.h"
 #include "yb/integration-tests/mini_cluster.h"
@@ -48,7 +49,7 @@ using YBTables = std::vector<std::shared_ptr<client::YBTable>>;
 
 constexpr int kRpcTimeout = NonTsanVsTsan(60, 120);
 static const std::string kUniverseId = "test_universe";
-static const cdc::ReplicationGroupId kReplicationGroupId("test_replication_group");
+static const xcluster::ReplicationGroupId kReplicationGroupId("test_replication_group");
 static const std::string kKeyColumnName = "key";
 static const uint32_t kRangePartitionInterval = 500;
 
@@ -67,7 +68,7 @@ class XClusterTestBase : public YBTest {
   class Cluster {
    public:
     std::unique_ptr<MiniCluster> mini_cluster_;
-    std::unique_ptr<YBClient> client_;
+    std::unique_ptr<client::YBClient> client_;
     std::unique_ptr<yb::pgwrapper::PgSupervisor> pg_supervisor_;
     HostPort pg_host_port_;
     boost::optional<client::TransactionManager> txn_mgr_;
@@ -106,6 +107,8 @@ class XClusterTestBase : public YBTest {
     HybridTime::TEST_SetPrettyToString(true);
 
     google::SetVLOGLevel("xcluster*", 4);
+    google::SetVLOGLevel("add_table*", 4);
+    google::SetVLOGLevel("xrepl*", 4);
     google::SetVLOGLevel("cdc*", 4);
     YBTest::SetUp();
 
@@ -123,13 +126,18 @@ class XClusterTestBase : public YBTest {
     propagation_timeout_ = MonoDelta::FromSeconds(30 * kTimeMultiplier);
   }
 
-  Status PostSetUp();
+  virtual Status PostSetUp();
 
   Result<std::unique_ptr<Cluster>> CreateCluster(
       const std::string& cluster_id, const std::string& cluster_short_name,
       uint32_t num_tservers = 1, uint32_t num_masters = 1);
 
   virtual Status InitClusters(const MiniClusterOptions& opts);
+
+  virtual Status PreProducerCreate() { return Status::OK(); }
+  virtual Status PostProducerCreate() { return Status::OK(); }
+  virtual Status PreConsumerCreate() { return Status::OK(); }
+  virtual Status PostConsumerCreate() { return Status::OK(); }
 
   void TearDown() override;
 
@@ -148,6 +156,7 @@ class XClusterTestBase : public YBTest {
       uint32_t num_tablets, const client::YBSchema* schema);
 
   virtual Status SetupUniverseReplication(const std::vector<std::string>& producer_table_ids);
+  virtual Status SetupUniverseReplication();
 
   virtual Status SetupUniverseReplication(
       const std::vector<std::shared_ptr<client::YBTable>>& producer_tables,
@@ -159,7 +168,7 @@ class XClusterTestBase : public YBTest {
       SetupReplicationOptions opts = SetupReplicationOptions());
 
   Status SetupUniverseReplication(
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       const std::vector<std::shared_ptr<client::YBTable>>& producer_tables,
       SetupReplicationOptions opts = SetupReplicationOptions());
 
@@ -168,53 +177,53 @@ class XClusterTestBase : public YBTest {
 
   Status SetupUniverseReplication(
       MiniCluster* producer_cluster, MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       const std::vector<std::shared_ptr<client::YBTable>>& producer_tables,
       const std::vector<xrepl::StreamId>& bootstrap_ids = {},
       SetupReplicationOptions opts = SetupReplicationOptions());
 
-  Status SetupUniverseReplication(
+  virtual Status SetupUniverseReplication(
       MiniCluster* producer_cluster, MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       const std::vector<TableId>& producer_table_ids,
       const std::vector<xrepl::StreamId>& bootstrap_ids = {},
       SetupReplicationOptions opts = SetupReplicationOptions());
 
   Status SetupNSUniverseReplication(
       MiniCluster* producer_cluster, MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id, const std::string& producer_ns_name,
+      const xcluster::ReplicationGroupId& replication_group_id, const std::string& producer_ns_name,
       const YQLDatabase& producer_ns_type,
       SetupReplicationOptions opts = SetupReplicationOptions());
 
   Status VerifyUniverseReplication(master::GetUniverseReplicationResponsePB* resp);
 
   Status VerifyUniverseReplication(
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       master::GetUniverseReplicationResponsePB* resp);
 
   Status VerifyUniverseReplication(
       MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       master::GetUniverseReplicationResponsePB* resp);
 
   Status VerifyNSUniverseReplication(
       MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id, int num_expected_table);
+      const xcluster::ReplicationGroupId& replication_group_id, int num_expected_table);
 
-  Status ChangeXClusterRole(const cdc::XClusterRole role, Cluster* cluster = nullptr);
+  virtual Status ChangeXClusterRole(const cdc::XClusterRole role, Cluster* cluster = nullptr);
 
   Status ToggleUniverseReplication(
       MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id, bool is_enabled);
+      const xcluster::ReplicationGroupId& replication_group_id, bool is_enabled);
 
   Status VerifyUniverseReplicationDeleted(
       MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id, int timeout);
+      const xcluster::ReplicationGroupId& replication_group_id, int timeout);
 
   // Wait for SetupUniverseReplication to complete. resp will contain the errors if any.
   Status WaitForSetupUniverseReplication(
       MiniCluster* consumer_cluster, YBClient* consumer_client,
-      const cdc::ReplicationGroupId& replication_group_id,
+      const xcluster::ReplicationGroupId& replication_group_id,
       master::IsSetupUniverseReplicationDoneResponsePB* resp);
 
   Status GetCDCStreamForTable(const TableId& table_id, master::ListCDCStreamsResponsePB* resp);
@@ -222,21 +231,21 @@ class XClusterTestBase : public YBTest {
   uint32_t GetSuccessfulWriteOps(MiniCluster* cluster);
 
   Status DeleteUniverseReplication(
-      const cdc::ReplicationGroupId& replication_group_id = kReplicationGroupId);
+      const xcluster::ReplicationGroupId& replication_group_id = kReplicationGroupId);
 
   Status DeleteUniverseReplication(
-      const cdc::ReplicationGroupId& replication_group_id, YBClient* client, MiniCluster* cluster);
+      const xcluster::ReplicationGroupId& replication_group_id, YBClient* client,
+      MiniCluster* cluster);
 
   Status AlterUniverseReplication(
-      const cdc::ReplicationGroupId& replication_group_id,
-      const std::vector<std::shared_ptr<client::YBTable>>& tables,
-      bool add_tables);
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const std::vector<std::shared_ptr<client::YBTable>>& tables, bool add_tables);
 
   Status CorrectlyPollingAllTablets(uint32_t num_producer_tablets);
   Status CorrectlyPollingAllTablets(MiniCluster* cluster, uint32_t num_producer_tablets);
 
   Status WaitForSetupUniverseReplicationCleanUp(
-      const cdc::ReplicationGroupId& replication_group_id);
+      const xcluster::ReplicationGroupId& replication_group_id);
 
   Status WaitForValidSafeTimeOnAllTServers(
       const NamespaceId& namespace_id, Cluster* cluster = nullptr,
@@ -306,13 +315,15 @@ class XClusterTestBase : public YBTest {
     return result;
   }
 
+  // Wait for the xcluster safe time to advance to the given time on all TServers.
   Status WaitForSafeTime(const NamespaceId& namespace_id, const HybridTime& min_safe_time);
 
-  void VerifyReplicationError(
-      const std::string& consumer_table_id,
-      const std::string& stream_id,
-      const boost::optional<ReplicationErrorPb>
-          expected_replication_error);
+  // Wait for the xcluster safe time to advance to Now on all TServers.
+  virtual Status WaitForSafeTimeToAdvanceToNow();
+
+  Status VerifyReplicationError(
+      const std::string& consumer_table_id, const xrepl::StreamId& stream_id,
+      const std::optional<ReplicationErrorPb> expected_replication_error);
 
   Result<xrepl::StreamId> GetCDCStreamID(const TableId& producer_table_id);
 
@@ -321,10 +332,14 @@ class XClusterTestBase : public YBTest {
 
   Result<TableId> GetColocatedDatabaseParentTableId();
 
+  Result<master::MasterReplicationProxy> GetProducerMasterProxy();
+
  protected:
   CoarseTimePoint PropagationDeadline() const {
     return CoarseMonoClock::Now() + propagation_timeout_;
   }
+
+  Status SetupCertificates(const xcluster::ReplicationGroupId& replication_group_id);
 
   Cluster producer_cluster_;
   Cluster consumer_cluster_;

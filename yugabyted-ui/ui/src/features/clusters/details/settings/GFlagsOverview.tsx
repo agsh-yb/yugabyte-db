@@ -2,7 +2,7 @@ import React, { FC, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Box, LinearProgress, makeStyles, MenuItem, Paper, Typography } from "@material-ui/core";
 import { YBSelect, YBTable } from "@app/components";
-import { useGetClusterNodesQuery, useGetGflagsQuery } from "@app/api/src";
+import { useGetClusterNodesQuery, useGetGflagsQuery, useGetNodeAddressQuery } from "@app/api/src";
 
 const useStyles = makeStyles((theme) => ({
   paperContainer: {
@@ -46,17 +46,19 @@ export const GFlagsOverview: FC<GFlagsOverviewProps> = (/* { showDrift, toggleDr
   const classes = useStyles();
   const { t } = useTranslation();
 
-  const { data: nodesResponse, isFetching: isFetchingNodes } = useGetClusterNodesQuery();
+  const { data: nodesResponse, isFetching: isFetchingNodes } = useGetClusterNodesQuery(
+    { get_all_masters: true }
+  );
   const nodesNamesList =
     nodesResponse?.data.map((node) => ({ label: node.name, value: node.host })) ?? [];
+  const { data: nodeAddress } = useGetNodeAddressQuery();
 
-  const [currentNode, setCurrentNode] = useState<string | undefined>("");
+  const [currentNode, setCurrentNode] = useState<string | undefined>(nodeAddress ?? "");
   React.useEffect(() => {
-    if (!currentNode && nodesResponse) {
-      setCurrentNode(nodesNamesList[0].value);
+    if (currentNode === "" || !nodesNamesList.find((node) => node.value === currentNode)) {
+      setCurrentNode(nodeAddress ?? "");
     }
-  }, [nodesResponse]);
-
+  }, [nodesNamesList, nodeAddress])
   const { data, isFetching: isFetchingGFlags } = useGetGflagsQuery<UpstreamGflagResponseType>(
     { node_address: currentNode || "" },
     { query: { enabled: !!currentNode } }

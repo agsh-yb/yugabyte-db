@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -117,6 +118,8 @@
 #include <boost/preprocessor/seq/transform.hpp>
 #include <boost/preprocessor/stringize.hpp>
 #include <boost/preprocessor/variadic/to_seq.hpp>
+#include <boost/range/adaptors.hpp>
+#include <boost/range/any_range.hpp>
 #include <boost/range/iterator_range.hpp>
 #include <boost/range/iterator_range_core.hpp>
 #include <boost/signals2/dummy_mutex.hpp>
@@ -155,6 +158,10 @@
 #include <gtest/internal/gtest-internal.h>
 #include <rapidjson/document.h>
 
+#include "yb/common/opid.fwd.h"
+#include "yb/common/opid.h"
+#include "yb/common/opid.messages.h"
+#include "yb/common/opid.pb.h"
 #include "yb/gutil/algorithm.h"
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/bind.h"
@@ -193,6 +200,7 @@
 #include "yb/gutil/threading/thread_collision_warner.h"
 #include "yb/gutil/type_traits.h"
 #include "yb/gutil/walltime.h"
+#include "yb/util/aggregate_stats.h"
 #include "yb/util/algorithm_util.h"
 #include "yb/util/async_task_util.h"
 #include "yb/util/async_util.h"
@@ -232,6 +240,9 @@
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/flags/flags_callback.h"
 #include "yb/util/format.h"
+#include "yb/util/hash_util.h"
+#include "yb/util/hdr_histogram.h"
+#include "yb/util/high_water_mark.h"
 #include "yb/util/init.h"
 #include "yb/util/io.h"
 #include "yb/util/jsonreader.h"
@@ -241,6 +252,7 @@
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/logging_callback.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/math_util.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/memory/arena.h"
@@ -259,15 +271,12 @@
 #include "yb/util/net/inetaddress.h"
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/net/rate_limiter.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/socket.h"
 #include "yb/util/numbered_deque.h"
 #include "yb/util/object_pool.h"
 #include "yb/util/operation_counter.h"
-#include "yb/util/opid.fwd.h"
-#include "yb/util/opid.h"
-#include "yb/util/opid.messages.h"
-#include "yb/util/opid.pb.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/physical_time.h"
@@ -284,12 +293,12 @@
 #include "yb/util/rwc_lock.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/semaphore.h"
-#include "yb/util/service_util.h"
 #include "yb/util/shared_lock.h"
 #include "yb/util/shared_ptr_tuple.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/slice.h"
 #include "yb/util/slice_parts.h"
+#include "yb/util/source_location.h"
 #include "yb/util/stack_trace.h"
 #include "yb/util/status.h"
 #include "yb/util/status_callback.h"
@@ -307,6 +316,7 @@
 #include "yb/util/strongly_typed_uuid.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/sync_point.h"
+#include "yb/util/tcmalloc_util.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
@@ -325,6 +335,8 @@
 #include "yb/util/unique_lock.h"
 #include "yb/util/uuid.h"
 #include "yb/util/varint.h"
+#include "yb/util/version_info.h"
+#include "yb/util/version_info.pb.h"
 #include "yb/util/version_tracker.h"
 #include "yb/util/web_callback_registry.h"
 #include "yb/util/write_buffer.h"

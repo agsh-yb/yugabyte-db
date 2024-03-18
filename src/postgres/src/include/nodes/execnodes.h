@@ -1300,8 +1300,9 @@ typedef struct SeqScanState
 typedef struct YbSeqScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
-	// TODO handle;				/* size of parallel heap scan descriptor */
+	Size		pscan_len;		/* size of parallel heap scan descriptor */
 	List	   *aggrefs;		/* aggregate pushdown information */
+	struct YBParallelPartitionKeysData *pscan; /* parallel scan data */
 } YbSeqScanState;
 
 /* ----------------
@@ -1476,7 +1477,7 @@ typedef struct IndexOnlyScanState
 typedef struct BitmapIndexScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
-	TIDBitmap  *biss_result;
+	void	   *biss_result;	/* either TIDBitmap or YbTIDBitmap */
 	ScanKey		biss_ScanKeys;
 	int			biss_NumScanKeys;
 	IndexRuntimeKeyInfo *biss_RuntimeKeys;
@@ -1581,6 +1582,37 @@ typedef struct BitmapHeapScanState
 	TBMSharedIterator *shared_prefetch_iterator;
 	ParallelBitmapHeapState *pstate;
 } BitmapHeapScanState;
+
+/* ----------------
+ *	 YbBitmapTableScanState information
+ *
+ *		bitmapqualorig	   execution state for bitmapqualorig expressions
+ *		ybtbm			   bitmap obtained from child index scan(s)
+ *		ybtbmiterator	   iterator for scanning rows from ybctids
+ *		ybtbmres		   current chunk of data
+ *		initialized		   is node is ready to iterate
+ *		recheck_required   do we have to recheck any of the results?
+ *		work_mem_exceeded  if we've exceeded work_mem, internally switch to
+ *						   seq scan
+ *		average_ybctid_bytes	an estimate of the average ybctid size
+ *		can_skip_fetch	   can we potentially skip tuple fetches in this scan?
+ *		skipped_tuples	   how many tuples have we skipped fetching?
+ * ----------------
+ */
+typedef struct YbBitmapTableScanState
+{
+	ScanState	ss;				/* its first field is NodeTag */
+	ExprState  *bitmapqualorig;
+	YbTIDBitmap  *ybtbm;
+	YbTBMIterator *ybtbmiterator;
+	YbTBMIterateResult *ybtbmres;
+	bool		initialized;
+	bool		recheck_required;
+	bool		work_mem_exceeded;
+	size_t		average_ybctid_bytes;
+	bool		can_skip_fetch;
+	int			skipped_tuples;
+} YbBitmapTableScanState;
 
 /* ----------------
  *	 TidScanState information
@@ -1886,6 +1918,14 @@ typedef struct YbBatchedNestLoopState
 	bool bnl_outerdone;
 	NLBatchStatus bnl_currentstatus;
 
+	bool is_first_batch_done;
+	int batch_size;
+
+	bool bnl_needs_sorting;
+	bool bnl_is_sorted;
+	Tuplesortstate *bnl_tuple_sort;
+	int64 bound;
+
 	/* State for tuplestore batch strategy */
 	Tuplestorestate *bnl_tupleStoreState;
 	List *bnl_batchMatchedInfo;
@@ -1903,9 +1943,11 @@ typedef struct YbBatchedNestLoopState
 	TupleHashIterator hashiter;
 	BucketTupleInfo *current_ht_tuple;
 	TupleHashEntry current_hash_entry;
-	FmgrInfo *hashFunctions;
+	FmgrInfo *outerHashFunctions;
+	FmgrInfo *innerHashFunctions;
 	int numLookupAttrs;
 	AttrNumber *innerAttrs;
+	ExprState *ht_lookup_fn;
 
 	/* Function pointers to local join methods */
 	FlushTupleFn_t FlushTupleImpl;

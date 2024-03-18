@@ -21,7 +21,7 @@
 #include "yb/common/schema.h"
 
 #include "yb/integration-tests/backfill-test-util.h"
-#include "yb/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "yb/integration-tests/external_mini_cluster_validator.h"
 
 #include "yb/master/master_admin.proxy.h"
 #include "yb/master/master_admin.pb.h"
@@ -34,7 +34,6 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/format.h"
 #include "yb/util/monotime.h"
-#include "yb/util/pb_util.h"
 #include "yb/util/status_format.h"
 #include "yb/util/string_util.h"
 #include "yb/util/test_thread_holder.h"
@@ -49,15 +48,19 @@ using std::string;
 using namespace std::chrono_literals;
 using namespace std::literals;
 
-namespace yb {
-namespace pgwrapper {
+namespace yb::pgwrapper {
 
 namespace {
 
 constexpr auto kColoDbName = "colodb";
-constexpr auto kDatabaseName = "yugabyte";
+const auto kDatabaseName = "yugabyte"s;
 constexpr auto kIndexName = "iii";
 constexpr auto kTableName = "ttt";
+const auto kCommandConcurrently = "CREATE INDEX CONCURRENTLY"s;
+const auto kCommandNonconcurrently = "CREATE INDEX NONCONCURRENTLY"s;
+const auto kPhase = "phase"s;
+const auto kPhaseBackfilling = "backfilling"s;
+const auto kPhaseInitializing = "initializing"s;
 const client::YBTableName kYBTableName(YQLDatabase::YQL_DATABASE_PGSQL, kDatabaseName, kTableName);
 
 } // namespace
@@ -122,21 +125,15 @@ class PgIndexBackfillTest : public LibPqTestBase {
     return Status::OK();
   }
 
-  Status WaitForIndexProgressOutput(const std::string columns, const std::string expected_result) {
-    return WaitFor(
-      [this, &columns, &expected_result]() -> Result<bool> {
-        auto res = conn_->FetchRowAsString(
-            Format("SELECT $0 FROM pg_stat_progress_create_index", columns));
-        if (!res.ok() && res.status().IsRuntimeError() &&
-            res.status().message().ToBuffer().find("Fetched 0 rows, while 1 expected")
-            != std::string::npos) {
-          // We might have failed because the index doesn't exist yet.
-          return false;
-        }
-        return *res == expected_result;
-      },
-      30s,
-      Format("Wait for index progress columns $0 to be $1", columns, expected_result));
+  template <class... Args>
+  Status WaitForIndexProgressOutput(
+      const std::string& columns, const std::tuple<Args...>& expected) {
+    return WaitForIndexProgressOutputImpl<decltype(expected), Args...>(columns, expected);
+  }
+
+  template <class T>
+  Status WaitForIndexProgressOutput(const std::string& columns, const T& expected) {
+    return WaitForIndexProgressOutputImpl<T, T>(columns, expected);
   }
 
   Status WaitForIndexScan(const std::string& query) {
@@ -152,6 +149,7 @@ class PgIndexBackfillTest : public LibPqTestBase {
   void TestSimpleBackfill(const std::string& table_create_suffix = "");
   void TestLargeBackfill(const int num_rows);
   void TestRetainDeleteMarkers(const std::string& db_name);
+  void TestRetainDeleteMarkersRecovery(const std::string& db_name, bool use_multiple_requests);
   Status TestInsertsWhileCreatingIndex(bool expect_missing_row);
 
   const int kTabletsPerServer = 8;
@@ -188,6 +186,51 @@ class PgIndexBackfillTest : public LibPqTestBase {
 
     return index_state_flags;
   }
+
+  template <class T, class... Args>
+  Status WaitForIndexProgressOutputImpl(const std::string& columns, const T& expected) {
+    const auto query = Format("SELECT $0 FROM pg_stat_progress_create_index", columns);
+    return WaitFor(
+        [this, &query, &expected]() -> Result<bool> {
+          auto values = VERIFY_RESULT(conn_->FetchRows<Args...>(query));
+          if (values.size() == 0) {
+            // Likely the index doesn't exist yet.
+            return false;
+          }
+          SCHECK_EQ(values.size(), 1, IllegalState, "unexpected number of rows");
+          return values[0] == expected;
+        },
+        30s,
+        Format("Wait on index progress columns $0", columns));
+  }
+
+  class PgRetainDeleteMarkersValidator final : public itest::RetainDeleteMarkersValidator {
+    using Base = itest::RetainDeleteMarkersValidator;
+
+   public:
+    PgRetainDeleteMarkersValidator(
+        ExternalMiniCluster* cluster, client::YBClient* client,
+        PGConn* conn, const std::string& db_name)
+        : Base(cluster, client, db_name), conn_(*CHECK_NOTNULL(conn)) {
+    }
+
+   private:
+    Status RestartCluster() override {
+      RETURN_NOT_OK(Base::RestartCluster());
+      conn_.Reset(); // Should be enough to restore connection after the cluster restart.
+      return Status::OK();
+    }
+
+    Status CreateIndex(const std::string &index_name, const std::string &table_name) override {
+      return conn_.ExecuteFormat("CREATE INDEX $0 ON $1 (i ASC)", index_name, table_name);
+    }
+
+    Status CreateTable(const std::string &table_name) override {
+      return conn_.ExecuteFormat("CREATE TABLE $0 (i int)", table_name);
+    }
+
+    PGConn& conn_;
+  };
 };
 
 namespace {
@@ -243,60 +286,24 @@ void PgIndexBackfillTest::TestSimpleBackfill(const std::string& table_create_suf
   const auto query = Format("SELECT c, i FROM $0 ORDER BY c", kTableName);
   ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
 
-  const auto values = ASSERT_RESULT((conn_->FetchAll<char, int32_t>(query)));
-  decltype(values) expected_values = {{'a', 0}, {'b', 100}, {'y', -5}};
-  ASSERT_EQ(values, expected_values);
+  const auto rows = ASSERT_RESULT((conn_->FetchRows<char, int32_t>(query)));
+  ASSERT_EQ(rows, (decltype(rows){{'a', 0}, {'b', 100}, {'y', -5}}));
 }
+
 
 // Checks that retain_delete_markers is false after index creation.
 void PgIndexBackfillTest::TestRetainDeleteMarkers(const std::string& db_name) {
-  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  ASSERT_OK(EnsureClientCreated());
+  PgRetainDeleteMarkersValidator{ cluster_.get(), client_.get(), conn_.get(), db_name }.Test();
+}
 
-  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (i int)", kTableName));
-  const auto index_name = "ttt_idx";
-  ASSERT_OK(conn_->ExecuteFormat("CREATE INDEX $0 ON $1 (i ASC)", index_name, kTableName));
-
-  // Verify that retain_delete_markers was set properly in the index table schema.
-  const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
-      client.get(), db_name, index_name));
-  auto table_info = std::make_shared<client::YBTableInfo>();
-  {
-    Synchronizer sync;
-    ASSERT_OK(client->GetTableSchemaById(table_id, table_info, sync.AsStatusCallback()));
-    ASSERT_OK(sync.Wait());
-  }
-
-  ASSERT_EQ(table_info->schema.version(), 0);
-  ASSERT_FALSE(table_info->schema.table_properties().retain_delete_markers());
-
-  // Validate the value if retain_delete_markers is persisted correctly in a tablet meta-data:
-  // let's get all tablets for an index table and validate it's superblock on a disk.
-  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
-  ASSERT_OK(client->GetTabletsFromTableId(table_id, 0, &tablets));
-  ASSERT_GT(tablets.size(), 0);
-
-  itest::ExternalMiniClusterFsInspector inspector { cluster_.get() };
-  for (const auto& tablet : tablets) {
-    for (size_t n = 0; n < cluster_->num_tablet_servers(); ++n) {
-      tablet::RaftGroupReplicaSuperBlockPB superblock;
-      ASSERT_OK(inspector.ReadTabletSuperBlockOnTS(n, tablet.tablet_id(), &superblock));
-      ASSERT_TRUE(superblock.has_kv_store());
-      ASSERT_GT(superblock.kv_store().tables_size(), 0);
-      for (const auto& table_pb : superblock.kv_store().tables()) {
-        // Take into accound only index table (required in case of colocation).
-        if (table_pb.has_table_name() && table_pb.table_name() != index_name) {
-          continue;
-        }
-
-        ASSERT_TRUE(table_pb.has_schema());
-        ASSERT_TRUE(table_pb.schema().has_table_properties());
-        LOG(INFO) << "P " << cluster_->tablet_server(n)->id() << " T " << tablet.tablet_id()
-                  << (table_pb.has_table_name() ? " Table " + table_pb.table_name() : "")
-                  << " properties: " << table_pb.schema().table_properties().ShortDebugString();
-        ASSERT_FALSE(table_pb.schema().table_properties().retain_delete_markers());
-      }
-    }
-  }
+// Test that retain_delete_markers is recovered after not being properly set after index backfill.
+void PgIndexBackfillTest::TestRetainDeleteMarkersRecovery(
+    const std::string& db_name, bool use_multiple_requests) {
+  ASSERT_OK(EnsureClientCreated());
+  auto validator =
+      PgRetainDeleteMarkersValidator{ cluster_.get(), client_.get(), conn_.get(), db_name };
+  validator.TestRecovery(use_multiple_requests);
 }
 
 void PgIndexBackfillTest::TestLargeBackfill(const int num_rows) {
@@ -316,7 +323,7 @@ void PgIndexBackfillTest::TestLargeBackfill(const int num_rows) {
       "SELECT COUNT(*) FROM $0 WHERE i > 0",
       kTableName);
   ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-  auto actual_num_rows = ASSERT_RESULT(conn_->FetchValue<PGUint64>(query));
+  auto actual_num_rows = ASSERT_RESULT(conn_->FetchRow<PGUint64>(query));
   ASSERT_EQ(actual_num_rows, num_rows);
 }
 
@@ -382,32 +389,18 @@ TEST_F(PgIndexBackfillTest, Partial) {
 
   // Index scan to verify contents of index table.
   {
-    const std::string query = Format("SELECT j FROM $0 WHERE j > -3 ORDER BY i", kTableName);
+    const auto query = Format("SELECT j FROM $0 WHERE j > -3 ORDER BY i", kTableName);
     ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-    PGResultPtr res = ASSERT_RESULT(conn_->Fetch(query));
-    ASSERT_EQ(PQntuples(res.get()), 2);
-    ASSERT_EQ(PQnfields(res.get()), 1);
-    std::array<int, 2> values = {
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 0)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 1, 0)),
-    };
-    ASSERT_EQ(values[0], -1);
-    ASSERT_EQ(values[1], -2);
+    const auto values = ASSERT_RESULT(conn_->FetchRows<int32_t>(query));
+    ASSERT_EQ(values, (decltype(values){-1, -2}));
   }
   {
-    const std::string query = Format(
+    const auto query = Format(
         "SELECT i FROM $0 WHERE j > -5 ORDER BY i DESC LIMIT 2",
         kTableName);
     ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-    PGResultPtr res = ASSERT_RESULT(conn_->Fetch(query));
-    ASSERT_EQ(PQntuples(res.get()), 2);
-    ASSERT_EQ(PQnfields(res.get()), 1);
-    std::array<int, 2> values = {
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 0)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 1, 0)),
-    };
-    ASSERT_EQ(values[0], 4);
-    ASSERT_EQ(values[1], 3);
+    const auto values = ASSERT_RESULT(conn_->FetchRows<int32_t>(query));
+    ASSERT_EQ(values, (decltype(values){4, 3}));
   }
 }
 
@@ -427,27 +420,8 @@ TEST_F(PgIndexBackfillTest, Expression) {
       "SELECT j, i, j % i as mod FROM $0 WHERE j % i = 2 ORDER BY i",
       kTableName);
   ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-  PGResultPtr res = ASSERT_RESULT(conn_->Fetch(query));
-  ASSERT_EQ(PQntuples(res.get()), 2);
-  ASSERT_EQ(PQnfields(res.get()), 3);
-  std::array<std::array<int, 3>, 2> values = {{
-    {
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 0)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 1)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 2)),
-    },
-    {
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 1, 0)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 1, 1)),
-      ASSERT_RESULT(GetValue<int32_t>(res.get(), 1, 2)),
-    },
-  }};
-  ASSERT_EQ(values[0][0], 14);
-  ASSERT_EQ(values[0][1], 4);
-  ASSERT_EQ(values[0][2], 2);
-  ASSERT_EQ(values[1][0], 18);
-  ASSERT_EQ(values[1][1], 8);
-  ASSERT_EQ(values[1][2], 2);
+  const auto rows = ASSERT_RESULT((conn_->FetchRows<int32_t, int32_t, int32_t>(query)));
+  ASSERT_EQ(rows, (decltype(rows){{14, 4, 2}, {18, 8, 2}}));
 }
 
 // Make sure that unique indexes work when index backfill is enabled.
@@ -468,18 +442,14 @@ TEST_F(PgIndexBackfillTest, Unique) {
   // Create unique index without failure.
   ASSERT_OK(conn_->ExecuteFormat("CREATE UNIQUE INDEX ON $0 (i ASC)", kTableName));
   // Index scan to verify contents of index table.
-  const std::string query = Format(
-      "SELECT * FROM $0 ORDER BY i",
-      kTableName);
+  const auto query = Format("SELECT * FROM $0 ORDER BY i", kTableName);
   ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-  PGResultPtr res = ASSERT_RESULT(conn_->Fetch(query));
-  ASSERT_EQ(PQntuples(res.get()), 4);
-  ASSERT_EQ(PQnfields(res.get()), 2);
+  ASSERT_OK(conn_->FetchMatrix(query, 4, 2));
 
   // Create unique index with failure.
-  Status status = conn_->ExecuteFormat("CREATE UNIQUE INDEX ON $0 (j ASC)", kTableName);
+  auto status = conn_->ExecuteFormat("CREATE UNIQUE INDEX ON $0 (j ASC)", kTableName);
   ASSERT_NOK(status);
-  const std::string msg = status.message().ToBuffer();
+  const auto msg = status.message().ToBuffer();
   ASSERT_TRUE(msg.find("duplicate key value violates unique constraint") != std::string::npos)
       << status;
 }
@@ -547,11 +517,9 @@ TEST_F(PgIndexBackfillTest, NonexistentDelete) {
   ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (i int PRIMARY KEY)", kTableName));
 
   // Delete to nonexistent row should return no rows.
-  PGResultPtr res = ASSERT_RESULT(conn_->FetchFormat(
-      "DELETE FROM $0 WHERE i = 1 RETURNING i",
-      kTableName));
-  ASSERT_EQ(PQntuples(res.get()), 0);
-  ASSERT_EQ(PQnfields(res.get()), 1);
+  const auto values = ASSERT_RESULT(conn_->FetchRows<int32_t>(
+      Format("DELETE FROM $0 WHERE i = 1 RETURNING i", kTableName)));
+  ASSERT_TRUE(values.empty());
 }
 
 // Make sure that index backfill on large tables backfills all data.
@@ -613,9 +581,9 @@ Status PgIndexBackfillTest::TestInsertsWhileCreatingIndex(bool expect_missing_ro
   thread_holder.Stop();
 
   LOG(INFO) << "Check counts";
-  const auto table_count = VERIFY_RESULT(conn_->FetchValue<PGUint64>(
+  const auto table_count = VERIFY_RESULT(conn_->FetchRow<PGUint64>(
       Format("SELECT count(*) FROM $0", kTableName)));
-  const auto index_count = VERIFY_RESULT(conn_->FetchValue<PGUint64>(
+  const auto index_count = VERIFY_RESULT(conn_->FetchRow<PGUint64>(
       Format("WITH w AS (SELECT * FROM $0 ORDER BY i) SELECT count(*) FROM w", kTableName)));
 
   LOG(INFO) << "Table has " << table_count << " rows";
@@ -632,15 +600,12 @@ Status PgIndexBackfillTest::TestInsertsWhileCreatingIndex(bool expect_missing_ro
     for (int n = 0; n < counts[thread_idx]; n++) {
       int i = n * kNumThreads + thread_idx;
       // Point index scan.
-      auto res = VERIFY_RESULT(conn_->FetchFormat("SELECT * FROM $0 WHERE i = $1", kTableName, i));
-      if (PQntuples(res.get()) == 1) {
-        SCHECK_EQ(1, PQnfields(res.get()), IllegalState, "returned wrong number of columns");
-        SCHECK_EQ(
-            i,
-            VERIFY_RESULT(GetValue<int32_t>(res.get(), 0, 0)),
-            IllegalState,
-            "found corruption");
+      auto values = VERIFY_RESULT(conn_->FetchRows<int32_t>(Format(
+          "SELECT * FROM $0 WHERE i = $1", kTableName, i)));
+      if (values.size() == 1) {
+        SCHECK_EQ(values[0], i, IllegalState, "found corruption");
       } else {
+        SCHECK_EQ(values.size(), 0, IllegalState, "unexpected number of rows");
         // Prefer LOG(ERROR) over ADD_FAILURE() since it fits in one line so is easier to read.
         LOG(ERROR) << "Index is missing element " << i;
         found_missing_row = true;
@@ -910,7 +875,9 @@ TEST_F_EX(PgIndexBackfillTest,
   for (int i = 0; i < kNumThreads; ++i) {
     thread_holder_.AddThreadFunctor([i, this, &statuses] {
       LOG(INFO) << "Begin thread " << i;
-      PGConn create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
+      // TODO (#19975): Enable read committed isolation
+      PGConn create_conn = ASSERT_RESULT(SetDefaultTransactionIsolation(
+          ConnectToDB(kDatabaseName), IsolationLevel::SNAPSHOT_ISOLATION));
       statuses[i] = MoveStatus(create_conn.ExecuteFormat(
           "CREATE INDEX $0 ON $1 (i)",
           kIndexName, kTableName));
@@ -963,7 +930,7 @@ TEST_F_EX(PgIndexBackfillTest,
   LOG(INFO) << "Checking postgres schema";
   {
     // Check number of indexes.
-    ASSERT_EQ(ASSERT_RESULT(conn_->FetchValue<std::string>(
+    ASSERT_EQ(ASSERT_RESULT(conn_->FetchRow<std::string>(
                 Format("SELECT indexname FROM pg_indexes WHERE tablename = '$0'", kTableName))),
               kIndexName);
 
@@ -1020,7 +987,7 @@ TEST_F_EX(PgIndexBackfillTest,
   LOG(INFO) << "Checking if index still works";
   {
     ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-    ASSERT_EQ(ASSERT_RESULT(conn_->FetchValue<int32_t>(query)), 7);
+    ASSERT_EQ(ASSERT_RESULT(conn_->FetchRow<int32_t>(query)), 7);
   }
 }
 
@@ -1035,6 +1002,16 @@ TEST_F(PgIndexBackfillTest, Tablegroup) {
 // Test that retain_delete_markers is properly set after index backfill.
 TEST_F(PgIndexBackfillTest, RetainDeleteMarkers) {
   TestRetainDeleteMarkers(kDatabaseName);
+}
+
+// Test for https://github.com/yugabyte/yugabyte-db/issues/19731.
+TEST_F(PgIndexBackfillTest, RetainDeleteMarkersRecovery) {
+  TestRetainDeleteMarkersRecovery(kDatabaseName, false /* use_multiple_requests */);
+}
+
+// Test for https://github.com/yugabyte/yugabyte-db/issues/19731.
+TEST_F(PgIndexBackfillTest, RetainDeleteMarkersRecoveryViaSeveralRequests) {
+  TestRetainDeleteMarkersRecovery(kDatabaseName, true /* use_multiple_requests */);
 }
 
 // Override the index backfill test to do alter slowly.
@@ -1154,6 +1131,42 @@ TEST_F_EX(PgIndexBackfillTest,
   // above `DROP INDEX` should have invalidated the corresponding table cache entry.  (There also
   // should be no catalog version mismatch because it is updated for the same session after DDL.)
   ASSERT_OK(conn_->FetchFormat("SELECT * FROM $0", kTableName));
+}
+
+class PgIndexBackfillGinStress : public PgIndexBackfillTest {
+ public:
+  int GetNumMasters() const override {
+    return 1;
+  }
+
+  int GetNumTabletServers() const override {
+    return 1;
+  }
+
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillTest::UpdateMiniClusterOptions(options);
+    options->extra_master_flags.push_back("--index_backfill_rpc_max_retries=0");
+    options->extra_master_flags.push_back("--replication_factor=1");
+    options->extra_tserver_flags.push_back("--enable_automatic_tablet_splitting=false");
+    options->extra_tserver_flags.push_back("--ysql_num_tablets=1");
+  }
+};
+
+TEST_F_EX(PgIndexBackfillTest,
+          YB_DISABLE_TEST_EXCEPT_RELEASE(GinStress),
+          PgIndexBackfillGinStress) {
+  // Note: too high numbers error with issue #13825 or #21114.
+  constexpr auto kNumIndexRowsPerTableRow = 10000;
+  constexpr auto kNumRows = 1000;
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int[])", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(R"#(
+      INSERT INTO $0
+          SELECT (SELECT ARRAY(SELECT floor(random() * 100000) FROM generate_series(1, $1)))
+          FROM generate_series(1, $2)
+      )#",
+      kTableName, kNumIndexRowsPerTableRow, kNumRows));
+  ASSERT_OK(conn_->ExecuteFormat("CREATE INDEX $0 ON $1 USING ybgin (a)", kIndexName, kTableName));
 }
 
 // Override the index backfill test to have slower backfill-related operations
@@ -1335,16 +1348,9 @@ TEST_F_EX(PgIndexBackfillTest,
   // Index scan to verify contents of index table.
   const std::string query = Format("SELECT * FROM $0 WHERE j = 113", kTableName);
   ASSERT_OK(WaitForIndexScan(query));
-  PGResultPtr res = ASSERT_RESULT(conn_->Fetch(query));
-  int lines = PQntuples(res.get());
-  ASSERT_EQ(1, lines);
-  int columns = PQnfields(res.get());
-  ASSERT_EQ(2, columns);
-  auto key = ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 0));
-  ASSERT_EQ(key, 3);
+  const auto row = ASSERT_RESULT((conn_->FetchRow<int32_t, int32_t>(query)));
   // Make sure that the update is visible.
-  auto value = ASSERT_RESULT(GetValue<int32_t>(res.get(), 0, 1));
-  ASSERT_EQ(value, 113);
+  ASSERT_EQ(row, (decltype(row){3, 113}));
 }
 
 // Make sure that updates at each stage of multi-stage CREATE INDEX work.  Simulate the following:
@@ -1418,7 +1424,7 @@ TEST_F_EX(PgIndexBackfillTest,
         key);
     ASSERT_OK(WaitForIndexScan(query));
     // Make sure that the update is visible.
-    ASSERT_EQ(ASSERT_RESULT(conn_->FetchValue<int32_t>(query)), key + 110);
+    ASSERT_EQ(ASSERT_RESULT(conn_->FetchRow<int32_t>(query)), key + 110);
   }
 }
 
@@ -1556,16 +1562,14 @@ TEST_F_EX(PgIndexBackfillTest,
   {
     CoarseBackoffWaiter waiter(CoarseMonoClock::Now() + 10s, CoarseMonoClock::Duration::max());
     while (true) {
-      Result<PGResultPtr> result = conn_->FetchFormat("SELECT count(*) FROM $0", kTableName);
+      auto result = conn_->FetchRow<PGUint64>(Format("SELECT count(*) FROM $0", kTableName));
       if (result.ok()) {
-        PGResultPtr res = std::move(*result);
-        const auto main_table_size = ASSERT_RESULT(GetValue<PGUint64>(res.get(), 0, 0));
-        ASSERT_EQ(main_table_size, 2);
+        ASSERT_EQ(*result, 2);
         break;
       }
-      ASSERT_TRUE(result.status().IsNetworkError()) << result.status();
-      ASSERT_TRUE(result.status().message().ToBuffer().find("schema version mismatch")
-                  != std::string::npos) << result.status();
+      auto& s = result.status();
+      ASSERT_TRUE(s.IsNetworkError()) << s;
+      ASSERT_TRUE(s.message().ToBuffer().find("schema version mismatch") != std::string::npos) << s;
       ASSERT_TRUE(waiter.Wait());
     }
   }
@@ -1622,21 +1626,18 @@ TEST_F_EX(PgIndexBackfillTest,
   thread_holder_.JoinAll();
 
   // Check.
-  const Result<PGResultPtr>& result = conn_->FetchFormat(
-      "SELECT count(*) FROM $0 WHERE j = 'a'", kTableName);
+  auto result = conn_->FetchRow<PGUint64>(Format(
+      "SELECT count(*) FROM $0 WHERE j = 'a'", kTableName));
   if (result.ok()) {
-    auto count = ASSERT_RESULT(GetValue<PGUint64>(result.get().get(), 0, 0));
-    ASSERT_EQ(count, 0);
-  } else if (result.status().IsNetworkError()) {
-    Status s = result.status();
+    ASSERT_EQ(*result, 0);
+  } else {
+    auto& s = result.status();
+    ASSERT_TRUE(s.IsNetworkError()) << "unexpected status: " << s;
     const std::string msg = s.message().ToBuffer();
     if (msg.find("Given ybctid is not associated with any row in table") == std::string::npos) {
       FAIL() << "unexpected status: " << s;
     }
     FAIL() << "delete to index was not present by the time backfill happened: " << s;
-  } else {
-    Status s = result.status();
-    FAIL() << "unexpected status: " << s;
   }
 }
 
@@ -1766,7 +1767,7 @@ TEST_F_EX(PgIndexBackfillTest,
 
   // Make sure that the index is gone.
   // Check postgres metadata.
-  auto value = ASSERT_RESULT(conn_->FetchValue<PGUint64>(
+  auto value = ASSERT_RESULT(conn_->FetchRow<PGUint64>(
       Format("SELECT COUNT(*) FROM pg_class WHERE relname = '$0'", kIndexName)));
   ASSERT_EQ(value, 0);
   // Check DocDB metadata.
@@ -1941,7 +1942,7 @@ TEST_F_EX(PgIndexBackfillTest,
   // Index scan to verify contents of index table.
   const std::string query = Format("SELECT COUNT(*) FROM $0 WHERE i > 0", kTableName);
   ASSERT_TRUE(ASSERT_RESULT(conn_->HasIndexScan(query)));
-  auto count = ASSERT_RESULT(conn_->FetchValue<PGUint64>(query));
+  auto count = ASSERT_RESULT(conn_->FetchRow<PGUint64>(query));
   ASSERT_EQ(count, 2);
 }
 
@@ -1950,6 +1951,18 @@ TEST_F_EX(PgIndexBackfillTest,
           ColocatedRetainDeleteMarkers,
           PgIndexBackfillColocated) {
   TestRetainDeleteMarkers(kColoDbName);
+}
+
+// Test for https://github.com/yugabyte/yugabyte-db/issues/19731.
+TEST_F_EX(PgIndexBackfillTest,
+          ColocatedRetainDeleteMarkersRecovery,
+          PgIndexBackfillColocated) {
+  TestRetainDeleteMarkersRecovery(kColoDbName, false /* use_multiple_requests */);
+}
+TEST_F_EX(PgIndexBackfillTest,
+          ColocatedRetainDeleteMarkersRecoveryViaSeveralRequests,
+          PgIndexBackfillColocated) {
+  TestRetainDeleteMarkersRecovery(kColoDbName, true /* use_multiple_requests */);
 }
 
 // Verify in-progress CREATE INDEX command's entry in pg_stat_progress_create_index.
@@ -1968,9 +1981,9 @@ TEST_F_EX(PgIndexBackfillTest,
     ASSERT_OK(create_conn.ExecuteFormat("CREATE INDEX $0 ON $1 (i ASC)", kIndexName, kTableName));
   });
 
-  ASSERT_OK(WaitForIndexProgressOutput("phase", "initializing"));
+  ASSERT_OK(WaitForIndexProgressOutput(kPhase, kPhaseInitializing));
   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "none"));
-  ASSERT_OK(WaitForIndexProgressOutput("phase", "backfilling"));
+  ASSERT_OK(WaitForIndexProgressOutput(kPhase, kPhaseBackfilling));
   ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
   thread_holder_.Stop();
 }
@@ -2000,20 +2013,32 @@ TEST_F_EX(PgIndexBackfillTest,
     ASSERT_OK(user_one_create_index_conn.ExecuteFormat("CREATE INDEX ON $0 (i)", kTableName));
   });
 
-  ASSERT_OK(WaitForIndexProgressOutput("phase", "backfilling"));
+  ASSERT_OK(WaitForIndexProgressOutput(kPhase, kPhaseBackfilling));
   // Assert that the new user that isn't a superuser but the owner can see the values
   // for the selected columns.
   constexpr auto query = "SELECT relid, command, phase, tuples_done, tuples_total"
       " FROM pg_stat_progress_create_index";
-  auto value = ASSERT_RESULT(user_one_read_conn.FetchRowAsString(query));
+  auto fetch_nulls = [](PGConn* conn) -> Result<std::tuple<bool, bool, bool, bool, bool>> {
+    const auto values = VERIFY_RESULT((conn->FetchRow<
+        std::optional<PGOid>, std::optional<std::string>, std::optional<std::string>,
+        std::optional<int64_t>, std::optional<int64_t>>(query)));
+    return std::apply(
+        [](const auto&... args) { return std::make_tuple(!args.has_value()...); },
+        values);
+  };
+  auto nulls = ASSERT_RESULT(fetch_nulls(&user_one_read_conn));
+  auto expected_nulls =
+      decltype(nulls){false, false, false, false, false};
   // Assert that superuser can see the values for the selected columns.
-  ASSERT_NE(value, "NULL, NULL, NULL, NULL, NULL");
-  value = ASSERT_RESULT(conn_->FetchRowAsString(query));
-  ASSERT_NE(value, "NULL, NULL, NULL, NULL, NULL");
+  ASSERT_EQ(nulls, expected_nulls);
+  nulls = ASSERT_RESULT(fetch_nulls(conn_.get()));
+  ASSERT_EQ(nulls, expected_nulls);
   // Assert that the new user that isn't a superuser or the owner cannot see the values
   // for the selected columns.
-  value = ASSERT_RESULT(user_two_read_conn.FetchRowAsString(query));
-  ASSERT_EQ(value, "NULL, NULL, NULL, NULL, NULL");
+  nulls = ASSERT_RESULT(fetch_nulls(&user_two_read_conn));
+  expected_nulls =
+      decltype(nulls){true, true, true, true, true};
+  ASSERT_EQ(nulls, expected_nulls);
   ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
   thread_holder_.Stop();
 }
@@ -2036,7 +2061,7 @@ TEST_F_EX(PgIndexBackfillTest,
   });
 
   // Verify that entry is visible to local node (if it isn't this WaitFor will time-out).
-  ASSERT_OK(WaitForIndexProgressOutput("phase", "backfilling"));
+  ASSERT_OK(WaitForIndexProgressOutput(kPhase, kPhaseBackfilling));
   // Connect to a different node.
   pg_ts = cluster_->tablet_server(1);
   auto different_node_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
@@ -2067,7 +2092,7 @@ TEST_F_EX(PgIndexBackfillTest,
         "CREATE INDEX $0 ON $1 (i ASC)", kIndexName, kTableName));
   });
 
-  ASSERT_OK(WaitForIndexProgressOutput("phase", "backfilling"));
+  ASSERT_OK(WaitForIndexProgressOutput(kPhase, kPhaseBackfilling));
   ASSERT_OK(conn_->ExecuteFormat("BEGIN"));
   // Get number of tuples done.
   constexpr auto index_progress_query =
@@ -2081,7 +2106,7 @@ TEST_F_EX(PgIndexBackfillTest,
   // Assert that the phase is still "backfilling" and that the number of tuples done is still 0
   // within this txn.
   res = ASSERT_RESULT(conn_->Fetch(index_progress_query));
-  ASSERT_EQ(ASSERT_RESULT(GetValue<std::string>(res.get(), 0, 0)), "backfilling");
+  ASSERT_EQ(ASSERT_RESULT(GetValue<std::string>(res.get(), 0, 0)), kPhaseBackfilling);
   ASSERT_EQ(ASSERT_RESULT(GetValue<PGUint64>(res.get(), 0, 1)), 0);
   ASSERT_OK(conn_->ExecuteFormat("COMMIT"));
 }
@@ -2090,14 +2115,16 @@ TEST_F_EX(PgIndexBackfillTest,
 // for concurrent gin, partial, include indexes and non-concurrent indexes.
 TEST_F(PgIndexBackfillTest,
        YB_DISABLE_TEST_IN_TSAN(PgStatProgressCreateIndexCheckIndexTypes)) {
+  constexpr int64_t kNumRows = 100;
   ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (i int, t text, v tsvector)", kTableName));
   ASSERT_OK(conn_->ExecuteFormat(
-      "INSERT INTO $0 VALUES (generate_series(1, 100), 'a', to_tsvector('simple', 'filler'))",
-      kTableName));
+      "INSERT INTO $0 VALUES (generate_series(1, $1), 'a', to_tsvector('simple', 'filler'))",
+      kTableName, kNumRows));
   ASSERT_OK(conn_->ExecuteFormat("ANALYZE $0", kTableName));
-  const auto num_rows_indexed_table = ASSERT_RESULT(conn_->FetchValue<float>(
-      Format("SELECT reltuples FROM pg_class WHERE relname='$0'", kTableName)
-  ));
+  ASSERT_EQ(
+      ASSERT_RESULT(conn_->FetchRow<float>(
+        Format("SELECT reltuples FROM pg_class WHERE relname='$0'", kTableName))),
+      kNumRows);
 
   const std::array<std::string, 4> create_index_stmts = {
       Format("CREATE INDEX CONCURRENTLY ON $0 USING gin (v)", kTableName),
@@ -2114,15 +2141,15 @@ TEST_F(PgIndexBackfillTest,
       auto create_conn = ASSERT_RESULT(ConnectToDB(kDatabaseName));
       ASSERT_OK(create_conn.Execute(stmt));
     });
+    bool nonconcurrently = false;
     if (stmt.find("NONCONCURRENTLY") != std::string::npos) {
-      ASSERT_OK(WaitForIndexProgressOutput(cols, Format(
-          "$0, backfilling, CREATE INDEX NONCONCURRENTLY, $1, $1",
-          kDatabaseName, num_rows_indexed_table)));
-    } else {
-      ASSERT_OK(WaitForIndexProgressOutput(cols, Format(
-          "$0, backfilling, CREATE INDEX CONCURRENTLY, $1, $1",
-          kDatabaseName, num_rows_indexed_table)));
+      nonconcurrently = true;
     }
+    ASSERT_OK((WaitForIndexProgressOutput(
+        cols,
+        std::make_tuple(kDatabaseName, kPhaseBackfilling,
+                        nonconcurrently ? kCommandNonconcurrently : kCommandConcurrently,
+                        kNumRows, kNumRows))));
     ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "none"));
     thread_holder_.JoinAll();
   }
@@ -2133,7 +2160,7 @@ TEST_F(PgIndexBackfillTest,
 TEST_F(PgIndexBackfillTest,
        YB_DISABLE_TEST_IN_TSAN(PgStatProgressCreateIndexPartitioned)) {
   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "backfill"));
-  constexpr int kNumPartitions = 3;
+  constexpr int64_t kNumPartitions = 3;
   ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (i int) PARTITION BY RANGE(i)", kTableName));
   ASSERT_OK(conn_->ExecuteFormat(
     "CREATE TABLE $0_1 PARTITION OF $0 FOR VALUES FROM (1) TO (31)", kTableName));
@@ -2155,14 +2182,16 @@ TEST_F(PgIndexBackfillTest,
   constexpr auto cols =
       "datname, command, phase, tuples_done, tuples_total, partitions_total, partitions_done";
   // Verify entries for the partitioned indexes.
-  for (int i = 0; i < kNumPartitions; ++i) {
-    ASSERT_OK(WaitForIndexProgressOutput(cols, Format(
-        "$0, CREATE INDEX NONCONCURRENTLY, initializing, 0, 30, $1, $2",
-        kDatabaseName, kNumPartitions, i)));
+  for (int64_t i = 0; i < kNumPartitions; ++i) {
+    ASSERT_OK((WaitForIndexProgressOutput(
+        cols,
+        std::make_tuple(kDatabaseName, kCommandNonconcurrently, kPhaseInitializing,
+                        static_cast<int64_t>(0), static_cast<int64_t>(30), kNumPartitions, i))));
     ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "postbackfill"));
-    ASSERT_OK(WaitForIndexProgressOutput(cols, Format(
-        "$0, CREATE INDEX NONCONCURRENTLY, backfilling, 30, 30, $1, $2",
-        kDatabaseName, kNumPartitions, i)));
+    ASSERT_OK(WaitForIndexProgressOutput(
+        cols,
+        std::make_tuple(kDatabaseName, kCommandNonconcurrently, kPhaseBackfilling,
+                        static_cast<int64_t>(30), static_cast<int64_t>(30), kNumPartitions, i)));
     ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "backfill"));
   }
   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_test_block_index_phase", "none"));
@@ -2174,8 +2203,8 @@ TEST_F(PgIndexBackfillTest,
 TEST_F_EX(PgIndexBackfillTest,
           PgStatProgressCreateIndexDifferentDatabase,
           PgIndexBackfillBlockDoBackfill) {
-  constexpr int kNumRows = 10;
-  constexpr auto kTestDatabaseName = "test_db";
+  constexpr int64_t kNumRows = 10;
+  const auto kTestDatabaseName = "test_db"s;
 
   ASSERT_OK(conn_->ExecuteFormat("CREATE DATABASE $0", kTestDatabaseName));
   auto new_db_conn = ASSERT_RESULT(ConnectToDB(kTestDatabaseName));
@@ -2183,9 +2212,10 @@ TEST_F_EX(PgIndexBackfillTest,
   ASSERT_OK(new_db_conn.ExecuteFormat(
       "INSERT INTO $0 VALUES (generate_series(1, $1))", kTableName, kNumRows));
   ASSERT_OK(new_db_conn.ExecuteFormat("ANALYZE $0", kTableName));
-  const auto num_rows_indexed_table = ASSERT_RESULT(new_db_conn.FetchValue<float>(
-      Format("SELECT reltuples FROM pg_class WHERE relname='$0'", kTableName)
-  ));
+  ASSERT_EQ(
+      ASSERT_RESULT(new_db_conn.FetchRow<float>(
+        Format("SELECT reltuples FROM pg_class WHERE relname='$0'", kTableName))),
+      kNumRows);
 
   thread_holder_.AddThreadFunctor([&new_db_conn] {
     LOG(INFO) << "Begin create thread";
@@ -2193,9 +2223,10 @@ TEST_F_EX(PgIndexBackfillTest,
   });
 
   constexpr auto cols = "datname, phase, command, tuples_total, tuples_done";
-  ASSERT_OK(WaitForIndexProgressOutput(cols, Format(
-      "$0, backfilling, CREATE INDEX CONCURRENTLY, $1, 0",
-      kTestDatabaseName, num_rows_indexed_table)));
+  ASSERT_OK(WaitForIndexProgressOutput(
+      cols,
+      std::make_tuple(kTestDatabaseName, kPhaseBackfilling, kCommandConcurrently, kNumRows,
+                      static_cast<int64_t>(0))));
   ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
   thread_holder_.Stop();
 }
@@ -2254,8 +2285,8 @@ TEST_F_EX(PgIndexBackfillTest,
   LOG(INFO) << "Validate data";
   const std::string query = Format("SELECT * FROM $0 ORDER BY j", kTableName);
   ASSERT_OK(WaitForIndexScan(query));
-  ASSERT_EQ("1, 2; 3, 5", ASSERT_RESULT(conn_->FetchAllAsString(query)));
+  auto rows = ASSERT_RESULT((conn_->FetchRows<int32_t, int32_t>(query)));
+  ASSERT_EQ(rows, (decltype(rows){{1, 2}, {3, 5}}));
 }
 
-} // namespace pgwrapper
-} // namespace yb
+} // namespace yb::pgwrapper

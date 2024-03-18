@@ -2,6 +2,7 @@ package helpers
 
 import (
     "encoding/json"
+    "net/url"
 )
 
 type PlacementBlock struct {
@@ -15,9 +16,14 @@ type ReplicasStruct struct {
     PlacementUuid   string           `json:"placement_uuid"`
 }
 
+type MultiAffinitizedLeader struct {
+    Zones []CloudInfoStruct `json:"zones"`
+ }
+
 type ReplicationInfoStruct struct {
-    LiveReplicas ReplicasStruct   `json:"live_replicas"`
-    ReadReplicas []ReplicasStruct `json:"read_replicas"`
+    LiveReplicas              ReplicasStruct          `json:"live_replicas"`
+    ReadReplicas             []ReplicasStruct         `json:"read_replicas"`
+    MultiAffinitizedLeaders  []MultiAffinitizedLeader `json:"multi_affinitized_leaders"`
 }
 
 type EncryptionInfoStruct struct {
@@ -44,18 +50,11 @@ func (h *HelperContainer) GetClusterConfigFuture(nodeHost string, future chan Cl
         ClusterConfig: ClusterConfigStruct{},
         Error:         nil,
     }
-    urls, err := h.BuildMasterURLs("api/v1/cluster-config")
-    if err != nil {
-        clusterConfig.Error = err
-        future <- clusterConfig
-        return
-    }
-    body, err := h.AttemptGetRequests(urls, true)
-    if err != nil {
-        clusterConfig.Error = err
-        future <- clusterConfig
-        return
-    }
+    body, err := h.BuildMasterURLsAndAttemptGetRequests(
+        "api/v1/cluster-config", // path
+        url.Values{}, // params
+        true, // expectJson
+    )
     if err != nil {
         clusterConfig.Error = err
         future <- clusterConfig

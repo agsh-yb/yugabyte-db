@@ -1,27 +1,48 @@
 ---
-title: Writes
-headerTitle: Writes
-linkTitle: Writes
-description: Writes in YugabyteDB.
-headcontent: Write performance when scaling out
+title: Scaling writes
+headerTitle: Scaling writes
+linkTitle: Scaling writes
+description: Writes scale horizontally in YugabyteDB as you add more nodes
+headcontent: Write performance when scaling horizontally
 menu:
   preview:
-    name: Writes
     identifier: scaling-writes
     parent: explore-scalability
-    weight: 50
+    weight: 40
 type: docs
 ---
 
-Writes scale linearly in YugabyteDB as more nodes are added to the cluster.
+Writes scale linearly in YugabyteDB as more nodes are added to the cluster. [Write](../../../architecture/transactions/single-row-transactions/) operations are more involved than [reads](../scaling-reads). This is because the write operation has to be replicated to a quorum before it is acknowledged to the application. Although writes are internally considered as transactions, YugabyteDB has a lot of [optimizations for single-row transactions](../../../architecture/transactions/transactions-overview/#single-row-transactions) and achieves high performance.
 
-In YugabyteDB, the rows are [sharded into tablets](../../../architecture/docdb-sharding/sharding/) based on the primary key (or the row ID when a primary key is not defined), and these tablets are distributed across the nodes in the cluster. Because data is distributed across the different nodes in the cluster, YugabyteDB can perform parallel write operations, which results in linear scaling of performance when nodes are added to the cluster.
+Let's go over how writes work and see how well they scale in YugabyteDB.
 
-YugabyteDB can clock more than 1 million writes/second in both [YSQL](../../../api/ysql/) and [YCQL](../../../api/ycql/) APIs.
+## How writes work
+
+When an application connected to a node sends a write request for a key, YugabyteDB first identifies the location of the tablet leader containing the row with the key specified. After the location of the tablet leader is identified, the request is internally re-directed to the node containing the tablet leader for the requested key.
+
+In the following illustration, you can see that the application sent the request for `UPDATE K=5` to `NODE-2`. The system identified that the key `K=5` is located in `NODE-1` and internally redirected the request to that node.
+
+![How does a write work](/images/explore/scalability/scaling-write-working.png)
+
+The leader replicates the write to the followers, updates any indexes if needed, and then acknowledges the write back to the application. The replication to followers adds additional latency to the request. A basic write involves a maximum of just 2 nodes.
+
+In the following illustration, you can see that the leader `T2` in `NODE-1` for key `K=5`, replicates the update request to its followers in `NODE-2` and `NODE-4`.
+
+![How does a write work](/images/explore/scalability/scaling-write-multiple-fetches.png)
+
+If multiple rows have to be fetched and are located in different tablets, various rows are internally fetched from various tablets located in different nodes. This redirection is completely transparent to the application.
+
+## Sysbench workload
+
+The following shows how writes scale horizontally in YugabyteDB using a [Sysbench](../../../benchmark/sysbench-ysql/) workload of basic inserts. The cluster consisted of m6i.4xlarge instances and had 1024 connections. All requests had a latency of less than 10ms.
+
+![Scaling with Sysbench](/images/explore/scalability/scaling-writes-sysbench.png)
+
+You can clearly see that with an increase in the number of nodes, the number of writes scales linearly.
 
 ## YSQL - 1 million writes/second
 
-On a 100-node YugabyteDB cluster set up with c5.4xlarge instances (16 vCPUs at 3.3GHz) in a single zone, the cluster performed 1.26 million writes/second with 1.7ms latency.
+On a 100-node YugabyteDB cluster using c5.4xlarge instances (16 vCPUs at 3.3GHz) in a single zone, the cluster performed 1.26 million writes/second with 1.7ms latency.
 
 The cluster configuration is shown in the following illustration.
 

@@ -19,12 +19,12 @@
 #include "yb/client/client_fwd.h"
 
 #include "yb/common/common_fwd.h"
+#include "yb/common/opid.h"
 
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
-#include "yb/util/opid.h"
 
 namespace yb {
 
@@ -285,6 +285,10 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
 // In case of tablet splitting YBSession can flush an operation to an outdated tablet and this can
 // be retried by the session internally without returning error to upper layers.
 bool ShouldSessionRetryError(const Status& status);
+
+int YsqlClientReadWriteTimeoutMs();
+int SysCatalogRetryableRequestTimeoutSecs();
+int RetryableRequestTimeoutSecs(TableType table_type);
 
 } // namespace client
 } // namespace yb

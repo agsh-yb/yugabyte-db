@@ -36,6 +36,7 @@
 
 #include <boost/optional.hpp>
 
+#include "yb/cdc/cdc_service.pb.h"
 #include "yb/client/client.h"
 #include "yb/client/yb_table_name.h"
 
@@ -69,6 +70,7 @@ class ConsensusServiceProxy;
 
 namespace client {
 class YBClient;
+class XClusterClient;
 }
 
 namespace tools {
@@ -320,6 +322,8 @@ class ClusterAdminClient {
 
   Status GetWalRetentionSecs(const client::YBTableName& table_name);
 
+  Status GetAutoFlagsConfig();
+
   Status PromoteAutoFlags(
       const std::string& max_flag_class, const bool promote_non_runtime_flags, const bool force);
 
@@ -328,7 +332,7 @@ class ClusterAdminClient {
   Status PromoteSingleAutoFlag(const std::string& process_name, const std::string& flag_name);
   Status DemoteSingleAutoFlag(const std::string& process_name, const std::string& flag_name);
 
-  Status ListAllNamespaces();
+  Status ListAllNamespaces(bool include_nonrunning = false);
 
   // Snapshot operations.
   Result<master::ListSnapshotsResponsePB> ListSnapshots(const ListSnapshotsFlags& flags);
@@ -347,6 +351,10 @@ class ClusterAdminClient {
   Result<rapidjson::Document> DeleteSnapshotSchedule(const SnapshotScheduleId& schedule_id);
   Result<rapidjson::Document> RestoreSnapshotSchedule(
       const SnapshotScheduleId& schedule_id, HybridTime restore_at);
+  Result<rapidjson::Document> CloneNamespace(
+      const TypedNamespaceName& source_namespace, const std::string& target_namespace_name,
+      HybridTime restore_at);
+  Result<rapidjson::Document> IsCloneDone(const NamespaceId& source_namespace_id, uint32_t seq_no);
   Status RestoreSnapshot(const std::string& snapshot_id, HybridTime timestamp);
 
   Result<rapidjson::Document> EditSnapshotSchedule(
@@ -356,13 +364,11 @@ class ClusterAdminClient {
 
   Status DeleteSnapshot(const std::string& snapshot_id);
   Status AbortSnapshotRestore(const TxnSnapshotRestorationId& restoration_id);
+  Status CreateSnapshotMetaFile(const std::string& snapshot_id, const std::string& file_name);
 
-  Status CreateSnapshotMetaFile(const std::string& snapshot_id,
-                                const std::string& file_name);
-  Status ImportSnapshotMetaFile(const std::string& file_name,
-                                const TypedNamespaceName& keyspace,
-                                const std::vector<client::YBTableName>& tables,
-                                bool selective_import);
+  Status ImportSnapshotMetaFile(
+      const std::string& file_name, const TypedNamespaceName& keyspace,
+      const std::vector<client::YBTableName>& tables, bool selective_import);
   Status ListReplicaTypeCounts(const client::YBTableName& table_name);
 
   Status SetPreferredZones(const std::vector<std::string>& preferred_zones);
@@ -388,7 +394,8 @@ class ClusterAdminClient {
 
   Status CreateCDCSDKDBStream(
       const TypedNamespaceName& ns, const std::string& CheckPointType,
-      const std::string& RecordType);
+      const cdc::CDCRecordType RecordType,
+      const std::string& ConsistentSnapshotOption);
 
   Status DeleteCDCStream(const std::string& stream_id, bool force_delete = false);
 
@@ -400,39 +407,39 @@ class ClusterAdminClient {
 
   Status GetCDCDBStreamInfo(const std::string& db_stream_id);
 
+  Status YsqlBackfillReplicationSlotNameToCDCSDKStream(
+      const std::string& stream_id, const std::string& replication_slot_name);
+
   Status SetupNamespaceReplicationWithBootstrap(const std::string& replication_id,
                                   const std::vector<std::string>& producer_addresses,
                                   const TypedNamespaceName& ns,
                                   bool transactional);
 
-  Status SetupUniverseReplication(const std::string& producer_uuid,
+  Status SetupUniverseReplication(const std::string& replication_group_id,
                                   const std::vector<std::string>& producer_addresses,
                                   const std::vector<TableId>& tables,
                                   const std::vector<std::string>& producer_bootstrap_ids,
                                   bool transactional);
 
-  Status DeleteUniverseReplication(const std::string& producer_id,
+  Status DeleteUniverseReplication(const std::string& replication_group_id,
                                    bool ignore_errors = false);
 
   Status AlterUniverseReplication(
-      const std::string& producer_uuid,
-      const std::vector<std::string>& producer_addresses,
-      const std::vector<TableId>& add_tables,
-      const std::vector<TableId>& remove_tables,
+      const std::string& replication_group_id, const std::vector<std::string>& producer_addresses,
+      const std::vector<TableId>& add_tables, const std::vector<TableId>& remove_tables,
       const std::vector<std::string>& producer_bootstrap_ids_to_add,
-      const std::string& new_producer_universe_id,
-      bool remove_table_ignore_errors = false);
+      const std::string& new_replication_group_id, bool remove_table_ignore_errors = false);
 
   Status RenameUniverseReplication(const std::string& old_universe_name,
                                    const std::string& new_universe_name);
 
   Status WaitForReplicationBootstrapToFinish(const std::string& replication_id);
 
-  Status WaitForSetupUniverseReplicationToFinish(const std::string& producer_uuid);
+  Status WaitForSetupUniverseReplicationToFinish(const std::string& replication_group_id);
 
   Status ChangeXClusterRole(cdc::XClusterRole role);
 
-  Status SetUniverseReplicationEnabled(const std::string& producer_id,
+  Status SetUniverseReplicationEnabled(const std::string& replication_group_id,
                                        bool is_enabled);
 
   Status PauseResumeXClusterProducerStreams(
@@ -443,13 +450,31 @@ class ClusterAdminClient {
   Status WaitForReplicationDrain(
       const std::vector<xrepl::StreamId>& stream_ids, const std::string& target_time);
 
-  Status SetupNSUniverseReplication(const std::string& producer_uuid,
+  Status SetupNSUniverseReplication(const std::string& replication_group_id,
                                     const std::vector<std::string>& producer_addresses,
                                     const TypedNamespaceName& producer_namespace);
 
-  Status GetReplicationInfo(const std::string& universe_uuid);
+  Status GetReplicationInfo(const std::string& replication_group_id);
 
   Result<rapidjson::Document> GetXClusterSafeTime(bool include_lag_and_skew = false);
+
+  Result<std::vector<NamespaceId>> CheckpointXClusterReplication(
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const std::vector<NamespaceName> databases);
+
+  Result<bool> IsXClusterBootstrapRequired(
+      const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId namespace_id);
+
+  Status CreateXClusterReplication(
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const std::string& target_master_addresses);
+
+  Status WaitForCreateXClusterReplication(
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const std::string& target_master_addresses);
+
+  Status DeleteXClusterOutboundReplicationGroup(
+      const xcluster::ReplicationGroupId& replication_group_id);
 
  protected:
   // Fetch the locations of the replicas for a given tablet from the Master.
@@ -530,6 +555,8 @@ class ClusterAdminClient {
   Result<master::IsTabletSplittingCompleteResponsePB> IsTabletSplittingCompleteInternal(
       bool wait_for_parent_deletion, const MonoDelta timeout = MonoDelta());
 
+  client::XClusterClient XClusterClient();
+
   std::string master_addr_list_;
   HostPort init_master_addr_;
   const MonoDelta timeout_;
@@ -586,7 +613,7 @@ class ClusterAdminClient {
       const MonoDelta timeout = MonoDelta());
 
   using NamespaceMap = std::unordered_map<NamespaceId, client::NamespaceInfo>;
-  Result<const NamespaceMap&> GetNamespaceMap();
+  Result<const NamespaceMap&> GetNamespaceMap(bool include_nonrunning = false);
 
   Result<TxnSnapshotId> SuitableSnapshotId(
       const SnapshotScheduleId& schedule_id, HybridTime restore_at, CoarseTimePoint deadline);
@@ -596,7 +623,7 @@ class ClusterAdminClient {
   Result<HostPort> GetFirstRpcAddressForTS();
 
   void CleanupEnvironmentOnSetupUniverseReplicationFailure(
-    const std::string& producer_uuid, const Status& failure_status);
+    const std::string& replication_group_id, const Status& failure_status);
 
   Status DisableTabletSplitsDuringRestore(CoarseTimePoint deadline);
 

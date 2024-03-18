@@ -602,6 +602,27 @@ _copyBitmapHeapScan(const BitmapHeapScan *from)
 }
 
 /*
+ * _copyBitmapHeapScan
+ */
+static YbBitmapTableScan *
+_copyYbBitmapTableScan(const YbBitmapTableScan *from)
+{
+	YbBitmapTableScan *newnode = makeNode(YbBitmapTableScan);
+
+	/*
+	 * copy node superclass fields
+	 */
+	CopyScanFields((const Scan *) from, (Scan *) newnode);
+
+	/*
+	 * copy remainder of node
+	 */
+	COPY_NODE_FIELD(bitmapqualorig);
+
+	return newnode;
+}
+
+/*
  * _copyTidScan
  */
 static TidScan *
@@ -912,10 +933,18 @@ _copyYbBatchedNestLoop(const YbBatchedNestLoop *from)
 			from->num_hashClauseInfos * sizeof(YbBNLHashClauseInfo));
 
 	for (int i = 0; i < from->num_hashClauseInfos; i++)
-	{
-		newnode->hashClauseInfos[i].outerParamExpr =
+		newnode->hashClauseInfos[i].outerParamExpr = (Expr *)
 			copyObject(from->hashClauseInfos[i].outerParamExpr);
-	}
+
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].orig_expr = (Expr *)
+			copyObject(from->hashClauseInfos[i].orig_expr);
+
+	COPY_SCALAR_FIELD(numSortCols);
+	COPY_POINTER_FIELD(sortColIdx, from->numSortCols * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(sortOperators, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(collations, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(nullsFirst, from->numSortCols * sizeof(bool));
 
 	return newnode;
 }
@@ -5028,6 +5057,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_BitmapHeapScan:
 			retval = _copyBitmapHeapScan(from);
+			break;
+		case T_YbBitmapTableScan:
+			retval = _copyYbBitmapTableScan(from);
 			break;
 		case T_TidScan:
 			retval = _copyTidScan(from);

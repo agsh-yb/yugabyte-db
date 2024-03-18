@@ -16,6 +16,8 @@
 
 #include <fstream>
 
+#include "yb/ash/wait_state.h"
+
 #include "yb/common/pgsql_error.h"
 #include "yb/common/transaction_error.h"
 #include "yb/common/wire_protocol.h"
@@ -30,6 +32,7 @@
 #include "yb/util/init.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 #include "yb/util/thread.h"
@@ -184,12 +187,35 @@ YBPgErrorCode FetchErrorCode(YBCStatus s) {
   return result;
 }
 
+// Used for ASH to extract the name for a given enum, after
+// removing the leading "k"-prefix.
+template <class Enum>
+const char* NoPrefixName(Enum value) {
+  const char* name = ToCString(value);
+  if (!name) {
+    DCHECK(false);
+    return nullptr;
+  }
+  return name + 1;
+}
+
 } // anonymous namespace
 
 extern "C" {
 
 bool YBCStatusIsNotFound(YBCStatus s) {
   return StatusWrapper(s)->IsNotFound();
+}
+
+// Checks if the status corresponds to an "Unknown Session" error
+bool YBCStatusIsUnknownSession(YBCStatus s) {
+  // The semantics of the "Unknown session" error is overloaded. It is used to indicate both:
+  // 1. Session with an invalid ID
+  // 2. An expired session
+  // We would like to terminate the connection only in case of an expired session.
+  // However, since we are unable to distinguish between the two, we handle both cases identically.
+  return StatusWrapper(s)->IsInvalidArgument() &&
+         FetchErrorCode(s) == YBPgErrorCode::YB_PG_CONNECTION_DOES_NOT_EXIST;
 }
 
 bool YBCStatusIsDuplicateKey(YBCStatus s) {
@@ -206,6 +232,14 @@ bool YBCStatusIsTryAgain(YBCStatus s) {
 
 bool YBCStatusIsAlreadyPresent(YBCStatus s) {
   return StatusWrapper(s)->IsAlreadyPresent();
+}
+
+bool YBCStatusIsReplicationSlotLimitReached(YBCStatus s) {
+  return StatusWrapper(s)->IsReplicationSlotLimitReached();
+}
+
+bool YBCStatusIsFatalError(YBCStatus s) {
+  return YBCStatusIsUnknownSession(s);
 }
 
 uint32_t YBCStatusPgsqlError(YBCStatus s) {
@@ -285,6 +319,10 @@ bool YBCIsTxnSkipLockingError(uint16_t txn_errcode) {
 
 bool YBCIsTxnDeadlockError(uint16_t txn_errcode) {
   return txn_errcode == to_underlying(TransactionErrorCode::kDeadlock);
+}
+
+bool YBCIsTxnAbortedError(uint16_t txn_errcode) {
+  return txn_errcode == to_underlying(TransactionErrorCode::kAborted);
 }
 
 uint16_t YBCGetTxnConflictErrorCode() {
@@ -380,6 +418,32 @@ double YBCEvalHashValueSelectivity(int32_t hash_low, int32_t hash_high) {
 
 void YBCInitThreading() {
   InitThreading();
+}
+
+void YBCGenerateAshRootRequestId(unsigned char *root_request_id) {
+  uint64_t a = RandomUniformInt<uint64_t>();
+  uint64_t b = RandomUniformInt<uint64_t>();
+  std::memcpy(root_request_id, &a, sizeof(uint64_t));
+  std::memcpy(root_request_id + sizeof(uint64_t), &b, sizeof(uint64_t));
+}
+
+const char* YBCGetWaitEventName(uint32_t wait_event_info) {
+  constexpr uint32_t kWaitEventMask = (1 << YB_ASH_COMPONENT_POSITION) - 1;
+  uint32_t wait_event = wait_event_info & kWaitEventMask;
+  return NoPrefixName(static_cast<ash::WaitStateCode>(wait_event));
+}
+
+const char* YBCGetWaitEventClass(uint32_t wait_event_info) {
+  /* The highest 8 bits are needed to get the wait event class */
+  constexpr uint8_t kAshClassMask = (1 << YB_ASH_CLASS_BITS) - 1;
+  uint8_t class_id = narrow_cast<uint8_t>(wait_event_info >> YB_ASH_CLASS_POSITION) & kAshClassMask;
+  return NoPrefixName(static_cast<ash::Class>(class_id));
+}
+
+const char* YBCGetWaitEventComponent(uint32_t wait_event_info) {
+  /* The highest 4 bits are needed to get the wait event component */
+  uint8_t comp_id = narrow_cast<uint8_t>(wait_event_info >> YB_ASH_COMPONENT_POSITION);
+  return NoPrefixName(static_cast<ash::Component>(comp_id));
 }
 
 } // extern "C"

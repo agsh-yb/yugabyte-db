@@ -47,8 +47,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.collections.MapUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.security.crypto.encrypt.Encryptors;
 import org.springframework.security.crypto.encrypt.TextEncryptor;
@@ -554,7 +554,7 @@ public class CommonUtils {
       List<T> list, T entry, BiFunction<T, T, Boolean> equalityCheck) {
     if (list instanceof BeanList) {
       BeanList<T> beanList = (BeanList<T>) list;
-      Set<T> removedBeans = beanList.getModifyRemovals();
+      Set<T> removedBeans = beanList.modifyRemovals();
       if (CollectionUtils.isEmpty(removedBeans)) {
         return null;
       }
@@ -678,6 +678,18 @@ public class CommonUtils {
     return compareReleases(thresholdRelease, actualRelease, false, false, true);
   }
 
+  /**
+   * This method compares 2 version strings. Make sure to only compare stable with stable and
+   * preview with preview if using this function. If you are not sure of either, use method {@link
+   * com.yugabyte.yw.common.Util#compareYBVersions}.
+   *
+   * @param thresholdRelease
+   * @param actualRelease
+   * @param beforeMatches
+   * @param afterMatches
+   * @param equalMatches
+   * @return
+   */
   private static boolean compareReleases(
       String thresholdRelease,
       String actualRelease,

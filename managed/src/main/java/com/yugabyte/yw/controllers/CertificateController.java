@@ -186,7 +186,10 @@ public class CertificateController extends AuthenticatedController {
     return PlatformResults.withData(certUUID);
   }
 
-  @ApiOperation(value = "YbaApi Internal. Create a self signed certificate", response = UUID.class)
+  @ApiOperation(
+      notes = "YbaApi Internal.",
+      value = "Create a self signed certificate",
+      response = UUID.class)
   @ApiImplicitParams(
       @ApiImplicitParam(
           name = "label",
@@ -227,7 +230,8 @@ public class CertificateController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "YbaApi Internal. Add a client certificate",
+      notes = "YbaApi Internal.",
+      value = "Add a client certificate",
       response = CertificateDetails.class)
   @ApiImplicitParams(
       @ApiImplicitParam(
@@ -328,10 +332,17 @@ public class CertificateController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "YbaApi Internal. Get a certificate's UUID",
+      notes = "YbaApi Internal.",
+      value = "Get a certificate's UUID",
       response = UUID.class,
       nickname = "getCertificate")
   @YbaApi(visibility = YbaApiVisibility.INTERNAL, sinceYBAVersion = "2.20.0.0")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.READ),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result get(UUID customerUUID, String label) {
     Customer.getOrBadRequest(customerUUID);
     CertificateInfo cert = CertificateInfo.getOrBadRequest(customerUUID, label);
@@ -411,7 +422,8 @@ public class CertificateController extends AuthenticatedController {
   }
 
   @ApiOperation(
-      value = "YbaApi Internal. Update an empty certificate",
+      notes = "YbaApi Internal.",
+      value = "Update an empty certificate",
       response = CertificateInfoExt.class)
   @AuthzPath({
     @RequiredPermissionOnResource(

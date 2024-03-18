@@ -83,8 +83,10 @@ import org.yb.client.YBClient;
 import org.yb.master.MasterDdlOuterClass.ListTablesResponsePB.TableInfo;
 import org.yb.master.MasterTypes.RelationType;
 import org.yb.ybc.BackupServiceTaskCreateRequest;
+import org.yb.ybc.CloudStoreConfig;
 import org.yb.ybc.CloudStoreSpec;
 import org.yb.ybc.NamespaceType;
+import org.yb.ybc.ProxyConfig;
 import play.libs.Json;
 
 @Slf4j
@@ -103,6 +105,7 @@ public class BackupHelper {
   private StorageUtilFactory storageUtilFactory;
   private ValidateReplicationInfo validateReplicationInfo;
   private NodeUniverseManager nodeUniverseManager;
+  private YbcBackupUtil ybcBackupUtil;
   @Inject Commissioner commissioner;
 
   @Inject
@@ -114,7 +117,8 @@ public class BackupHelper {
       StorageUtilFactory storageUtilFactory,
       Commissioner commisssioner,
       ValidateReplicationInfo validateReplicationInfo,
-      NodeUniverseManager nodeUniverseManager) {
+      NodeUniverseManager nodeUniverseManager,
+      YbcBackupUtil ybcBackupUtil) {
     this.ybcManager = ybcManager;
     this.ybClientService = ybClientService;
     this.customerConfigService = customerConfigService;
@@ -122,6 +126,7 @@ public class BackupHelper {
     this.storageUtilFactory = storageUtilFactory;
     this.validateReplicationInfo = validateReplicationInfo;
     this.nodeUniverseManager = nodeUniverseManager;
+    this.ybcBackupUtil = ybcBackupUtil;
     // this.commissioner = commissioner;
   }
 
@@ -130,13 +135,12 @@ public class BackupHelper {
   }
 
   public boolean abortBackupTask(UUID taskUUID) {
-    boolean status = commissioner.abortTask(taskUUID);
-    return status;
+    return commissioner.abortTask(taskUUID, false);
   }
 
   public List<UUID> getBackupUUIDList(UUID taskUUID) {
     List<Backup> backups = Backup.fetchAllBackupsByTaskUUID(taskUUID);
-    List<UUID> uuidList = new ArrayList<UUID>();
+    List<UUID> uuidList = new ArrayList<UUID>(backups.size());
 
     for (Backup b : backups) {
       uuidList.add(b.getBackupUUID());
@@ -196,7 +200,6 @@ public class BackupHelper {
               "Invalid parallel backups value provided for universe %s",
               universe.getUniverseUUID()));
     }
-    validateBackupRequest(taskParams.keyspaceTableList, universe, taskParams.backupType);
 
     if (taskParams.timeBeforeDelete != 0L && taskParams.expiryTimeUnit == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Please provide time unit for backup expiry");
@@ -235,8 +238,8 @@ public class BackupHelper {
         throw new PlatformServiceException(
             BAD_REQUEST, "No previous successful backup found, please trigger a new base backup.");
       }
-      validateStorageConfigOnBackup(customerConfig, previousBackup);
-    } else {
+    }
+    if (!isSkipConfigBasedPreflightValidation(universe)) {
       validateStorageConfig(customerConfig);
     }
     UUID taskUUID = commissioner.submit(TaskType.CreateBackup, taskParams);
@@ -284,27 +287,27 @@ public class BackupHelper {
     if (CollectionUtils.isEmpty(taskParams.backupStorageInfoList)) {
       throw new PlatformServiceException(BAD_REQUEST, "Backup information not provided");
     }
-    validateRestoreOverwrites(taskParams.backupStorageInfoList, universe, taskParams.category);
+
     CustomerConfig customerConfig =
         customerConfigService.getOrBadRequest(customerUUID, taskParams.storageConfigUUID);
     if (!customerConfig.getState().equals(ConfigState.Active)) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Cannot restore backup as config is queued for deletion.");
     }
-    // Even though we check with default location below, this is needed to validate
-    // regional locations, because their validity is not known to us when we send restore
-    // request with a config.
-    validateStorageConfig(customerConfig);
+
     CustomerConfigStorageData configData =
         (CustomerConfigStorageData) customerConfig.getDataObject();
 
-    storageUtilFactory
-        .getStorageUtil(customerConfig.getName())
-        .validateStorageConfigOnLocationsList(
-            configData,
-            taskParams.backupStorageInfoList.parallelStream()
-                .map(bSI -> bSI.storageLocation)
-                .collect(Collectors.toSet()));
+    if (!isSkipConfigBasedPreflightValidation(universe)) {
+      storageUtilFactory
+          .getStorageUtil(customerConfig.getName())
+          .validateStorageConfigOnDefaultLocationsList(
+              configData,
+              taskParams.backupStorageInfoList.parallelStream()
+                  .map(bSI -> bSI.storageLocation)
+                  .collect(Collectors.toSet()),
+              false);
+    }
 
     if (taskParams.category.equals(BackupCategory.YB_CONTROLLER) && !universe.isYbcEnabled()) {
       throw new PlatformServiceException(
@@ -442,10 +445,8 @@ public class BackupHelper {
     storageUtilFactory.getStorageUtil(config.getName()).validateStorageConfig(configData);
   }
 
-  // API facing restore overwrite check to fail upfront at controller level. This is
-  // not a comprehensive check( atleast for YBC, for yb_backup this is the most we can do ).
   public void validateRestoreOverwrites(
-      List<BackupStorageInfo> backupStorageInfos, Universe universe, Backup.BackupCategory category)
+      List<BackupStorageInfo> backupStorageInfos, Universe universe)
       throws PlatformServiceException {
     List<TableInfo> tableInfoList = getTableInfosOrEmpty(universe);
     for (BackupStorageInfo backupInfo : backupStorageInfos) {
@@ -527,17 +528,56 @@ public class BackupHelper {
             });
   }
 
-  public void validateStorageConfigForRestoreTask(
-      UUID storageConfigUUID, UUID customerUUID, Collection<YbcBackupResponse> successMarkers) {
+  /**
+   * Validate YB-Controller based restores using success marker metadata. The method validates the
+   * following 3 things:
+   *
+   * <p>1. The Storage config which is used for restore must contain all regions used in the backup.
+   *
+   * <p>2. The relative path of the backup i.e. the cloud directories inside the buckets must be
+   * listable using the credentials provided.
+   *
+   * <p>3. The step (2) but done on database nodes(only default cloudDir) instead of YBA.
+   *
+   * @param storageConfigUUID
+   * @param customerUUID
+   * @param universeUUID
+   * @param successMarkers
+   */
+  public void validateStorageConfigForYbcRestoreTask(
+      UUID storageConfigUUID,
+      UUID customerUUID,
+      UUID universeUUID,
+      Collection<YbcBackupResponse> successMarkers) {
+    Universe universe = Universe.getOrBadRequest(universeUUID);
+    if (isSkipConfigBasedPreflightValidation(universe)) {
+      return;
+    }
     CustomerConfig storageConfig =
         customerConfigService.getOrBadRequest(customerUUID, storageConfigUUID);
     CustomerConfigData configData = storageConfig.getDataObject();
-    successMarkers.stream()
-        .forEach(
-            sM ->
-                storageUtilFactory
-                    .getStorageUtil(storageConfig.getName())
-                    .validateStorageConfigOnSuccessMarker(configData, sM));
+    StorageUtil storageUtil = storageUtilFactory.getStorageUtil(storageConfig.getName());
+    Map<String, String> configLocationMap = storageUtil.getRegionLocationsMap(configData);
+    for (YbcBackupResponse successMarker : successMarkers) {
+      Map<String, YbcBackupResponse.ResponseCloudStoreSpec.BucketLocation>
+          successMarkerBucketLocationMap =
+              successMarker.responseCloudStoreSpec.getBucketLocationsMap();
+      successMarkerBucketLocationMap.entrySet().stream()
+          .forEach(
+              sME -> {
+                if (!configLocationMap.containsKey(sME.getKey())) {
+                  throw new PlatformServiceException(
+                      PRECONDITION_FAILED,
+                      String.format("Storage config does not contain region %s", sME.getKey()));
+                }
+              });
+      // Verify all regions locations including default from Platform.
+      storageUtil.checkListObjectsWithYbcSuccessMarkerCloudStore(
+          configData, successMarker.responseCloudStoreSpec);
+      // Verify on Universe nodes.
+      validateStorageConfigForRestoreOnUniverse(
+          storageConfig, universe, successMarker.responseCloudStoreSpec.getBucketLocationsMap());
+    }
   }
 
   public void validateBackupRequest(
@@ -782,8 +822,8 @@ public class BackupHelper {
     // Validate storage config is usable
     storageUtilFactory
         .getStorageUtil(storageConfig.getName())
-        .validateStorageConfigOnLocationsList(
-            storageConfig.getDataObject(), preflightParams.getBackupLocations());
+        .validateStorageConfigOnDefaultLocationsList(
+            storageConfig.getDataObject(), preflightParams.getBackupLocations(), false);
 
     UUID backupUUID = preflightParams.getBackupUUID();
     if (backupUUID != null) {
@@ -975,6 +1015,18 @@ public class BackupHelper {
         ybcSuccessMarkerMap, selectiveRestoreYbcCheck, filterIndexes, tablespaceResponsesMap);
   }
 
+  public boolean checkFileExistsOnBackupLocation(
+      UUID configUUID,
+      UUID customerUUID,
+      Set<String> storagelocationList,
+      UUID universeUUID,
+      String fileName,
+      boolean checkExistsOnAll) {
+    CustomerConfig storageConfig = customerConfigService.getOrBadRequest(customerUUID, configUUID);
+    return checkFileExistsOnBackupLocation(
+        storageConfig, storagelocationList, universeUUID, fileName, checkExistsOnAll);
+  }
+
   // Pass list of locations and particular file. The checkExistsOnAll
   // will determine OR or AND of file existence.
   public boolean checkFileExistsOnBackupLocation(
@@ -1008,6 +1060,7 @@ public class BackupHelper {
    */
   public Map<String, YbcBackupResponse> getYbcSuccessMarker(
       CustomerConfig storageConfig, Set<String> storageLocationList, UUID universeUUID) {
+    Universe universe = Universe.getOrBadRequest(universeUUID);
     Map<String, String> successMarkerStrs = new HashMap<>();
     try {
       storageLocationList.stream()
@@ -1017,10 +1070,15 @@ public class BackupHelper {
                     storageUtilFactory
                         .getStorageUtil(storageConfig.getName())
                         .createDsmCloudStoreSpec(bL, storageConfig.getDataObject());
+                ProxyConfig proxyConfig =
+                    storageUtilFactory
+                        .getStorageUtil(storageConfig.getName())
+                        .createYbcProxyConfig(universe, storageConfig.getDataObject());
                 String taskId = UUID.randomUUID().toString() + "_preflight_success_marker";
                 // Need to assign some namespace type here, real context does not change.
                 BackupServiceTaskCreateRequest smDownloadRequest =
-                    YbcBackupUtil.createDsmRequest(successMarkerCSSpec, taskId, NamespaceType.YCQL);
+                    YbcBackupUtil.createDsmRequest(
+                        successMarkerCSSpec, taskId, NamespaceType.YCQL, proxyConfig);
                 String successMarkerStr =
                     ybcManager.downloadSuccessMarker(smDownloadRequest, universeUUID, taskId);
                 if (StringUtils.isBlank(successMarkerStr)) {
@@ -1041,5 +1099,102 @@ public class BackupHelper {
     } catch (Exception e) {
       throw new RuntimeException("Parse error for success marker files", e.getCause());
     }
+  }
+
+  /**
+   * Validate storage config for backup on Universe using YBC gRPC. Currently we only validate
+   * default location. Adding region specific validation is a TODO.
+   *
+   * @param config
+   * @param universe
+   */
+  public void validateStorageConfigForBackupOnUniverse(CustomerConfig config, Universe universe) {
+    if (isSkipConfigBasedPreflightValidation(universe)) {
+      return;
+    }
+    List<NodeDetails> nodeDetailsList = universe.getRunningTserversInPrimaryCluster();
+    for (NodeDetails node : nodeDetailsList) {
+      ybcManager.validateCloudConfigIgnoreIfYbcUnavailable(
+          node.cloudInfo.private_ip,
+          universe,
+          ybcBackupUtil.getCloudStoreConfigWithProvidedRegions(config, null, universe));
+    }
+  }
+
+  /**
+   * Validate storage config for Restore on Universe using YBC gRPC. We validate default region
+   * configuration on available YBC servers. Adding region specific validation is a TODO.
+   *
+   * @param config
+   * @param universe
+   * @param bucketLocationsMap
+   */
+  public void validateStorageConfigForRestoreOnUniverse(
+      CustomerConfig config,
+      Universe universe,
+      Map<String, YbcBackupResponse.ResponseCloudStoreSpec.BucketLocation> bucketLocationsMap) {
+    if (isSkipConfigBasedPreflightValidation(universe)) {
+      return;
+    }
+    List<NodeDetails> nodeDetailsList = universe.getRunningTserversInPrimaryCluster();
+    for (NodeDetails node : nodeDetailsList) {
+      ybcManager.validateCloudConfigIgnoreIfYbcUnavailable(
+          node.cloudInfo.private_ip,
+          universe,
+          ybcBackupUtil.getCloudStoreConfigWithBucketLocationsMap(
+              config, bucketLocationsMap, universe));
+    }
+  }
+
+  public void validateStorageConfigForSuccessMarkerDownloadOnUniverse(
+      CustomerConfig config, Universe universe, Set<String> successMarkerLocations) {
+    if (isSkipConfigBasedPreflightValidation(universe)) {
+      return;
+    }
+    List<NodeDetails> nodeDetailsList = universe.getRunningTserversInPrimaryCluster();
+    for (String successMarkerLoc : successMarkerLocations) {
+      CloudStoreSpec successMarkerCSSpec =
+          storageUtilFactory
+              .getStorageUtil(config.getName())
+              .createDsmCloudStoreSpec(successMarkerLoc, config.getDataObject());
+      ProxyConfig proxyConfig =
+          storageUtilFactory
+              .getStorageUtil(config.getName())
+              .createYbcProxyConfig(universe, config.getDataObject());
+      CloudStoreConfig csConfig =
+          YbcBackupUtil.getCloudStoreConfig(successMarkerCSSpec, null, proxyConfig);
+      for (NodeDetails node : nodeDetailsList) {
+        ybcManager.validateCloudConfigIgnoreIfYbcUnavailable(
+            node.cloudInfo.private_ip, universe, csConfig);
+      }
+    }
+  }
+
+  /**
+   * Validate storage config on running Universe nodes.
+   *
+   * @param customerConfig
+   * @param universe
+   * @param ybcBackup
+   */
+  public void validateStorageConfigOnRunningUniverseNodes(
+      CustomerConfig customerConfig, Universe universe, boolean ybcBackup) {
+    if (isSkipConfigBasedPreflightValidation(universe)) {
+      return;
+    }
+    // Validate storage config on running Universe nodes.
+    if (ybcBackup) {
+      validateStorageConfigForBackupOnUniverse(customerConfig, universe);
+    } else {
+      // Only for NFS non-YBC universes.
+      storageUtilFactory
+          .getStorageUtil(customerConfig.getName())
+          .validateStorageConfigOnUniverseNonRpc(customerConfig, universe);
+    }
+  }
+
+  public boolean isSkipConfigBasedPreflightValidation(Universe universe) {
+    return confGetter.getConfForScope(
+        universe, UniverseConfKeys.skipConfigBasedPreflightValidation);
   }
 }

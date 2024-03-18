@@ -1,6 +1,6 @@
 // Copyright (c) YugaByte, Inc.
 import { Component } from 'react';
-import { Alert, Row, Panel } from 'react-bootstrap';
+import { Alert, Row, Panel, OverlayTrigger, Tooltip } from 'react-bootstrap';
 import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import moment from 'moment-timezone';
 import { sortBy, values } from 'lodash';
@@ -12,7 +12,7 @@ import { isNonEmptyArray, isEmptyArray, isNonEmptyString } from '../../../../uti
 import { getPromiseState } from '../../../../utils/PromiseUtils';
 import { UniverseAction } from '../../../universes';
 import { isDisabled, isNotHidden } from '../../../../utils/LayoutUtils';
-import { getPrimaryCluster } from '../../../../utils/UniverseUtils';
+import { getPrimaryCluster, isKubernetesUniverse } from '../../../../utils/UniverseUtils';
 import Wrench from '../../../../redesign/assets/wrench.svg';
 
 import './UniverseHealthCheckList.scss';
@@ -21,11 +21,13 @@ export const UniverseHealthCheckList = (props) => {
   const {
     universe: { healthCheck, currentUniverse },
     currentCustomer,
-    currentUser
+    currentUser,
+    isNodeAgentEnabled
   } = props;
   const primaryCluster = getPrimaryCluster(
     props?.universe?.currentUniverse?.data?.universeDetails?.clusters
   );
+  const isK8universe = isKubernetesUniverse(currentUniverse.data);
   const useSystemd = primaryCluster?.userIntent?.useSystemd;
   let nodesCronStatus = <span />;
   const inactiveCronNodes = getNodesWithInactiveCrons(currentUniverse.data).join(', ');
@@ -56,6 +58,8 @@ export const UniverseHealthCheckList = (props) => {
         timestamp={timestamp}
         index={index}
         universeDetails={currentUniverse?.data?.universeDetails}
+        isK8universe={isK8universe}
+        isNodeAgentEnabled={isNodeAgentEnabled}
       />
     ));
   }
@@ -100,7 +104,7 @@ class Timestamp extends Component {
   }
 
   render() {
-    const { timestamp, index, universeDetails } = this.props;
+    const { timestamp, index, universeDetails, isK8universe, isNodeAgentEnabled } = this.props;
     const { isNodeAgentStatusModalOpen } = this.state;
     const defaultExpanded = this.state.isOpen || index === 0;
 
@@ -126,7 +130,7 @@ class Timestamp extends Component {
             <span>{timestampFormatter(timestamp.timestampMoment)}</span>
             <div className="universe-status">
               {countFormatter(timestamp.errorNodes, 'node', 'nodes', true, false, 'failing')}
-              {isNonEmptyArray(timestamp.errorNodes) && (
+              {isNonEmptyArray(timestamp.errorNodes) && !isK8universe && isNodeAgentEnabled && (
                 <>
                   <img src={Wrench} alt="wrench" />
                   <span
@@ -162,6 +166,22 @@ class Timestamp extends Component {
   }
 }
 
+const IPAddressTooltip = (node) => {
+  const IPAddressSubstring = node.ipAddress.substring(0, 120);
+  return (
+    <OverlayTrigger
+      placement="top"
+      overlay={
+        <Tooltip className="high-index" id="health-check-ip-tooltip">
+          {node.ipAddress}
+        </Tooltip>
+      }
+    >
+      <span className="tree-node-main-heading">{`${IPAddressSubstring}...`}</span>
+    </OverlayTrigger>
+  );
+};
+
 const NodeList = (props) => {
   const { nodes, defaultExpanded } = props;
   return (
@@ -172,7 +192,10 @@ const NodeList = (props) => {
           defaultExpanded={defaultExpanded}
           header={
             <span>
-              <span className="tree-node-main-heading">{node.ipAddress}</span>-
+              <span className="tree-node-main-heading">
+                {node.ipAddress.length > 120 ? IPAddressTooltip(node) : node.ipAddress}
+              </span>
+              -
               {node.passingChecks.length > 0 &&
                 countFormatter(node.passingChecks, 'check', 'checks', false, false, 'OK')}
               {node.failedChecks.length > 0 &&

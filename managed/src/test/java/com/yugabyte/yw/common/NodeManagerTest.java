@@ -95,7 +95,6 @@ import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -251,10 +250,7 @@ public class NodeManagerTest extends FakeDBApplication {
     params.azUuid = testData.zone.getUuid();
     params.instanceType = testData.node.getInstanceTypeCode();
     params.nodeName = testData.node.getNodeName();
-    Iterator<NodeDetails> iter = universe.getNodes().iterator();
-    if (iter.hasNext()) {
-      params.nodeUuid = iter.next().nodeUuid;
-    }
+    params.nodeUuid = testData.node.getNodeUuid();
     params.setUniverseUUID(universe.getUniverseUUID());
     params.placementUuid = universe.getUniverseDetails().getPrimaryCluster().uuid;
     params.currentClusterType = ClusterType.PRIMARY;
@@ -515,8 +511,10 @@ public class NodeManagerTest extends FakeDBApplication {
     testData.addAll(getTestData(customer, Common.CloudType.gcp));
     testData.addAll(getTestData(customer, Common.CloudType.onprem));
     ReleaseManager.ReleaseMetadata releaseMetadata = new ReleaseManager.ReleaseMetadata();
+    ReleaseContainer release =
+        new ReleaseContainer(releaseMetadata, mockCloudUtilFactory, mockConfig);
     releaseMetadata.filePath = "/yb/release.tar.gz";
-    when(releaseManager.getReleaseByVersion("0.0.1")).thenReturn(releaseMetadata);
+    when(releaseManager.getReleaseByVersion("0.0.1")).thenReturn(release);
     when(mockConfig.getString(NodeManager.BOOT_SCRIPT_PATH)).thenReturn("");
     when(mockConfGetter.getStaticConf()).thenReturn(mockConfig);
     when(mockConfGetter.getConfForScope(
@@ -568,6 +566,14 @@ public class NodeManagerTest extends FakeDBApplication {
     when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.ssh2Enabled))).thenReturn(false);
     when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.devopsCommandTimeout)))
         .thenReturn(Duration.ofHours(1));
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.destroyServerCommandTimeout)))
+        .thenReturn(Duration.ofMinutes(10));
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.acceptableClockSkewWaitEnabled)))
+        .thenReturn(true);
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.waitForClockSyncMaxAcceptableClockSkew)))
+        .thenReturn(Duration.ofMillis(500));
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.waitForClockSyncTimeout)))
+        .thenReturn(Duration.ofSeconds(300));
 
     when(mockConfGetter.getConfForScope(
             any(Universe.class), eq(UniverseConfKeys.notifyPeerOnRemoval)))
@@ -598,11 +604,19 @@ public class NodeManagerTest extends FakeDBApplication {
       TestData testData,
       boolean useHostname) {
     Map<String, String> gflags = new TreeMap<>();
+    String processType = params.getProperty("processType");
     gflags.put("placement_cloud", configureParams.getProvider().getCode());
     gflags.put("placement_region", configureParams.getRegion().getCode());
     gflags.put("placement_zone", configureParams.getAZ().getCode());
+    if (ServerType.MASTER.name().equals(processType)) {
+      gflags.put("master_join_existing_universe", "true");
+    }
     gflags.put("max_log_size", "256");
-    gflags.put("undefok", "enable_ysql");
+    if (ServerType.MASTER.name().equals(processType)) {
+      gflags.put("undefok", "master_join_existing_universe,enable_ysql");
+    } else {
+      gflags.put("undefok", "enable_ysql");
+    }
     gflags.put("placement_uuid", String.valueOf(configureParams.placementUuid));
     gflags.put("metric_node_name", configureParams.nodeName);
 
@@ -613,8 +627,6 @@ public class NodeManagerTest extends FakeDBApplication {
 
     String index = testData.node.getDetails().nodeName.split("-n")[1];
     String private_ip = "10.0.0." + index;
-    String processType = params.getProperty("processType");
-
     if (processType == null) {
       gflags.put("master_addresses", "");
     } else if (processType.equals(ServerType.TSERVER.name())) {
@@ -700,6 +712,7 @@ public class NodeManagerTest extends FakeDBApplication {
     gflags.put("cluster_uuid", String.valueOf(configureParams.getUniverseUUID()));
     if (configureParams.isMaster) {
       gflags.put("replication_factor", String.valueOf(userIntent.replicationFactor));
+      gflags.put("load_balancer_initial_delay_secs", "480");
     }
 
     if (configureParams.currentClusterType == UniverseDefinitionTaskParams.ClusterType.PRIMARY
@@ -869,12 +882,10 @@ public class NodeManagerTest extends FakeDBApplication {
           expectedCommand.add(setupParams.instanceType);
         }
 
-        if (cloud.equals(Common.CloudType.gcp)) {
-          String ybImage = testData.region.getYbImage();
-          if (ybImage != null && !ybImage.isEmpty()) {
-            expectedCommand.add("--machine_image");
-            expectedCommand.add(ybImage);
-          }
+        String ybImage = testData.region.getYbImage();
+        if (ybImage != null && !ybImage.isEmpty()) {
+          expectedCommand.add("--machine_image");
+          expectedCommand.add(ybImage);
         }
 
         if ((cloud.equals(Common.CloudType.aws) || cloud.equals(Common.CloudType.gcp))
@@ -894,7 +905,6 @@ public class NodeManagerTest extends FakeDBApplication {
           expectedCommand.add("--master_addresses_for_master");
           expectedCommand.add(MASTER_ADDRESSES);
         }
-
         expectedCommand.add("--master_http_port");
         expectedCommand.add("7000");
         expectedCommand.add("--master_rpc_port");
@@ -1139,6 +1149,11 @@ public class NodeManagerTest extends FakeDBApplication {
                 Json.toJson(
                     getExtraGflags(configureParams, params, userIntent, testData, useHostname))));
 
+        expectedCommand.add("--acceptable_clock_skew_wait_enabled");
+        expectedCommand.add("--acceptable_clock_skew_sec");
+        expectedCommand.add("0.500000000");
+        expectedCommand.add("--acceptable_clock_skew_max_tries");
+        expectedCommand.add("300");
         break;
       case Destroy:
         AnsibleDestroyServer.Params destroyParams = (AnsibleDestroyServer.Params) params;
@@ -2328,13 +2343,9 @@ public class NodeManagerTest extends FakeDBApplication {
 
         verify(shellProcessHandler, times(3)).run(captor.capture(), any(ShellProcessContext.class));
 
-        Map<String, String> cloudGflags = extractGFlags(captor.getAllValues().get(0));
-        assertEquals(
-            new TreeMap<>(params.gflags), new TreeMap<>(cloudGflags)); // Not processed at all.
-
         Map<String, String> gflagsProcessed = extractGFlags(captor.getAllValues().get(1));
         Map<String, String> copy = new TreeMap<>(params.gflags);
-        copy.put(GFlagsUtil.UNDEFOK, "use_private_ip,enable_ysql");
+        copy.put(GFlagsUtil.UNDEFOK, "use_private_ip,master_join_existing_universe,enable_ysql");
         String jwksFileName1 = "";
         String jwksFileName2 = "";
         try {
@@ -2368,7 +2379,7 @@ public class NodeManagerTest extends FakeDBApplication {
 
         Map<String, String> gflagsNotFiltered = extractGFlags(captor.getAllValues().get(2));
         Map<String, String> copy2 = new TreeMap<>(params.gflags);
-        copy2.put(GFlagsUtil.UNDEFOK, "use_private_ip,enable_ysql");
+        copy2.put(GFlagsUtil.UNDEFOK, "use_private_ip,master_join_existing_universe,enable_ysql");
         copy2.put(
             GFlagsUtil.YSQL_HBA_CONF_CSV,
             String.format(
@@ -2388,6 +2399,9 @@ public class NodeManagerTest extends FakeDBApplication {
         copy2.put(GFlagsUtil.CSQL_PROXY_BIND_ADDRESS, "0.0.0.0:9042");
         copy2.put(GFlagsUtil.PSQL_PROXY_BIND_ADDRESS, "0.1.2.3:5433");
         assertEquals(copy2, new TreeMap<>(gflagsNotFiltered));
+
+        Map<String, String> cloudGflags = extractGFlags(captor.getAllValues().get(0));
+        assertEquals(copy2, new TreeMap<>(cloudGflags)); // Non filtered as well
       }
     }
   }

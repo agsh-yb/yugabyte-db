@@ -1859,6 +1859,21 @@ _readBitmapHeapScan(void)
 }
 
 /*
+ * _readBitmapHeapScan
+ */
+static YbBitmapTableScan *
+_readYbBitmapTableScan(void)
+{
+	READ_LOCALS(YbBitmapTableScan);
+
+	ReadCommonScan(&local_node->scan);
+
+	READ_NODE_FIELD(bitmapqualorig);
+
+	READ_DONE();
+}
+
+/*
  * _readTidScan
  */
 static TidScan *
@@ -2111,6 +2126,16 @@ _readYbBatchedNestLoop(void)
 	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
 		local_node->hashClauseInfos[i].outerParamExpr = nodeRead(NULL, 0);
 
+	/* Ignore :orig_expr */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+		local_node->hashClauseInfos[i].orig_expr = nodeRead(NULL, 0);
+
+	READ_INT_FIELD(numSortCols);
+	READ_ATTRNUMBER_ARRAY(sortColIdx, local_node->numSortCols);
+	READ_OID_ARRAY(sortOperators, local_node->numSortCols);
+	READ_OID_ARRAY(collations, local_node->numSortCols);
+	READ_BOOL_ARRAY(nullsFirst, local_node->numSortCols);
 	READ_DONE();
 }
 
@@ -2609,6 +2634,22 @@ _readPartitionRangeDatum(void)
 }
 
 /*
+ * _readYbExprParamDesc
+ */
+static YbExprColrefDesc *
+_readYbExprColrefDesc(void)
+{
+	READ_LOCALS(YbExprColrefDesc);
+
+	READ_INT_FIELD(attno);
+	READ_OID_FIELD(typid);
+	READ_INT_FIELD(typmod);
+	READ_OID_FIELD(collid);
+
+	READ_DONE();
+}
+
+/*
  * parseNodeString
  *
  * Given a character string representing a node tree, parseNodeString creates
@@ -2793,6 +2834,8 @@ parseNodeString(void)
 		return_value = _readBitmapIndexScan();
 	else if (MATCH("BITMAPHEAPSCAN", 14))
 		return_value = _readBitmapHeapScan();
+	else if (MATCH("YBBITMAPTABLESCAN", 17))
+		return_value = _readYbBitmapTableScan();
 	else if (MATCH("TIDSCAN", 7))
 		return_value = _readTidScan();
 	else if (MATCH("SUBQUERYSCAN", 12))
@@ -2871,6 +2914,8 @@ parseNodeString(void)
 		return_value = _readPartitionBoundSpec();
 	else if (MATCH("PARTITIONRANGEDATUM", 19))
 		return_value = _readPartitionRangeDatum();
+	else if (MATCH("YBEXPRCOLREFDESC", 16))
+		return_value = _readYbExprColrefDesc();
 	else
 	{
 		elog(ERROR, "badly formatted node string \"%.32s\"...", token);

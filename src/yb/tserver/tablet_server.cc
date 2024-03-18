@@ -37,10 +37,7 @@
 #include <list>
 #include <thread>
 #include <utility>
-#include <vector>
 
-#include "yb/client/auto_flags_manager.h"
-#include "yb/client/client.h"
 #include "yb/client/client_fwd.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/client/universe_key_client.h"
@@ -68,8 +65,9 @@
 #include "yb/rpc/yb_rpc.h"
 #include "yb/rpc/secure_stream.h"
 
+#include "yb/server/async_client_initializer.h"
 #include "yb/server/rpc_server.h"
-#include "yb/server/secure.h"
+#include "yb/rpc/secure.h"
 #include "yb/server/webserver.h"
 #include "yb/server/hybrid_clock.h"
 
@@ -85,8 +83,9 @@
 #include "yb/tserver/pg_table_mutation_count_sender.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver-path-handlers.h"
+#include "yb/tserver/tserver_auto_flags_manager.h"
 #include "yb/tserver/tserver_service.proxy.h"
-#include "yb/tserver/xcluster_consumer.h"
+#include "yb/tserver/xcluster_consumer_if.h"
 #include "yb/tserver/backup_service.h"
 
 #include "yb/cdc/cdc_service.h"
@@ -184,9 +183,9 @@ DEFINE_test_flag(uint64, pg_auth_key, 0, "Forces an auth key for the postgres us
 
 DECLARE_int32(num_concurrent_backfills_allowed);
 
-constexpr int kTServerYbClientDefaultTimeoutMs = 60 * 1000;
+constexpr int kTServerYBClientDefaultTimeoutMs = 60 * 1000;
 
-DEFINE_UNKNOWN_int32(tserver_yb_client_default_timeout_ms, kTServerYbClientDefaultTimeoutMs,
+DEFINE_UNKNOWN_int32(tserver_yb_client_default_timeout_ms, kTServerYBClientDefaultTimeoutMs,
              "Default timeout for the YBClient embedded into the tablet server that is used "
              "for distributed transactions.");
 
@@ -207,7 +206,6 @@ DEFINE_UNKNOWN_int32(xcluster_svc_queue_length, 5000,
              "RPC queue length for the xCluster service");
 TAG_FLAG(xcluster_svc_queue_length, advanced);
 
-DECLARE_string(cert_node_filename);
 DECLARE_bool(ysql_enable_table_mutation_counter);
 
 DEFINE_NON_RUNTIME_bool(allow_encryption_at_rest, true,
@@ -233,12 +231,10 @@ DEFINE_NON_RUNTIME_uint32(ysql_conn_mgr_port, yb::pgwrapper::PgProcessConf::kDef
     "Ysql Connection Manager port to which clients will connect. This must be different from the "
     "postgres port set via pgsql_proxy_bind_address. Default is 5433.");
 
-DEFINE_UNKNOWN_int32(check_pg_object_id_allocators_interval_secs, 3600 * 3,
-    "Interval at which the TS check pg object id allocators for dropped databases.");
-TAG_FLAG(check_pg_object_id_allocators_interval_secs, advanced);
+DEFINE_NON_RUNTIME_bool(start_pgsql_proxy, false,
+            "Whether to run a PostgreSQL server as a child process of the tablet server");
 
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
 namespace {
 
@@ -274,6 +270,15 @@ void PostgresAndYsqlConnMgrPortValidator() {
 REGISTER_CALLBACK(ysql_conn_mgr_port, "PostgresAndYsqlConnMgrPortValidator",
     &PostgresAndYsqlConnMgrPortValidator);
 
+void ValidateEnableYsqlConnMgr() {
+  if (FLAGS_enable_ysql_conn_mgr && !(FLAGS_start_pgsql_proxy || FLAGS_enable_ysql)) {
+    LOG(FATAL) << "Cannot start Ysql Connection Manager (YSQL is not enabled)";
+    return;
+  }
+  return;
+}
+
+REGISTER_CALLBACK(enable_ysql_conn_mgr, "ValidateEnableYsqlConnMgr", &ValidateEnableYsqlConnMgr);
 
 class CDCServiceContextImpl : public cdc::CDCServiceContext {
  public:
@@ -293,11 +298,15 @@ class CDCServiceContextImpl : public cdc::CDCServiceContext {
 
   const std::string& permanent_uuid() const override { return tablet_server_.permanent_uuid(); }
 
-  std::unique_ptr<client::AsyncClientInitialiser> MakeClientInitializer(
+  std::unique_ptr<client::AsyncClientInitializer> MakeClientInitializer(
       const std::string& client_name, MonoDelta default_timeout) const override {
-    return std::make_unique<client::AsyncClientInitialiser>(
+    return std::make_unique<client::AsyncClientInitializer>(
         client_name, default_timeout, tablet_server_.permanent_uuid(), &tablet_server_.options(),
         tablet_server_.metric_entity(), tablet_server_.mem_tracker(), tablet_server_.messenger());
+  }
+
+  Result<uint32> GetAutoFlagsConfigVersion() const override {
+    return tablet_server_.ValidateAndGetAutoFlagsConfigVersion();
   }
 
  private:
@@ -309,7 +318,7 @@ TabletServer::TabletServer(const TabletServerOptions& opts)
     : DbServerBase("TabletServer", opts, "yb.tabletserver", server::CreateMemTrackerForServer()),
       fail_heartbeats_for_tests_(false),
       opts_(opts),
-      auto_flags_manager_(new AutoFlagsManager("yb-tserver", fs_manager_.get())),
+      auto_flags_manager_(new TserverAutoFlagsManager(clock(), fs_manager_.get())),
       tablet_manager_(new TSTabletManager(fs_manager_.get(), this, metric_registry())),
       path_handlers_(new TabletServerPathHandlers(this)),
       maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
@@ -339,7 +348,7 @@ MonoDelta TabletServer::default_client_timeout() {
   return std::chrono::milliseconds(FLAGS_tserver_yb_client_default_timeout_ms);
 }
 
-void TabletServer::SetupAsyncClientInit(client::AsyncClientInitialiser* async_client_init) {
+void TabletServer::SetupAsyncClientInit(client::AsyncClientInitializer* async_client_init) {
   // If enabled, creates a proxy to call this tablet server locally.
   if (FLAGS_enable_direct_local_tablet_server_call) {
     proxy_ = std::make_shared<TabletServerServiceProxy>(proxy_cache_.get(), HostPort());
@@ -452,7 +461,8 @@ Status TabletServer::Init() {
     encryption::UniverseKeyRegistryPB universe_key_registry;
     while (true) {
       auto res = client::UniverseKeyClient::GetFullUniverseKeyRegistry(
-          options_.HostsString(), JoinStrings(master_addresses, ","), *fs_manager());
+          options_.HostsString(), JoinStrings(master_addresses, ","),
+          fs_manager()->GetDefaultRootDir());
       if (res.ok()) {
         universe_key_registry = *res;
         break;
@@ -504,14 +514,13 @@ Status TabletServer::Init() {
     shared_object().SetPostgresAuthKey(RandomUniformInt<uint64_t>());
   }
 
+  shared_object().SetTserverUuid(fs_manager()->uuid());
+
   return Status::OK();
 }
 
 Status TabletServer::InitAutoFlags() {
-  if (!VERIFY_RESULT(auto_flags_manager_->LoadFromFile())) {
-    RETURN_NOT_OK(auto_flags_manager_->LoadFromMaster(
-        options_.HostsString(), *opts_.GetMasterAddresses(), ApplyNonRuntimeAutoFlags::kTrue));
-  }
+  RETURN_NOT_OK(auto_flags_manager_->Init(options_.HostsString(), *opts_.GetMasterAddresses()));
 
   return RpcAndWebServerBase::InitAutoFlags();
 }
@@ -524,9 +533,13 @@ uint32_t TabletServer::GetAutoFlagConfigVersion() const {
   return auto_flags_manager_->GetConfigVersion();
 }
 
-Status TabletServer::SetAutoFlagConfig(const AutoFlagsConfigPB new_config) {
-  return auto_flags_manager_->LoadFromConfig(
-      std::move(new_config), ApplyNonRuntimeAutoFlags::kFalse);
+void TabletServer::HandleMasterHeartbeatResponse(
+    HybridTime heartbeat_sent_time, std::optional<AutoFlagsConfigPB> new_config) {
+  auto_flags_manager_->HandleMasterHeartbeatResponse(heartbeat_sent_time, std::move(new_config));
+}
+
+Result<uint32> TabletServer::ValidateAndGetAutoFlagsConfigVersion() const {
+  return auto_flags_manager_->ValidateAndGetConfigVersion();
 }
 
 AutoFlagsConfigPB TabletServer::TEST_GetAutoFlagConfig() const {
@@ -613,6 +626,7 @@ Status TabletServer::RegisterServices() {
   auto remote_bootstrap_service = std::make_shared<RemoteBootstrapServiceImpl>(
           fs_manager_.get(), tablet_manager_.get(), metric_entity(), this->MakeCloudInfoPB(),
           &this->proxy_cache());
+  remote_bootstrap_service_ = remote_bootstrap_service;
   LOG(INFO) << "yb::tserver::RemoteBootstrapServiceImpl created at " <<
     remote_bootstrap_service.get();
   RETURN_NOT_OK(RegisterService(
@@ -620,7 +634,8 @@ Status TabletServer::RegisterServices() {
   auto pg_client_service = std::make_shared<PgClientServiceImpl>(
       *this, tablet_manager_->client_future(), clock(),
       std::bind(&TabletServer::TransactionPool, this), mem_tracker(), metric_entity(),
-      &messenger()->scheduler(), XClusterContext(xcluster_safe_time_map_, xcluster_read_only_mode_),
+      messenger(), permanent_uuid(), &options(),
+      XClusterContext(xcluster_safe_time_map_, xcluster_read_only_mode_),
       &pg_node_level_mutation_counter_);
   pg_client_service_ = pg_client_service;
   LOG(INFO) << "yb::tserver::PgClientServiceImpl created at " << pg_client_service.get();
@@ -669,10 +684,6 @@ Status TabletServer::Start() {
   RETURN_NOT_OK(maintenance_manager_->Init());
 
   google::FlushLogFiles(google::INFO); // Flush the startup messages.
-
-  if (FLAGS_enable_ysql) {
-    ScheduleCheckObjectIdAllocators();
-  }
 
   return Status::OK();
 }
@@ -901,6 +912,24 @@ void TabletServer::SetYsqlDBCatalogVersions(
       std::make_pair(db_oid, CatalogVersionInfo({.current_version = new_version,
                                                  .last_breaking_version = new_breaking_version,
                                                  .shm_index = -1})));
+    if (ysql_db_catalog_version_map_.size() > 1) {
+      if (!catalog_version_table_in_perdb_mode_.has_value() ||
+          !catalog_version_table_in_perdb_mode_.value()) {
+        LOG(INFO) << "set pg_yb_catalog_version table in perdb mode";
+        catalog_version_table_in_perdb_mode_ = true;
+        shared_object().SetCatalogVersionTableInPerdbMode(true);
+      }
+    } else {
+      DCHECK_EQ(ysql_db_catalog_version_map_.size(), 1);
+      if (!catalog_version_table_in_perdb_mode_.has_value()) {
+        // We can initialize to false at most one time. Once set,
+        // catalog_version_table_in_perdb_mode_ can only go from false to
+        // true (i.e., from global mode to perdb mode).
+        LOG(INFO) << "set pg_yb_catalog_version table in global mode";
+        catalog_version_table_in_perdb_mode_ = false;
+        shared_object().SetCatalogVersionTableInPerdbMode(false);
+      }
+    }
     bool row_inserted = it.second;
     bool row_updated = false;
     int shm_index = -1;
@@ -1027,6 +1056,19 @@ void TabletServer::SetYsqlDBCatalogVersions(
   }
 }
 
+void TabletServer::WriteServerMetaCacheAsJson(JsonWriter* writer) {
+  writer->StartObject();
+  DbServerBase::WriteMainMetaCacheAsJson(writer);
+  if (auto xcluster_consumer = GetXClusterConsumer()) {
+    auto clients = xcluster_consumer->GetYbClientsList();
+    for (auto client : clients) {
+      writer->String(client->client_name());
+      client->AddMetaCacheInfo(writer);
+    }
+  }
+  writer->EndObject();
+}
+
 void TabletServer::UpdateTransactionTablesVersion(uint64_t new_version) {
   const auto transaction_manager = transaction_manager_.load(std::memory_order_acquire);
   if (transaction_manager) {
@@ -1144,13 +1186,13 @@ void TabletServer::InvalidatePgTableCache() {
 Status TabletServer::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
   RETURN_NOT_OK(DbServerBase::SetupMessengerBuilder(builder));
 
-  secure_context_ = VERIFY_RESULT(
-      server::SetupInternalSecureContext(options_.HostsString(), *fs_manager_, builder));
+  secure_context_ = VERIFY_RESULT(rpc::SetupInternalSecureContext(
+      options_.HostsString(), fs_manager_->GetDefaultRootDir(), builder));
 
   return Status::OK();
 }
 
-XClusterConsumer* TabletServer::GetXClusterConsumer() const {
+XClusterConsumerIf* TabletServer::GetXClusterConsumer() const {
   std::lock_guard l(xcluster_consumer_mutex_);
   return xcluster_consumer_.get();
 }
@@ -1167,13 +1209,8 @@ Status TabletServer::SetUniverseKeyRegistry(
 }
 
 Status TabletServer::CreateXClusterConsumer() {
-  auto is_leader_clbk = [this](const string& tablet_id) {
-    auto tablet_peer = tablet_manager_->LookupTablet(tablet_id);
-    if (!tablet_peer) {
-      return false;
-    }
-    return tablet_peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
-  };
+  std::lock_guard l(xcluster_consumer_mutex_);
+  SCHECK(!xcluster_consumer_, IllegalState, "XCluster consumer already exists");
 
   auto get_leader_term = [this](const TabletId& tablet_id) {
     auto tablet_peer = tablet_manager_->LookupTablet(tablet_id);
@@ -1182,24 +1219,77 @@ Status TabletServer::CreateXClusterConsumer() {
     }
     return tablet_peer->LeaderTerm();
   };
+  auto connect_to_pg = [this](const std::string& database_name, const CoarseTimePoint& deadline) {
+    return pgwrapper::CreateInternalPGConnBuilder(
+               pgsql_proxy_bind_address(), database_name, GetSharedMemoryPostgresAuthKey(),
+               deadline)
+        .Connect();
+  };
+  auto get_namespace_info =
+      [this](const TabletId& tablet_id) -> Result<std::pair<NamespaceId, NamespaceName>> {
+    auto tablet_peer = tablet_manager_->LookupTablet(tablet_id);
+    SCHECK(tablet_peer, NotFound, "Could not find tablet $0", tablet_id);
+    return std::make_pair(
+        tablet_peer->tablet_metadata()->namespace_id(),
+        tablet_peer->tablet_metadata()->namespace_name());
+  };
 
-  xcluster_consumer_ = VERIFY_RESULT(XClusterConsumer::Create(
-      std::move(is_leader_clbk), std::move(get_leader_term), proxy_cache_.get(), this));
+  xcluster_consumer_ = VERIFY_RESULT(tserver::CreateXClusterConsumer(
+      std::move(get_leader_term), std::move(connect_to_pg), std::move(get_namespace_info),
+      proxy_cache_.get(), this));
   return Status::OK();
 }
 
-Status TabletServer::SetConfigVersionAndConsumerRegistry(
-    int32_t cluster_config_version, const cdc::ConsumerRegistryPB* consumer_registry) {
-  std::lock_guard l(xcluster_consumer_mutex_);
+Status TabletServer::XClusterHandleMasterHeartbeatResponse(
+    const master::TSHeartbeatResponsePB& resp) {
+  auto* xcluster_consumer = GetXClusterConsumer();
 
-  // Only create a cdc consumer if consumer_registry is not null.
-  if (!xcluster_consumer_ && consumer_registry) {
-    RETURN_NOT_OK(CreateXClusterConsumer());
+  // Only create a xcluster consumer if consumer_registry is not null.
+  const cdc::ConsumerRegistryPB* consumer_registry = nullptr;
+  if (resp.has_consumer_registry()) {
+    consumer_registry = &resp.consumer_registry();
+
+    if (!xcluster_consumer) {
+      RETURN_NOT_OK(CreateXClusterConsumer());
+      xcluster_consumer = GetXClusterConsumer();
+    }
+
+    SetXClusterDDLOnlyMode(consumer_registry->role() != cdc::XClusterRole::ACTIVE);
   }
-  if (xcluster_consumer_) {
-    xcluster_consumer_->RefreshWithNewRegistryFromMaster(consumer_registry, cluster_config_version);
+
+  if (xcluster_consumer) {
+    int32_t cluster_config_version = -1;
+    if (!resp.has_cluster_config_version()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 30)
+          << "Invalid heartbeat response without a cluster config version";
+    } else {
+      cluster_config_version = resp.cluster_config_version();
+    }
+
+    xcluster_consumer->HandleMasterHeartbeatResponse(consumer_registry, cluster_config_version);
   }
+
+  // Check whether the cluster is a producer of a CDC stream.
+  if (resp.has_xcluster_enabled_on_producer() && resp.xcluster_enabled_on_producer()) {
+    RETURN_NOT_OK(SetCDCServiceEnabled());
+  }
+
+  if (resp.has_xcluster_producer_registry() && resp.has_xcluster_config_version()) {
+    RETURN_NOT_OK(SetPausedXClusterProducerStreams(
+        resp.xcluster_producer_registry().paused_producer_stream_ids(),
+        resp.xcluster_config_version()));
+  }
+
   return Status::OK();
+}
+
+Status TabletServer::ClearUniverseUuid() {
+  auto instance_universe_uuid_str = VERIFY_RESULT(
+      fs_manager_->GetUniverseUuidFromTserverInstanceMetadata());
+  auto instance_universe_uuid = VERIFY_RESULT(UniverseUuid::FromString(instance_universe_uuid_str));
+  SCHECK_EQ(false, instance_universe_uuid.IsNil(), IllegalState,
+      "universe_uuid is not set in instance metadata");
+  return fs_manager_->ClearUniverseUuidOnTserverInstanceMetadata();
 }
 
 Status TabletServer::ValidateAndMaybeSetUniverseUuid(const UniverseUuid& universe_uuid) {
@@ -1213,6 +1303,7 @@ Status TabletServer::ValidateAndMaybeSetUniverseUuid(const UniverseUuid& univers
                "uuid is $1", universe_uuid.ToString(), instance_universe_uuid.ToString()));
     return Status::OK();
   }
+
   return fs_manager_->SetUniverseUuidOnTserverInstanceMetadata(universe_uuid);
 }
 
@@ -1258,10 +1349,8 @@ Status TabletServer::ReloadKeysAndCertificates() {
     return Status::OK();
   }
 
-  RETURN_NOT_OK(server::ReloadSecureContextKeysAndCertificates(
-      secure_context_.get(),
-      fs_manager_->GetDefaultRootDir(),
-      server::SecureContextType::kInternal,
+  RETURN_NOT_OK(rpc::ReloadSecureContextKeysAndCertificates(
+      secure_context_.get(), fs_manager_->GetDefaultRootDir(), rpc::SecureContextType::kInternal,
       options_.HostsString()));
 
   std::lock_guard l(xcluster_consumer_mutex_);
@@ -1299,49 +1388,29 @@ void TabletServer::SetXClusterDDLOnlyMode(bool is_xcluster_read_only_mode) {
   xcluster_read_only_mode_.store(is_xcluster_read_only_mode, std::memory_order_release);
 }
 
-Result<std::unordered_set<uint32_t>> TabletServer::GetPgDatabaseOids() {
-  LOG(INFO) << "Read pg_database to get the set of database oids";
-  std::unordered_set<uint32_t> db_oids;
-  auto conn = VERIFY_RESULT(pgwrapper::PGConnBuilder({
-    .host = PgDeriveSocketDir(pgsql_proxy_bind_address()),
-    .port = pgsql_proxy_bind_address().port(),
-    .dbname = "template1",
-    .user = "postgres",
-    .password = UInt64ToString(GetSharedMemoryPostgresAuthKey()),
-  }).Connect());
+void TabletServer::SetCQLServer(yb::server::RpcAndWebServerBase* server) {
+  DCHECK_EQ(cql_server_.load(), nullptr);
+  cql_server_.store(server);
+}
 
-  auto res = VERIFY_RESULT(conn.Fetch("SELECT oid FROM pg_database"));
-  auto lines = PQntuples(res.get());
-  for (int i = 0; i != lines; ++i) {
-    const auto oid = VERIFY_RESULT(pgwrapper::GetValue<pgwrapper::PGOid>(res.get(), i, 0));
-    db_oids.insert(oid);
+rpc::Messenger* TabletServer::GetMessenger(ash::Component component) const {
+  switch (component) {
+    case ash::Component::kYSQL:
+    case ash::Component::kMaster:
+      return nullptr;
+    case ash::Component::kTServer:
+      return messenger();
+    case ash::Component::kYCQL:
+      auto cql_server = cql_server_.load();
+      return (cql_server ? cql_server->messenger() : nullptr);
   }
-  LOG(INFO) << "Successfully read " << db_oids.size() << " database oids from pg_database";
-  return db_oids;
+  FATAL_INVALID_ENUM_VALUE(ash::Component, component);
 }
 
-void TabletServer::ScheduleCheckObjectIdAllocators() {
-  messenger()->scheduler().Schedule(
-      [this](const Status& status) {
-        if (!status.ok()) {
-          LOG(INFO) << status;
-          return;
-        }
-        Result<std::unordered_set<uint32_t>> db_oids = GetPgDatabaseOids();
-        if (db_oids.ok()) {
-          auto pg_client_service = pg_client_service_.lock();
-          if (pg_client_service) {
-            pg_client_service->CheckObjectIdAllocators(*db_oids);
-          } else {
-            LOG(WARNING) << "Could not call CheckObjectIdAllocators";
-          }
-        } else {
-          LOG(WARNING) << "Could not get the set of database oids: " << ResultToStatus(db_oids);
-        }
-        ScheduleCheckObjectIdAllocators();
-      },
-      std::chrono::seconds(FLAGS_check_pg_object_id_allocators_interval_secs));
+void TabletServer::ClearAllMetaCachesOnServer() {
+  if (auto xcluster_consumer = GetXClusterConsumer()) {
+    xcluster_consumer->ClearAllClientMetaCaches();
+  }
+  client()->ClearAllMetaCachesOnServer();
 }
-
-}  // namespace tserver
-}  // namespace yb
+}  // namespace yb::tserver

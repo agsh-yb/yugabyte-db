@@ -25,11 +25,12 @@ import { YBLabelWithIcon } from '../../../common/descriptors';
 import { api, providerQueryKey, universeQueryKey } from '../../../../redesign/helpers/api';
 import { getInfraProviderTab, getLinkedUniverses } from '../utils';
 
-import styles from './ProviderView.module.scss';
 import { ProviderStatusLabel } from '../components/ProviderStatusLabel';
 import { useInterval } from 'react-use';
-import { RbacValidator, hasNecessaryPerm } from '../../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../../redesign/features/rbac/UserPermPathMapping';
+import { RbacValidator, hasNecessaryPerm } from '../../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { isRbacEnabled } from '../../../../redesign/features/rbac/common/RbacUtils';
+import styles from './ProviderView.module.scss';
 
 interface ProviderViewProps {
   providerUUID: string;
@@ -67,7 +68,7 @@ export const ProviderView = ({ providerUUID }: ProviderViewProps) => {
   if (providerQuery.isError) {
     return <YBErrorIndicator customErrorMessage="Error fetching provider." />;
   }
-  if (universeListQuery.isError) {
+  if (universeListQuery.isError && !isRbacEnabled()) {
     return <YBErrorIndicator customErrorMessage="Error fetching universe list." />;
   }
 
@@ -83,7 +84,7 @@ export const ProviderView = ({ providerUUID }: ProviderViewProps) => {
   };
 
   const providerConfig = providerQuery.data;
-  const universeList = universeListQuery.data;
+  const universeList = universeListQuery.data ?? [];
   const linkedUniverses = getLinkedUniverses(providerConfig.uuid, universeList);
   return (
     <div className={styles.viewContainer}>
@@ -98,20 +99,14 @@ export const ProviderView = ({ providerUUID }: ProviderViewProps) => {
           pullRight
         >
           <RbacValidator
-            accessRequiredOn={{
-              onResource: "CUSTOMER_ID",
-              ...UserPermissionMap.deleteProvider
-            }}
+            accessRequiredOn={ApiPermissionMap.DELETE_PROVIDER}
             isControl
             overrideStyle={{ display: 'block' }}
           >
             <MenuItem
               eventKey="1"
               onSelect={showDeleteProviderModal}
-              disabled={linkedUniverses.length > 0 || !hasNecessaryPerm({
-                onResource: "CUSTOMER_ID",
-                ...UserPermissionMap.deleteProvider
-              })}
+              disabled={linkedUniverses.length > 0 || !hasNecessaryPerm(ApiPermissionMap.DELETE_PROVIDER)}
             >
               <YBLabelWithIcon icon="fa fa-trash">Delete Configuration</YBLabelWithIcon>
             </MenuItem>
@@ -125,6 +120,6 @@ export const ProviderView = ({ providerUUID }: ProviderViewProps) => {
         providerConfig={providerConfig}
         redirectURL={`/${PROVIDER_ROUTE_PREFIX}/${getInfraProviderTab(providerConfig)}`}
       />
-    </div>
+    </div >
   );
 };

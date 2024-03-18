@@ -25,6 +25,7 @@ DECLARE_bool(TEST_consider_all_local_transaction_tables_local);
 DECLARE_bool(TEST_pause_sending_txn_status_requests);
 DECLARE_bool(TEST_select_all_status_tablets);
 DECLARE_bool(TEST_txn_status_moved_rpc_force_fail);
+DECLARE_bool(TEST_txn_status_moved_rpc_force_fail_retryable);
 DECLARE_bool(auto_create_local_transaction_tables);
 DECLARE_bool(auto_promote_nonlocal_transactions_to_global);
 DECLARE_bool(enable_wait_queues);
@@ -35,6 +36,7 @@ DECLARE_int32(TEST_old_txn_status_abort_delay_ms);
 DECLARE_int32(TEST_transaction_inject_flushed_delay_ms);
 DECLARE_int32(TEST_txn_status_moved_rpc_handle_delay_ms);
 DECLARE_int32(TEST_txn_status_moved_rpc_send_delay_ms);
+DECLARE_int32(TEST_new_txn_status_initial_heartbeat_delay_ms);
 DECLARE_int64(transaction_rpc_timeout_ms);
 DECLARE_string(ysql_pg_conf_csv);
 DECLARE_uint64(TEST_inject_sleep_before_applying_write_batch_ms);
@@ -210,10 +212,10 @@ class GeoTransactionsPromotionTest : public GeoTransactionsTestBase {
     if (success) {
       // Ensure data written is still fine.
       for (size_t i = 1; i <= tables_per_region_; ++i) {
-        ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchValue<int32_t>(strings::Substitute(
+        ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchRow<int32_t>(strings::Substitute(
             "SELECT value FROM $0$1_$2", kTablePrefix, kLocalRegion, i))));
       }
-      ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchValue<int32_t>(strings::Substitute(
+      ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchRow<int32_t>(strings::Substitute(
           "SELECT value FROM $0$1_1", kTablePrefix, kOtherRegion))));
     }
 
@@ -236,10 +238,10 @@ class GeoTransactionsPromotionTest : public GeoTransactionsTestBase {
 
     if (transaction_type == TestTransactionType::kCommit && success) {
       for (size_t i = 1; i <= tables_per_region_; ++i) {
-        ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchValue<int32_t>(strings::Substitute(
+        ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchRow<int32_t>(strings::Substitute(
             "SELECT value FROM $0$1_$2", kTablePrefix, kLocalRegion, i))));
       }
-      ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchValue<int32_t>(strings::Substitute(
+      ASSERT_EQ(field_value, EXPECT_RESULT(conn.FetchRow<int32_t>(strings::Substitute(
           "SELECT value FROM $0$1_1", kTablePrefix, kOtherRegion))));
     } else {
       for (size_t i = 1; i <= tables_per_region_; ++i) {
@@ -288,6 +290,14 @@ class GeoTransactionsPromotionTest : public GeoTransactionsTestBase {
   }
 };
 
+class GeoTransactionsPromotionConflictAbortTest : public GeoTransactionsPromotionTest {
+ public:
+  void SetUp() override {
+    EnableFailOnConflict();
+    GeoTransactionsPromotionTest::SetUp();
+  }
+};
+
 class GeoTransactionsPromotionRF1Test : public GeoTransactionsPromotionTest {
  protected:
   static constexpr auto kGlobalTable = "global_table";
@@ -329,7 +339,7 @@ class GeoTransactionsFailOnConflictTest : public GeoTransactionsPromotionTest {
   void SetUp() override {
     // This test depends on fail-on-conflict concurrency control to perform its validation.
     // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = false;
+    EnableFailOnConflict();
     GeoTransactionsPromotionTest::SetUp();
   }
 };
@@ -586,6 +596,7 @@ TEST_F(GeoTransactionsPromotionTest,
   auto rpc_timeout = static_cast<int32_t>(FLAGS_transaction_rpc_timeout_ms);
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_handle_delay_ms) = kInjectDelay;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_force_fail) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_force_fail_retryable) = true;
   auto pre_commit_hook = [rpc_timeout]() {
     std::this_thread::sleep_for(20 * kInjectDelay * 1ms);
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_handle_delay_ms) = 0;
@@ -608,6 +619,57 @@ TEST_F_EX(GeoTransactionsPromotionTest,
           GeoTransactionsFailOnConflictTest) {
   // Wait for heartbeat for conn1 to be informed about abort due to conflict before promotion.
   PerformConflictTest(0 /* delay_before_promotion_us */);
+}
+
+TEST_F(GeoTransactionsPromotionConflictAbortTest, TestConflictAbortBeforeNewHeartbeat) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_heartbeat_usec) =
+      3000000 * yb::kTimeMultiplier;
+
+  auto conn0 = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn0.ExecuteFormat(
+      "CREATE UNIQUE INDEX $0$1_1_key ON $0$1_1(value) TABLESPACE tablespace$1",
+      kTablePrefix, kLocalRegion));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_new_txn_status_initial_heartbeat_delay_ms) =
+      2000 * kTimeMultiplier;
+
+  auto conn1 = ASSERT_RESULT(Connect());
+  auto conn2 = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn1.Execute("SET force_global_transaction = false"));
+  ASSERT_OK(conn2.Execute("SET force_global_transaction = false"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_override_transaction_priority) = 100;
+  ASSERT_OK(conn1.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+  ASSERT_OK(conn1.ExecuteFormat(
+      "INSERT INTO $0$1_1(value, other_value) VALUES (1, 1)", kTablePrefix, kLocalRegion));
+
+  TestThreadHolder thread_holder;
+
+  thread_holder.AddThreadFunctor([&conn1] {
+    // Trigger promotion.
+    if (conn1.ExecuteFormat(
+        "INSERT INTO $0$1_1(value, other_value) VALUES (2, 1)", kTablePrefix, kOtherRegion).ok()) {
+      // Commit errors with a status only when all the previous statements have passed. Else it
+      // returns a Status::OK() but implicitly does a ROLLBACK (returning the message "ROLLBACK")
+      // to the user. Hence ASSERT_NOK on commit only when the previous statement succeeds.
+      ASSERT_NOK(conn1.CommitTransaction());
+    }
+  });
+
+  thread_holder.AddThreadFunctor([&conn2] {
+    // Give time for promotion to start, but not for initial heartbeat to be sent.
+    std::this_thread::sleep_for(1000ms * kTimeMultiplier);
+
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_override_transaction_priority) = 200;
+    ASSERT_OK(conn2.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+    // Trigger abort on conn1.
+    ASSERT_OK(conn2.ExecuteFormat(
+        "INSERT INTO $0$1_1(value, other_value) VALUES (1, 2)", kTablePrefix, kLocalRegion));
+    ASSERT_OK(conn2.CommitTransaction());
+  });
+  thread_holder.WaitAndStop(4000ms * kTimeMultiplier);
 }
 
 TEST_F(GeoTransactionsPromotionRF1Test,
@@ -635,6 +697,36 @@ TEST_F(GeoTransactionsPromotionRF1Test,
       VALUES ($1), ($2)
     )#", kGlobalTable, i, 10000 + i));
     ASSERT_OK(conn.CommitTransaction());
+  }
+}
+
+TEST_F(GeoTransactionsPromotionRF1Test, TestTwoTabletPromotionFailure) {
+  constexpr auto kNumIterations = 50;
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_force_fail) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_status_moved_rpc_force_fail_retryable) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("SET force_global_transaction = false"));
+  ASSERT_OK(conn.Execute("SET ysql_session_max_batch_size = 1"));
+  ASSERT_OK(conn.Execute("SET ysql_max_in_flight_ops = 2"));
+
+  for (int i = 0; i < kNumIterations; ++i) {
+    ASSERT_OK(conn.StartTransaction(IsolationLevel::SERIALIZABLE_ISOLATION));
+    // Start transaction as local.
+    ASSERT_OK(conn.ExecuteFormat(
+       "INSERT INTO $0$1_1(value, other_value) VALUES ($2, $2)", kTablePrefix, kLocalRegion, i));
+
+    // Query that may have two batches. The race condition can be reproduced when there are two
+    // batches that both require promotion (both non-local) that run simultaneously and both fail.
+    // If the race condition is not reproduced, this is expected to succeed, whereas if it is
+    // reproduced, this is expected to fail. So we allow both OK and non-OK status here.
+    static_cast<void>(conn.ExecuteFormat(R"#(
+      INSERT INTO $0(value)
+      VALUES ($1), ($2)
+    )#", kGlobalTable, i, 10000 + i));
+    ASSERT_OK(conn.RollbackTransaction());
   }
 }
 
@@ -910,11 +1002,10 @@ TEST_F(GeoPartitionedReadCommiittedTest, TestPromotionAmidstConflicts) {
   // Assert that the conflicting updates above go through successfully.
   auto conn = ASSERT_RESULT(Connect());
   for (int i = 1; i <= num_iterations/2; i++) {
-    auto rows_res = ASSERT_RESULT(conn.FetchFormat(
-        "SELECT people FROM $0 WHERE country='C$1'", table_name, i));
-    auto num_fetched_rows = PQntuples(rows_res.get());
-    for (int j = 0; j < num_fetched_rows; j++) {
-      ASSERT_EQ(num_sessions * 2, ASSERT_RESULT(pgwrapper::GetValue<int32>(rows_res.get(), j, 0)));
+    auto values = ASSERT_RESULT(conn.FetchRows<int32_t>(
+        Format("SELECT people FROM $0 WHERE country='C$1'", table_name, i)));
+    for (const auto value : values) {
+      ASSERT_EQ(value, num_sessions * 2);
     }
   }
 }
@@ -975,7 +1066,7 @@ TEST_F(GeoPartitionedReadCommiittedTest,
   ASSERT_OK(conn.CommitTransaction());
 
   thread_holder.WaitAndStop(60s * kTimeMultiplier);
-  auto res = ASSERT_RESULT(conn.FetchValue<int32_t>(Format(
+  auto res = ASSERT_RESULT(conn.FetchRow<int32_t>(Format(
       "SELECT people FROM $0 WHERE country='C0' AND state='$1'", table_name, kLocalState)));
   ASSERT_EQ(res, num_sessions + 1);
 }

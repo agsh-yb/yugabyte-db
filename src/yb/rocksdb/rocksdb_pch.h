@@ -45,6 +45,7 @@
 #include <forward_list>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iosfwd>
 #include <iostream>
 #include <iterator>
@@ -75,6 +76,7 @@
 #include <boost/atomic.hpp>
 #include <boost/container/small_vector.hpp>
 #include <boost/core/demangle.hpp>
+#include <boost/core/enable_if.hpp>
 #include <boost/function.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/mpl/and.hpp>
@@ -92,6 +94,7 @@
 #include <boost/range/iterator_range.hpp>
 #include <boost/smart_ptr/detail/yield_k.hpp>
 #include <boost/tti/has_type.hpp>
+#include <boost/type_traits.hpp>
 #include <boost/type_traits/make_signed.hpp>
 #include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
@@ -111,6 +114,8 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest_prod.h>
 
+#include "yb/common/opid.h"
+#include "yb/common/opid.pb.h"
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/callback_forward.h"
@@ -121,11 +126,13 @@
 #include "yb/gutil/int128.h"
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
+#include "yb/gutil/map-util.h"
 #include "yb/gutil/port.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/spinlock.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/fastmem.h"
+#include "yb/gutil/strings/human_readable.h"
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/strings/stringpiece.h"
 #include "yb/gutil/strings/substitute.h"
@@ -134,6 +141,7 @@
 #include "yb/gutil/thread_annotations.h"
 #include "yb/gutil/type_traits.h"
 #include "yb/gutil/walltime.h"
+#include "yb/util/aggregate_stats.h"
 #include "yb/util/atomic.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/byte_buffer.h"
@@ -157,6 +165,8 @@
 #include "yb/util/flags/flag_tags.h"
 #include "yb/util/flags/flags_callback.h"
 #include "yb/util/format.h"
+#include "yb/util/hdr_histogram.h"
+#include "yb/util/high_water_mark.h"
 #include "yb/util/io.h"
 #include "yb/util/jsonwriter.h"
 #include "yb/util/locks.h"
@@ -165,18 +175,18 @@
 #include "yb/util/malloc.h"
 #include "yb/util/math_util.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/memory/memory_usage.h"
 #include "yb/util/metric_entity.h"
 #include "yb/util/metrics.h"
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/metrics_writer.h"
 #include "yb/util/monotime.h"
 #include "yb/util/mutex.h"
-#include "yb/util/opid.h"
-#include "yb/util/opid.pb.h"
 #include "yb/util/path_util.h"
 #include "yb/util/physical_time.h"
 #include "yb/util/port_picker.h"
 #include "yb/util/priority_thread_pool.h"
+#include "yb/util/random.h"
 #include "yb/util/random_util.h"
 #include "yb/util/result.h"
 #include "yb/util/rw_semaphore.h"
@@ -203,6 +213,7 @@
 #include "yb/util/striped64.h"
 #include "yb/util/strongly_typed_bool.h"
 #include "yb/util/sync_point.h"
+#include "yb/util/tcmalloc_util.h"
 #include "yb/util/test_kill.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_thread_holder.h"

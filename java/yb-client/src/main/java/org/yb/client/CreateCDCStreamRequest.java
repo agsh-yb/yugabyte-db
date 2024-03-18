@@ -35,13 +35,17 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
 
   private CommonTypes.YQLDatabase dbType;
 
+  private CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption;
+
   public CreateCDCStreamRequest(YBTable masterTable, String tableId,
                                 String namespaceName, String format,
-                                String checkpointType, String recordType) {
+                                String checkpointType, String recordType,
+                                CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption) {
     super(masterTable);
     this.tableId = tableId;
     this.namespaceName = namespaceName;
     this.source_type = CdcService.CDCRequestSource.CDCSDK;
+    this.cdcsdkSnapshotOption = cdcsdkSnapshotOption;
     if (format.equalsIgnoreCase("PROTO"))
       this.record_format = CdcService.CDCRecordFormat.PROTO;
     else {
@@ -63,8 +67,18 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
         this.recordType = CdcService.CDCRecordType.FULL_ROW_NEW_IMAGE;
       } else if (recordType.equalsIgnoreCase("MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES")) {
         this.recordType = CdcService.CDCRecordType.MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES;
-      } else {
+      } else if (recordType.equalsIgnoreCase("CHANGE")) {
         this.recordType = CdcService.CDCRecordType.CHANGE;
+      } else if (recordType.equalsIgnoreCase("FULL")) {
+        this.recordType = CdcService.CDCRecordType.PG_FULL;
+      } else if (recordType.equalsIgnoreCase("CHANGE_OLD_NEW")) {
+        this.recordType = CdcService.CDCRecordType.PG_CHANGE_OLD_NEW;
+      } else if (recordType.equalsIgnoreCase("DEFAULT")) {
+        this.recordType = CdcService.CDCRecordType.PG_DEFAULT;
+      } else if (recordType.equalsIgnoreCase("NOTHING")) {
+        this.recordType = CdcService.CDCRecordType.PG_NOTHING;
+      } else {
+        throw new IllegalArgumentException("Invalid record type: " + recordType);
       }
     } else {
       this.recordType = CdcService.CDCRecordType.CHANGE;
@@ -74,15 +88,17 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
   public CreateCDCStreamRequest(YBTable masterTable, String tableId,
                                 String namespaceName, String format,
                                 String checkpointType) {
-    this(masterTable, tableId, namespaceName, format, checkpointType, null);
+    this(masterTable, tableId, namespaceName, format, checkpointType, null, null);
   }
 
   public CreateCDCStreamRequest(YBTable masterTable, String tableId,
                                 String namespaceName, String format,
                                 String checkpointType, String recordType,
-                                CommonTypes.YQLDatabase dbType) {
+                                CommonTypes.YQLDatabase dbType,
+                                CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption) {
 
-    this(masterTable, tableId, namespaceName, format, checkpointType, recordType);
+    this(masterTable, tableId, namespaceName, format, checkpointType, recordType,
+      cdcsdkSnapshotOption);
     this.dbType = dbType;
   }
 
@@ -103,6 +119,10 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
 
     if (dbType != null) {
       builder.setDbType(this.dbType);
+    }
+
+    if (cdcsdkSnapshotOption != null) {
+      builder.setCdcsdkConsistentSnapshotOption(this.cdcsdkSnapshotOption);
     }
     return toChannelBuffer(header, builder.build());
   }

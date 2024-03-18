@@ -1,9 +1,10 @@
 import { FC, useContext } from 'react';
-import { useQuery } from 'react-query';
+import { useQuery, useQueryClient } from 'react-query';
 import { useSelector } from 'react-redux';
 import { browserHistory } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useUpdateEffect, useEffectOnce } from 'react-use';
+import { set } from 'lodash';
 import { UniverseFormContext } from './UniverseFormContainer';
 import { UniverseForm } from './form/UniverseForm';
 import { YBLoading } from '../../../../components/common/indicators';
@@ -52,6 +53,8 @@ export const CreateUniverse: FC = () => {
   const globalRuntimeConfigQuery = useQuery(QUERY_KEY.fetchGlobalRunTimeConfigs, () =>
     api.fetchRunTimeConfigs(true)
   );
+
+  const queryClient = useQueryClient();
 
   useEffectOnce(() => {
     initializeForm({
@@ -112,6 +115,7 @@ export const CreateUniverse: FC = () => {
       encryptionAtRestConfig: {
         key_op: primaryData.instanceConfig.enableEncryptionAtRest ? 'ENABLE' : 'UNDEFINED'
       },
+      arch: primaryData.instanceConfig.arch!,
       clusters: [
         {
           clusterType: ClusterType.PRIMARY,
@@ -150,6 +154,11 @@ export const CreateUniverse: FC = () => {
           ]
         }
       });
+      // the getPrimaryInheritedValues overrides the async clusters imageBundleUUID.
+      // we are manually overriding it
+      const asyncIndex = configurePayload.clusters!.length -1;
+      set(configurePayload, `clusters.[${asyncIndex}].userIntent.imageBundleUUID`, asyncData.instanceConfig.imageBundleUUID);
+
     }
 
     if (
@@ -160,6 +169,9 @@ export const CreateUniverse: FC = () => {
       configurePayload.encryptionAtRestConfig.configUUID = primaryData.instanceConfig.kmsConfig;
     }
     createUniverse({ configurePayload, universeContextData: contextState });
+    setTimeout(()=>{
+      queryClient.invalidateQueries('user_permissions');
+    }, 2000);
   };
 
   if (isLoading) return <YBLoading />;

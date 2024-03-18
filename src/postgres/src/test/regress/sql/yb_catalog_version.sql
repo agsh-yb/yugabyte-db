@@ -354,3 +354,30 @@ END$$ LANGUAGE plpgsql;
 :display_catalog_version;
 CREATE TABLE t_3 AS SELECT c FROM (SELECT 1 AS c, f1()) AS s;
 :display_catalog_version;
+
+-- The next GRANT SELECT will increment current_version.
+GRANT SELECT (rolname, rolsuper) ON pg_authid TO CURRENT_USER;
+:display_catalog_version;
+
+-- The next GRANT SELECT will increment current_version due to evt_ddl_start.
+GRANT SELECT (rolname, rolsuper) ON pg_authid TO CURRENT_USER;
+:display_catalog_version;
+
+DROP EVENT TRIGGER evt_ddl_start;
+:display_catalog_version;
+
+-- The next GRANT SELECT should not cause any catalog version change.
+GRANT SELECT (rolname, rolsuper) ON pg_authid TO CURRENT_USER;
+:display_catalog_version;
+
+-- Verify REFRESH MATERIALIZED VIEW is not a breaking change.
+CREATE TABLE base (t int);
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM base;
+CREATE UNIQUE INDEX ON mv(t);
+:display_catalog_version;
+-- nonconcurrent refreshes should bump catalog version.
+REFRESH MATERIALIZED VIEW mv;
+:display_catalog_version;
+-- concurrent refreshes should not bump catalog version.
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv;
+:display_catalog_version;

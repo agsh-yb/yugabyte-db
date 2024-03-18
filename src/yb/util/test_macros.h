@@ -381,6 +381,12 @@ inline std::string FindFirstDiff(const std::string& lhs, const std::string& rhs)
 #define YB_DISABLE_TEST_IN_TSAN(test_name) test_name
 #endif
 
+#ifdef ADDRESS_SANITIZER
+#define YB_DISABLE_TEST_IN_ASAN(test_name) YB_DISABLE_TEST(test_name)
+#else
+#define YB_DISABLE_TEST_IN_ASAN(test_name) test_name
+#endif
+
 #if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
 #define YB_DISABLE_TEST_IN_SANITIZERS(test_name) YB_DISABLE_TEST(test_name)
 #else
@@ -403,6 +409,12 @@ inline std::string FindFirstDiff(const std::string& lhs, const std::string& rhs)
 #define YB_DISABLE_TEST_EXCEPT_RELEASE(test_name) YB_DISABLE_TEST(test_name)
 #else
 #define YB_DISABLE_TEST_EXCEPT_RELEASE(test_name) test_name
+#endif
+
+#ifdef __linux__
+#define YB_LINUX_ONLY_TEST(test_name) test_name
+#else
+#define YB_LINUX_ONLY_TEST(test_name) YB_DISABLE_TEST(test_name)
 #endif
 
 // Can be used in individual test cases or in the SetUp() method to skip all tests for a fixture.

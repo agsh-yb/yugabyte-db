@@ -46,6 +46,8 @@
 #include "yb/master/sys_catalog-test_base.h"
 #include "yb/master/sys_catalog.h"
 
+#include "yb/tablet/tablet_peer.h"
+
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
@@ -331,10 +333,15 @@ TEST_F(SysCatalogTest, TestSysCatalogPlacementOperations) {
     req.mutable_cluster_config()->set_cluster_uuid("some-cluster-uuid");
     auto status = master_->catalog_manager()->SetClusterConfig(&req, &resp);
     ASSERT_TRUE(status.IsInvalidArgument());
-
-    // Setting the cluster uuid should make the request succeed.
     req.mutable_cluster_config()->set_cluster_uuid(config.cluster_uuid());
 
+    // Verify that we receive an error when trying to change the universe uuid.
+    req.mutable_cluster_config()->set_universe_uuid("some-universe-uuid");
+    status = master_->catalog_manager()->SetClusterConfig(&req, &resp);
+    ASSERT_TRUE(status.IsInvalidArgument());
+    req.mutable_cluster_config()->set_universe_uuid(config.universe_uuid());
+
+    // Setting the cluster and universe uuid correctly should make the request succeed.
     ASSERT_OK(master_->catalog_manager()->SetClusterConfig(&req, &resp));
     l.Commit();
   }
@@ -375,7 +382,8 @@ TEST_F(SysCatalogTest, TestSysCatalogNamespacesOperations) {
 
   // 2. CHECK ADD_NAMESPACE
   // Create new namespace.
-  scoped_refptr<NamespaceInfo> ns(new NamespaceInfo("deadbeafdeadbeafdeadbeafdeadbeaf"));
+  scoped_refptr<NamespaceInfo> ns(
+      new NamespaceInfo("deadbeafdeadbeafdeadbeafdeadbeaf", /*tasks_tracker=*/nullptr));
   {
     auto l = ns->LockForWrite();
     l.mutable_data()->pb.set_name("test_ns");
@@ -804,7 +812,8 @@ TEST_F(SysCatalogTest, TestNamespaceNameMigration) {
   ASSERT_EQ(kNumSystemNamespaces, ns_loader->namespaces.size());
 
   auto epoch = LeaderEpoch(kLeaderTerm, sys_catalog_->pitr_count());
-  scoped_refptr<NamespaceInfo> ns(new NamespaceInfo("deadbeafdeadbeafdeadbeafdeadbeaf"));
+  scoped_refptr<NamespaceInfo> ns(
+      new NamespaceInfo("deadbeafdeadbeafdeadbeafdeadbeaf", /*tasks_tracker=*/nullptr));
   {
     auto l = ns->LockForWrite();
     l.mutable_data()->pb.set_name("test_ns");
@@ -843,6 +852,13 @@ TEST_F(SysCatalogTest, TestNamespaceNameMigration) {
                !persisted_ns_name.empty() && persisted_ns_name == ns->name();
       },
       10s * kTimeMultiplier, "Wait for table's namespace_name to be set in memory and on disk."));
+}
+
+TEST_F(SysCatalogTest, TestTabletMemTracker) {
+  const auto& tablet_mem_tracker =
+      sys_catalog_->TEST_GetTabletPeer()->shared_tablet()->mem_tracker();
+  ASSERT_EQ("Tablets_overhead", tablet_mem_tracker->parent()->id());
+  ASSERT_EQ("mem_tracker_server_Tablets_overhead_PerTablet", tablet_mem_tracker->metric_name());
 }
 
 } // namespace master

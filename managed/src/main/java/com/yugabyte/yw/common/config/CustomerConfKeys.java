@@ -119,14 +119,14 @@ public class CustomerConfKeys extends RuntimeConfigKeysModule {
           ConfDataType.BooleanType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
 
-  public static final ConfKeyInfo<Boolean> showDrUi =
+  public static final ConfKeyInfo<Boolean> enableInUseProviderEditing =
       new ConfKeyInfo<>(
-          "yb.ui.feature_flags.disaster_recovery",
+          "yb.ui.feature_flags.edit_in_use_provider",
           ScopeType.CUSTOMER,
-          "Show disaster recovery UI",
-          "YBA provides an active-active single-master disaster recovery (DR) solution "
-              + "through the API. This runtime config exposes a user interface for managing DR "
-              + "configurations.",
+          "Enable partial editing of in use providers",
+          "A subset of fields from in use providers can be edited. Users can edit in use "
+              + "providers directly through the YBA API. This config is used to enable this "
+              + "functionality through YBA UI as well.",
           ConfDataType.BooleanType,
           ImmutableList.of(ConfKeyTags.PUBLIC));
 

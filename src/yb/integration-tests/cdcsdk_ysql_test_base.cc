@@ -11,30 +11,46 @@
 // under the License.
 
 #include "yb/integration-tests/cdcsdk_ysql_test_base.h"
+#include <cstddef>
+#include <map>
+#include <vector>
+#include <gtest/gtest.h>
 
+#include "yb/cdc/xrepl_types.h"
 #include "yb/cdc/cdc_service.pb.h"
 #include "yb/cdc/cdc_state_table.h"
 
+#include "yb/client/yb_table_name.h"
+#include "yb/common/entity_ids_types.h"
 #include "yb/master/catalog_manager.h"
+#include "yb/master/master_client.pb.h"
+#include "yb/master/master_cluster.proxy.h"
+#include "yb/rpc/rpc_controller.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+#include "yb/util/status.h"
+
+DECLARE_bool(cdc_write_post_apply_metadata);
 
 namespace yb {
 namespace cdc {
-  Result<string> CDCSDKYsqlTest::GetUniverseId(Cluster* cluster) {
-    yb::master::GetMasterClusterConfigRequestPB req;
-    yb::master::GetMasterClusterConfigResponsePB resp;
+Result<string> CDCSDKYsqlTest::GetUniverseId(PostgresMiniCluster* cluster) {
+  yb::master::GetMasterClusterConfigRequestPB req;
+  yb::master::GetMasterClusterConfigResponsePB resp;
 
-    master::MasterClusterProxy master_proxy(
-        &cluster->client_->proxy_cache(),
-        VERIFY_RESULT(cluster->mini_cluster_->GetLeaderMasterBoundRpcAddr()));
+  master::MasterClusterProxy master_proxy(
+      &cluster->client_->proxy_cache(),
+      VERIFY_RESULT(cluster->mini_cluster_->GetLeaderMasterBoundRpcAddr()));
 
-    rpc::RpcController rpc;
-    rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeout));
-    RETURN_NOT_OK(master_proxy.GetMasterClusterConfig(req, &resp, &rpc));
-    if (resp.has_error()) {
-      return STATUS(IllegalState, "Error getting cluster config");
-    }
-    return resp.cluster_config().cluster_uuid();
+  rpc::RpcController rpc;
+  rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeout));
+  RETURN_NOT_OK(master_proxy.GetMasterClusterConfig(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return STATUS(IllegalState, "Error getting cluster config");
   }
+  return resp.cluster_config().cluster_uuid();
+}
 
   void CDCSDKYsqlTest::VerifyCdcStateMatches(
       client::YBClient* client, const xrepl::StreamId& stream_id, const TabletId& tablet_id,
@@ -56,8 +72,8 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::WriteRowsToTwoTables(
-      uint32_t start, uint32_t end, Cluster* cluster, bool flag, const char* const first_table_name,
-      const char* const second_table_name, uint32_t num_cols) {
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag,
+      const char* const first_table_name, const char* const second_table_name, uint32_t num_cols) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -168,7 +184,7 @@ namespace cdc {
         "The cdc_sdk_min_checkpoint_op_id doesn't match with expected op_id."));
   }
 
-  Status CDCSDKYsqlTest::DropDB(Cluster* cluster) {
+  Status CDCSDKYsqlTest::DropDB(PostgresMiniCluster* cluster) {
     const std::string db_name = "testdatabase";
     RETURN_NOT_OK(CreateDatabase(&test_cluster_, db_name, true));
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(db_name));
@@ -176,16 +192,27 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::TruncateTable(Cluster* cluster, const std::vector<string>& table_ids) {
+  Status CDCSDKYsqlTest::TruncateTable(
+      PostgresMiniCluster* cluster, const std::vector<string>& table_ids) {
     RETURN_NOT_OK(cluster->client_->TruncateTables(table_ids));
     return Status::OK();
   }
 
   // The range is exclusive of end i.e. [start, end)
   Status CDCSDKYsqlTest::WriteRows(
-      uint32_t start, uint32_t end, Cluster* cluster,
-      const vector<string>& optional_cols_name) {
-    auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster,
+      const vector<string>& optional_cols_name, pgwrapper::PGConn* conn) {
+    if (conn == nullptr) {
+      auto conn_obj = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
+      return WriteRowsWithConn(start, end, cluster, &conn_obj, optional_cols_name);
+    } else {
+      return WriteRowsWithConn(start, end, cluster, conn, optional_cols_name);
+    }
+  }
+
+  Status CDCSDKYsqlTest::WriteRowsWithConn(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster,
+      pgwrapper::PGConn* conn, const vector<string>& optional_cols_name) {
     LOG(INFO) << "Writing " << end - start << " row(s)";
 
     for (uint32_t i = start; i < end; ++i) {
@@ -200,20 +227,34 @@ namespace cdc {
         }
         columns_name << " )";
         columns_value << " )";
-        RETURN_NOT_OK(conn.ExecuteFormat(
+        RETURN_NOT_OK(conn->ExecuteFormat(
             "INSERT INTO $0 $1 VALUES $2", kTableName, columns_name.str(), columns_value.str()));
       } else {
-        RETURN_NOT_OK(conn.ExecuteFormat(
+        RETURN_NOT_OK(conn->ExecuteFormat(
             "INSERT INTO $0($1, $2) VALUES ($3, $4)", kTableName, kKeyColumnName, kValueColumnName,
             i, i + 1));
       }
     }
-    return Status::OK();
+    int retry_count = 1;
+    return WaitFor(
+        [&]() -> Result<bool> {
+          LOG(INFO) << "Retry : " << retry_count++;
+          auto rows = VERIFY_RESULT((conn->FetchRows<int32_t, int32_t>(Format(
+              "SELECT $1, $2 FROM $0 WHERE $1 >= $3 AND $1 < $4", kTableName, kKeyColumnName,
+              kValueColumnName, start, end))));
+
+          bool write_completed = true;
+          if (rows.size() != (end - start)) {
+            write_completed = false;
+          }
+          return write_completed;
+        },
+        MonoDelta::FromSeconds(60), "Waiting for write to be completed");
   }
 
   // The range is exclusive of end i.e. [start, end)
-  Status CDCSDKYsqlTest::WriteRows(uint32_t start, uint32_t end, Cluster* cluster,
-    uint32_t num_cols) {
+  Status CDCSDKYsqlTest::WriteRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, uint32_t num_cols) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s)";
 
@@ -232,18 +273,37 @@ namespace cdc {
     return Status::OK();
   }
 
-  void CDCSDKYsqlTest::DropTable(Cluster* cluster, const char* table_name) {
+  void CDCSDKYsqlTest::DropTable(PostgresMiniCluster* cluster, const char* table_name) {
     auto conn = EXPECT_RESULT(cluster->ConnectToDB(kNamespaceName));
     ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", table_name));
   }
 
   Status CDCSDKYsqlTest::WriteRowsHelper(
-      uint32_t start, uint32_t end, Cluster* cluster, bool flag, uint32_t num_cols,
-      const char* const table_name,  const vector<string>& optional_cols_name) {
-    auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag, uint32_t num_cols,
+      const char* const table_name, const vector<string>& optional_cols_name,
+      const bool transaction_enabled, pgwrapper::PGConn* conn) {
+    if (conn == nullptr) {
+      auto conn_obj = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
+      return WriteRowsHelperWithConn(
+          start, end, cluster, flag, &conn_obj, num_cols, table_name, optional_cols_name,
+          transaction_enabled);
+    } else {
+      return WriteRowsHelperWithConn(
+          start, end, cluster, flag, conn, num_cols, table_name, optional_cols_name,
+          transaction_enabled);
+    }
+  }
+
+  Status CDCSDKYsqlTest::WriteRowsHelperWithConn(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag,
+      pgwrapper::PGConn* conn, uint32_t num_cols, const char* const table_name,
+      const vector<string>& optional_cols_name, const bool transaction_enabled) {
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
-    RETURN_NOT_OK(conn.Execute("BEGIN"));
+    if (transaction_enabled) {
+      RETURN_NOT_OK(conn->Execute("BEGIN"));
+    }
+
     for (uint32_t i = start; i < end; ++i) {
       if (!optional_cols_name.empty()) {
         std::stringstream columns_name;
@@ -256,7 +316,7 @@ namespace cdc {
         }
         columns_name << " )";
         columns_value << " )";
-        RETURN_NOT_OK(conn.ExecuteFormat(
+        RETURN_NOT_OK(conn->ExecuteFormat(
             "INSERT INTO $0 $1 VALUES $2", table_name, columns_name.str(), columns_value.str()));
       } else {
         uint32_t value = i;
@@ -268,25 +328,29 @@ namespace cdc {
 
         std::string statement(statement_buff.str());
         statement.at(statement.size() - 1) = ')';
-        RETURN_NOT_OK(conn.ExecuteFormat(statement, table_name));
+        RETURN_NOT_OK(conn->ExecuteFormat(statement, table_name));
       }
     }
-    if (flag) {
-      RETURN_NOT_OK(conn.Execute("COMMIT"));
-    } else {
-      RETURN_NOT_OK(conn.Execute("ABORT"));
+
+    if (transaction_enabled) {
+      if (flag) {
+        RETURN_NOT_OK(conn->Execute("COMMIT"));
+      } else {
+        RETURN_NOT_OK(conn->Execute("ABORT"));
+      }
     }
+
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::CreateTableWithoutPK(Cluster* cluster) {
+  Status CDCSDKYsqlTest::CreateTableWithoutPK(PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     RETURN_NOT_OK(conn.ExecuteFormat("CREATE TABLE test1_no_pk(id1 int, id2 int)"));
     return Status::OK();
   }
 
   Status CDCSDKYsqlTest::WriteAndUpdateRowsHelper(
-      uint32_t start, uint32_t end, Cluster* cluster, bool flag,
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag,
       const std::multimap<uint32_t, uint32_t>& col_val_map, const std::string& table_id) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
@@ -296,7 +360,7 @@ namespace cdc {
           "INSERT INTO $0($1, $2) VALUES ($3, $4)", kTableName, kKeyColumnName, kValueColumnName, i,
           i + 1));
     }
-    RETURN_NOT_OK(test_client()->FlushTables(
+    RETURN_NOT_OK(WaitForFlushTables(
         {table_id}, /* add_indexes = */ false,
         /* timeout_secs = */ 30, /* is_compaction = */ false));
 
@@ -308,7 +372,7 @@ namespace cdc {
           "UPDATE $0 SET $1 = $2 WHERE $3 = $4", kTableName, kValueColumnName,
           col_value_pair.second, kKeyColumnName, col_value_pair.first));
     }
-    RETURN_NOT_OK(test_client()->FlushTables(
+    RETURN_NOT_OK(WaitForFlushTables(
         {table_id}, /* add_indexes = */ false,
         /* timeout_secs = */ 30, /* is_compaction = */ false));
 
@@ -320,7 +384,7 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::CreateColocatedObjects(Cluster* cluster) {
+  Status CDCSDKYsqlTest::CreateColocatedObjects(PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     RETURN_NOT_OK(conn.ExecuteFormat("CREATE TABLEGROUP tg1"));
     RETURN_NOT_OK(conn.ExecuteFormat("CREATE TABLE test1(id1 int primary key) TABLEGROUP tg1;"));
@@ -329,15 +393,16 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::AddColocatedTable(
-      Cluster* cluster, const TableName& table_name, const std::string& table_group_name) {
+      PostgresMiniCluster* cluster, const TableName& table_name,
+      const std::string& table_group_name) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     RETURN_NOT_OK(conn.ExecuteFormat(
         "CREATE TABLE $0(id2 text primary key) TABLEGROUP $1;", table_name, table_group_name));
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::PopulateColocatedData(Cluster* cluster, int insert_count,
-    bool transaction) {
+  Status CDCSDKYsqlTest::PopulateColocatedData(
+      PostgresMiniCluster* cluster, int insert_count, bool transaction) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     if (transaction) {
       RETURN_NOT_OK(conn.Execute("BEGIN"));
@@ -354,9 +419,8 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::WriteEnumsRows(
-      uint32_t start, uint32_t end, Cluster* cluster, const string& enum_suffix,
-      string database_name, string table_name,
-      string schema_name) {
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, const string& enum_suffix,
+      string database_name, string table_name, string schema_name) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(database_name));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -372,7 +436,7 @@ namespace cdc {
   }
 
   Result<YBTableName> CDCSDKYsqlTest::CreateCompositeTable(
-      Cluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
+      PostgresMiniCluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
 
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -385,7 +449,8 @@ namespace cdc {
     return GetTable(cluster, kNamespaceName, "emp");
   }
 
-  Status CDCSDKYsqlTest::WriteCompositeRows(uint32_t start, uint32_t end, Cluster* cluster) {
+  Status CDCSDKYsqlTest::WriteCompositeRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -399,7 +464,7 @@ namespace cdc {
   }
 
   Result<YBTableName> CDCSDKYsqlTest::CreateNestedCompositeTable(
-      Cluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
+      PostgresMiniCluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
 
     RETURN_NOT_OK(
@@ -415,7 +480,8 @@ namespace cdc {
     return GetTable(cluster, kNamespaceName, "emp_nested");
   }
 
-  Status CDCSDKYsqlTest::WriteNestedCompositeRows(uint32_t start, uint32_t end, Cluster* cluster) {
+  Status CDCSDKYsqlTest::WriteNestedCompositeRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -429,7 +495,7 @@ namespace cdc {
   }
 
   Result<YBTableName> CDCSDKYsqlTest::CreateArrayCompositeTable(
-      Cluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
+      PostgresMiniCluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
 
     RETURN_NOT_OK(
@@ -442,7 +508,8 @@ namespace cdc {
     return GetTable(cluster, kNamespaceName, "emp_array");
   }
 
-  Status CDCSDKYsqlTest::WriteArrayCompositeRows(uint32_t start, uint32_t end, Cluster* cluster) {
+  Status CDCSDKYsqlTest::WriteArrayCompositeRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -458,7 +525,7 @@ namespace cdc {
   }
 
   Result<YBTableName> CDCSDKYsqlTest::CreateRangeCompositeTable(
-      Cluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
+      PostgresMiniCluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
 
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -471,7 +538,8 @@ namespace cdc {
     return GetTable(cluster, kNamespaceName, "range_composite_table");
   }
 
-  Status CDCSDKYsqlTest::WriteRangeCompositeRows(uint32_t start, uint32_t end, Cluster* cluster) {
+  Status CDCSDKYsqlTest::WriteRangeCompositeRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -486,7 +554,7 @@ namespace cdc {
   }
 
   Result<YBTableName> CDCSDKYsqlTest::CreateRangeArrayCompositeTable(
-      Cluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
+      PostgresMiniCluster* cluster, const uint32_t num_tablets, const std::string& type_suffix) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
 
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -500,8 +568,8 @@ namespace cdc {
     return GetTable(cluster, kNamespaceName, "range_array_composite_table");
   }
 
-  Status CDCSDKYsqlTest::WriteRangeArrayCompositeRows(uint32_t start, uint32_t end,
-    Cluster* cluster) {
+  Status CDCSDKYsqlTest::WriteRangeArrayCompositeRows(
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Writing " << end - start << " row(s) within transaction";
 
@@ -516,7 +584,7 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::UpdateRows(uint32_t key, uint32_t value, Cluster* cluster) {
+  Status CDCSDKYsqlTest::UpdateRows(uint32_t key, uint32_t value, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Updating row for key " << key << " with value " << value;
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -525,7 +593,8 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::UpdatePrimaryKey(uint32_t key, uint32_t value, Cluster* cluster) {
+  Status CDCSDKYsqlTest::UpdatePrimaryKey(
+      uint32_t key, uint32_t value, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Updating primary key " << key << " with value " << value;
     RETURN_NOT_OK(conn.ExecuteFormat(
@@ -535,7 +604,8 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::UpdateRows(
-      uint32_t key, const std::map<std::string, uint32_t>& col_val_map, Cluster* cluster) {
+      uint32_t key, const std::map<std::string, uint32_t>& col_val_map,
+      PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     std::stringstream log_buff;
     log_buff << "Updating row for key " << key << " with";
@@ -559,7 +629,7 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::UpdateRowsHelper(
-      uint32_t start, uint32_t end, Cluster* cluster, bool flag, uint32_t key,
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag, uint32_t key,
       const std::map<std::string, uint32_t>& col_val_map1,
       const std::map<std::string, uint32_t>& col_val_map2, uint32_t num_cols) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
@@ -624,7 +694,7 @@ namespace cdc {
   }
 
   Status CDCSDKYsqlTest::UpdateDeleteRowsHelper(
-      uint32_t start, uint32_t end, Cluster* cluster, bool flag, uint32_t key,
+      uint32_t start, uint32_t end, PostgresMiniCluster* cluster, bool flag, uint32_t key,
       const std::map<std::string, uint32_t>& col_val_map, uint32_t num_cols) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     std::stringstream log_buff1, log_buff2;
@@ -684,7 +754,7 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::DeleteRows(uint32_t key, Cluster* cluster) {
+  Status CDCSDKYsqlTest::DeleteRows(uint32_t key, PostgresMiniCluster* cluster) {
     auto conn = VERIFY_RESULT(cluster->ConnectToDB(kNamespaceName));
     LOG(INFO) << "Deleting row for key " << key;
     RETURN_NOT_OK(
@@ -692,7 +762,7 @@ namespace cdc {
     return Status::OK();
   }
 
-  Status CDCSDKYsqlTest::SplitTablet(const TabletId& tablet_id, Cluster* cluster) {
+  Status CDCSDKYsqlTest::SplitTablet(const TabletId& tablet_id, PostgresMiniCluster* cluster) {
     yb::master::SplitTabletRequestPB req;
     req.set_tablet_id(tablet_id);
     yb::master::SplitTabletResponsePB resp;
@@ -753,13 +823,22 @@ namespace cdc {
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
       const GetChangesResponsePB* change_resp,
       const TableId table_id) {
+
+    return UpdateCheckpoint(stream_id, tablets, change_resp->cdc_sdk_checkpoint(), table_id);
+  }
+
+  Result<GetChangesResponsePB> CDCSDKYsqlTest::UpdateCheckpoint(
+      const xrepl::StreamId& stream_id,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const CDCSDKCheckpointPB& resp_checkpoint,
+      const TableId table_id) {
     GetChangesRequestPB change_req2;
     GetChangesResponsePB change_resp2;
     PrepareChangeRequest(
-        &change_req2, stream_id, tablets, 0, change_resp->cdc_sdk_checkpoint().index(),
-        change_resp->cdc_sdk_checkpoint().term(), change_resp->cdc_sdk_checkpoint().key(),
-        change_resp->cdc_sdk_checkpoint().write_id(),
-        change_resp->cdc_sdk_checkpoint().snapshot_time(), table_id);
+        &change_req2, stream_id, tablets, 0, resp_checkpoint.index(),
+        resp_checkpoint.term(), resp_checkpoint.key(),
+        resp_checkpoint.write_id(),
+        resp_checkpoint.snapshot_time(), table_id);
     RpcController get_changes_rpc;
     RETURN_NOT_OK(cdc_proxy_->GetChanges(change_req2, &change_resp2, &get_changes_rpc));
     if (change_resp2.has_error()) {
@@ -848,26 +927,41 @@ namespace cdc {
     change_req->set_tablet_id(tablet_id);
     change_req->mutable_from_cdc_sdk_checkpoint()->set_term(cp.term());
     change_req->mutable_from_cdc_sdk_checkpoint()->set_index(cp.index());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_key(cp.key());
+
+    if (cp.has_key()) {
+      change_req->mutable_from_cdc_sdk_checkpoint()->set_key(cp.key());
+    }
+
     change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(cp.write_id());
   }
 
   void CDCSDKYsqlTest::PrepareChangeRequestWithExplicitCheckpoint(
       GetChangesRequestPB* change_req, const xrepl::StreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
-      const CDCSDKCheckpointPB& cp, const int tablet_idx) {
+      const CDCSDKCheckpointPB* from_op_id, const CDCSDKCheckpointPB* explicit_checkpoint,
+      const TableId table_id, const int tablet_idx) {
     change_req->set_stream_id(stream_id.ToString());
     change_req->set_tablet_id(tablets.Get(tablet_idx).tablet_id());
 
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_term(cp.term());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_index(cp.index());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_key(cp.key());
-    change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(cp.write_id());
+    change_req->mutable_from_cdc_sdk_checkpoint()->set_term(from_op_id->term());
+    change_req->mutable_from_cdc_sdk_checkpoint()->set_index(from_op_id->index());
+    change_req->mutable_from_cdc_sdk_checkpoint()->set_key(from_op_id->key());
+    change_req->mutable_from_cdc_sdk_checkpoint()->set_write_id(from_op_id->write_id());
+    change_req->mutable_from_cdc_sdk_checkpoint()->set_snapshot_time(from_op_id->snapshot_time());
 
-    change_req->mutable_explicit_cdc_sdk_checkpoint()->set_term(cp.term());
-    change_req->mutable_explicit_cdc_sdk_checkpoint()->set_index(cp.index());
-    change_req->mutable_explicit_cdc_sdk_checkpoint()->set_key(cp.key());
-    change_req->mutable_explicit_cdc_sdk_checkpoint()->set_write_id(cp.write_id());
+    if (explicit_checkpoint != nullptr) {
+      change_req->mutable_explicit_cdc_sdk_checkpoint()->set_term(explicit_checkpoint->term());
+      change_req->mutable_explicit_cdc_sdk_checkpoint()->set_index(explicit_checkpoint->index());
+      change_req->mutable_explicit_cdc_sdk_checkpoint()->set_key(explicit_checkpoint->key());
+      change_req->mutable_explicit_cdc_sdk_checkpoint()->set_write_id(
+        explicit_checkpoint->write_id());
+      change_req->mutable_explicit_cdc_sdk_checkpoint()->set_snapshot_time(
+        explicit_checkpoint->snapshot_time());
+    }
+
+    if (!table_id.empty()) {
+      change_req->set_table_id(table_id);
+    }
   }
 
   void CDCSDKYsqlTest::PrepareSetCheckpointRequest(
@@ -913,7 +1007,9 @@ namespace cdc {
 
           if (set_checkpoint_resp.has_error() &&
               set_checkpoint_resp.error().code() != CDCErrorPB::TABLET_NOT_FOUND &&
-              set_checkpoint_resp.error().code() != CDCErrorPB::LEADER_NOT_READY) {
+              set_checkpoint_resp.error().code() != CDCErrorPB::LEADER_NOT_READY &&
+              set_checkpoint_resp.error().status().message().find("TRY_AGAIN_CODE") ==
+                  std::string::npos) {
             return STATUS_FORMAT(
                 InternalError, "Response had error: $0", set_checkpoint_resp.DebugString());
           }
@@ -970,11 +1066,11 @@ namespace cdc {
 
   Result<GetCheckpointResponsePB> CDCSDKYsqlTest::GetCDCSnapshotCheckpoint(
       const xrepl::StreamId& stream_id, const TabletId& tablet_id, const TableId& table_id) {
-    RpcController get_checkpoint_rpc;
+
     GetCheckpointRequestPB get_checkpoint_req;
     GetCheckpointResponsePB get_checkpoint_resp;
     auto deadline = CoarseMonoClock::now() + test_client()->default_rpc_timeout();
-    get_checkpoint_rpc.set_deadline(deadline);
+
     get_checkpoint_req.set_stream_id(stream_id.ToString());
 
     if (!table_id.empty()) {
@@ -982,10 +1078,78 @@ namespace cdc {
     }
 
     get_checkpoint_req.set_tablet_id(tablet_id);
-    RETURN_NOT_OK(
-        cdc_proxy_->GetCheckpoint(get_checkpoint_req, &get_checkpoint_resp, &get_checkpoint_rpc));
+
+    RETURN_NOT_OK(WaitFor(
+          [&]() -> Result<bool> {
+            RpcController get_checkpoint_rpc;
+            get_checkpoint_rpc.set_deadline(deadline);
+
+            RETURN_NOT_OK(cdc_proxy_->GetCheckpoint(
+                get_checkpoint_req, &get_checkpoint_resp, &get_checkpoint_rpc));
+
+            if (get_checkpoint_resp.has_error() &&
+                get_checkpoint_resp.error().code() != CDCErrorPB::TABLET_NOT_FOUND &&
+                get_checkpoint_resp.error().code() != CDCErrorPB::LEADER_NOT_READY) {
+              return STATUS_FORMAT(
+                  InternalError, "Response had error: $0", get_checkpoint_resp.DebugString());
+            }
+            if (!get_checkpoint_resp.has_error()) {
+              return true;
+            }
+
+            return false;
+          },
+          MonoDelta::FromSeconds(kRpcTimeout),
+          "GetCheckpoint timed out waiting for Leader to get ready"));
 
     return get_checkpoint_resp;
+  }
+
+  Result<CDCSDKCheckpointPB> CDCSDKYsqlTest::GetCDCSDKSnapshotCheckpoint(
+      const xrepl::StreamId& stream_id, const TabletId& tablet_id, const TableId& table_id) {
+
+    GetCheckpointRequestPB get_checkpoint_req;
+    GetCheckpointResponsePB get_checkpoint_resp;
+    auto deadline = CoarseMonoClock::now() + test_client()->default_rpc_timeout();
+
+    get_checkpoint_req.set_stream_id(stream_id.ToString());
+
+    if (!table_id.empty()) {
+      get_checkpoint_req.set_table_id(table_id);
+    }
+
+    get_checkpoint_req.set_tablet_id(tablet_id);
+    RETURN_NOT_OK(WaitFor(
+          [&]() -> Result<bool> {
+            RpcController get_checkpoint_rpc;
+            get_checkpoint_rpc.set_deadline(deadline);
+
+            RETURN_NOT_OK(cdc_proxy_->GetCheckpoint(
+                get_checkpoint_req, &get_checkpoint_resp, &get_checkpoint_rpc));
+
+            if (get_checkpoint_resp.has_error() &&
+                get_checkpoint_resp.error().code() != CDCErrorPB::TABLET_NOT_FOUND &&
+                get_checkpoint_resp.error().code() != CDCErrorPB::LEADER_NOT_READY) {
+              return STATUS_FORMAT(
+                  InternalError, "Response had error: $0", get_checkpoint_resp.DebugString());
+            }
+            if (!get_checkpoint_resp.has_error()) {
+              return true;
+            }
+
+            return false;
+          },
+          MonoDelta::FromSeconds(kRpcTimeout),
+          "GetCheckpoint timed out waiting for Leader to get ready"));;
+
+    CDCSDKCheckpointPB checkpoint_resp;
+    checkpoint_resp.set_index(get_checkpoint_resp.checkpoint().op_id().index());
+    checkpoint_resp.set_term(get_checkpoint_resp.checkpoint().op_id().term());
+    checkpoint_resp.set_write_id(-1);
+    checkpoint_resp.set_snapshot_time(get_checkpoint_resp.snapshot_time());
+    checkpoint_resp.set_key(get_checkpoint_resp.snapshot_key());
+
+    return checkpoint_resp;
   }
 
   Result<GetTabletListToPollForCDCResponsePB> CDCSDKYsqlTest::GetTabletListToPollForCDC(
@@ -1078,7 +1242,7 @@ namespace cdc {
       const auto& tserver = test_cluster()->mini_tablet_server(i)->server();
       auto cdc_service = dynamic_cast<CDCServiceImpl*>(
           tserver->rpc_server()->TEST_service_pool("yb.cdc.CDCService")->TEST_get_service().get());
-      auto status = cdc_service->TEST_GetTabletInfoFromCache({{}, stream_id, tablet_id});
+      auto status = cdc_service->TEST_GetTabletInfoFromCache({stream_id, tablet_id});
       if (status.ok()) {
         count += 1;
       }
@@ -1142,7 +1306,7 @@ namespace cdc {
       CDCSDKYsqlTest::ExpectedRecordWithThreeColumns expected_records, uint32_t* count,
       const bool& validate_old_tuple,
       CDCSDKYsqlTest::ExpectedRecordWithThreeColumns expected_before_image_records,
-      const bool& validate_third_column) {
+      const bool& validate_third_column, const bool is_nothing_record) {
     // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE in that order.
     switch (record.row_message().op()) {
       case RowMessage::DDL: {
@@ -1183,18 +1347,21 @@ namespace cdc {
         count[2]++;
       } break;
       case RowMessage::DELETE: {
-        ASSERT_EQ(record.row_message().old_tuple(0).datum_int32(),
-          expected_before_image_records.key);
-        if (validate_old_tuple) {
-          if (validate_third_column) {
-            ASSERT_EQ(record.row_message().old_tuple_size(), 3);
-            ASSERT_EQ(record.row_message().new_tuple_size(), 3);
-            AssertBeforeImageKeyValue(
-                record, expected_before_image_records.key, expected_before_image_records.value,
-                true, expected_before_image_records.value2);
-          } else {
-            AssertBeforeImageKeyValue(
-                record, expected_before_image_records.key, expected_before_image_records.value);
+        if (is_nothing_record) {
+          ASSERT_EQ(record.row_message().old_tuple_size(), 0);
+          ASSERT_EQ(record.row_message().new_tuple_size(), 0);
+        } else {
+          if (validate_old_tuple) {
+            if (validate_third_column) {
+              ASSERT_EQ(record.row_message().old_tuple_size(), 3);
+              ASSERT_EQ(record.row_message().new_tuple_size(), 3);
+              AssertBeforeImageKeyValue(
+                  record, expected_before_image_records.key, expected_before_image_records.value,
+                  true, expected_before_image_records.value2);
+            } else {
+              AssertBeforeImageKeyValue(
+                  record, expected_before_image_records.key, expected_before_image_records.value);
+            }
           }
         }
         ASSERT_EQ(record.row_message().table(), kTableName);
@@ -1266,6 +1433,128 @@ namespace cdc {
         ASSERT_FALSE(true);
         break;
     }
+  }
+
+  Status CDCSDKYsqlTest::InitVirtualWAL(
+      const xrepl::StreamId& stream_id, const std::vector<TableId> table_ids,
+      const uint64_t session_id) {
+    InitVirtualWALForCDCRequestPB init_req;
+    init_req.set_stream_id(stream_id.ToString());
+    init_req.set_session_id(session_id);
+    for (const auto& table_id : table_ids) {
+      init_req.add_table_id(table_id);
+    }
+
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          InitVirtualWALForCDCResponsePB init_resp;
+          RpcController init_rpc;
+          auto status = cdc_proxy_->InitVirtualWALForCDC(init_req, &init_resp, &init_rpc);
+
+          if (status.ok() && !init_resp.has_error()) {
+            return true;
+          }
+
+          if (status.ok() && init_resp.has_error()) {
+            status = StatusFromPB(init_resp.error().status());
+            if (status.IsAlreadyPresent() || status.IsInvalidArgument()) {
+              RETURN_NOT_OK(status);
+            }
+          }
+
+          return false;
+        },
+        MonoDelta::FromSeconds(kRpcTimeout), "InitVirtualWal failed due to RPC timeout"));
+
+    return Status::OK();
+  }
+
+  Status CDCSDKYsqlTest::DestroyVirtualWAL(const uint64_t session_id) {
+    DestroyVirtualWALForCDCRequestPB req;
+    req.set_session_id(session_id);
+
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          DestroyVirtualWALForCDCResponsePB resp;
+          RpcController init_rpc;
+          auto status = cdc_proxy_->DestroyVirtualWALForCDC(req, &resp, &init_rpc);
+
+          if (status.ok() && !resp.has_error()) {
+            return true;
+          }
+
+          if (status.ok() && resp.has_error()) {
+            status = StatusFromPB(resp.error().status());
+            if (status.IsNotFound() || status.IsInvalidArgument()) {
+              RETURN_NOT_OK(status);
+            }
+          }
+
+          return false;
+        },
+        MonoDelta::FromSeconds(kRpcTimeout), "DestroyVirtualWAL failed due to RPC timeout"));
+
+    return Status::OK();
+  }
+
+  Result<GetConsistentChangesResponsePB> CDCSDKYsqlTest::GetConsistentChangesFromCDC(
+      const xrepl::StreamId& stream_id, const std::vector<TableId> table_ids,
+      const uint64_t session_id) {
+    GetConsistentChangesRequestPB change_req;
+    GetConsistentChangesResponsePB final_resp;
+    change_req.set_stream_id(stream_id.ToString());
+    change_req.set_session_id(session_id);
+
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          GetConsistentChangesResponsePB change_resp;
+          RpcController get_changes_rpc;
+          auto status =
+              cdc_proxy_->GetConsistentChanges(change_req, &change_resp, &get_changes_rpc);
+
+          if (!status.ok()) {
+            return false;
+          }
+
+          if (status.ok() && change_resp.has_error()) {
+            status = StatusFromPB(change_resp.error().status());
+            if (status.IsNotFound() || status.IsInvalidArgument()) {
+              RETURN_NOT_OK(status);
+            }
+          }
+
+          final_resp = change_resp;
+          return true;
+        },
+        MonoDelta::FromSeconds(kRpcTimeout), "GetConsistentChanges failed due to RPC timeout"));
+
+    return final_resp;
+  }
+
+  Status CDCSDKYsqlTest::UpdateAndPersistLSN(
+      const xrepl::StreamId& stream_id, const uint64_t confirmed_flush_lsn,
+      const uint64_t restart_lsn, const uint64_t session_id) {
+    UpdateAndPersistLSNRequestPB update_req;
+    update_req.set_session_id(session_id);
+    update_req.set_stream_id(stream_id.ToString());
+    update_req.set_restart_lsn(restart_lsn);
+    update_req.set_confirmed_flush_lsn(confirmed_flush_lsn);
+
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          UpdateAndPersistLSNResponsePB update_resp;
+          RpcController rpc;
+          auto status = cdc_proxy_->UpdateAndPersistLSN(update_req, &update_resp, &rpc);
+
+          if (status.ok() && !update_resp.has_error()) {
+            return true;
+          }
+          LOG(WARNING) << StatusFromPB(update_resp.error().status()).ToString();
+          return false;
+        },
+        MonoDelta::FromSeconds(kRpcTimeout), "UpdateRestartLSN failed due to RPC timeout"));
+
+    return Status::OK();
   }
 
   Result<GetChangesResponsePB> CDCSDKYsqlTest::GetChangesFromCDC(
@@ -1351,6 +1640,131 @@ namespace cdc {
     return change_resp;
   }
 
+  Result<int64> CDCSDKYsqlTest::GetChangeRecordCount(
+      const xrepl::StreamId& stream_id,
+      const YBTableName& table,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      std::map<TabletId, CDCSDKCheckpointPB> tablet_to_checkpoint,
+      const int64 expected_total_records,
+      bool explicit_checkpointing_enabled,
+      std::map<TabletId, std::vector<CDCSDKProtoRecordPB>> records) {
+    std::vector<TabletId> tablet_ids;
+    std::map<TabletId, CDCSDKCheckpointPB> explicit_checkpoints;
+    for (int i = 0; i < tablets.size(); ++i) {
+      tablet_ids.push_back(tablets.Get(i).tablet_id());
+    }
+
+    GetChangesRequestPB change_req;
+    GetChangesResponsePB change_resp;
+
+    CDCSDKCheckpointPB explicit_checkpoint;
+    explicit_checkpoint.set_term(0);
+    explicit_checkpoint.set_index(0);
+    explicit_checkpoint.set_write_id(0);
+    explicit_checkpoint.set_key("");
+
+    int64 total_record_count = 0;
+
+    RETURN_NOT_OK(WaitFor([&]() -> Result<bool> {
+      for (uint32_t i = 0; i < tablet_ids.size(); ++i) {
+        auto cp = tablet_to_checkpoint.find(tablet_ids[i]);
+
+        if (cp == tablet_to_checkpoint.end()) {
+          PrepareChangeRequest(&change_req, stream_id, tablet_ids[i], i);
+        } else {
+          PrepareChangeRequest(&change_req, stream_id, tablet_ids[i], cp->second, i);
+        }
+
+        // If the stream is configured for explicit checkpointing, then we will populate the
+        // explicit_cdc_sdk_checkpoint field as well.
+        auto iter = explicit_checkpoints.find(tablet_ids[i]);
+        CDCSDKCheckpointPB explicit_cp;
+        if (explicit_checkpointing_enabled) {
+          if (iter == explicit_checkpoints.end()) {
+            change_req.mutable_explicit_cdc_sdk_checkpoint()->CopyFrom(explicit_checkpoint);
+          } else {
+            explicit_cp = iter->second;
+            change_req.mutable_explicit_cdc_sdk_checkpoint()->CopyFrom(explicit_cp);
+
+          }
+        }
+
+        rpc::RpcController get_changes_rpc;
+
+        LOG(INFO) << "Calling GetChanges on " << tablet_ids[i] << " with "
+                  << change_req.from_cdc_sdk_checkpoint().term() << ":"
+                  << change_req.from_cdc_sdk_checkpoint().index();
+        auto status = cdc_proxy_->GetChanges(change_req, &change_resp, &get_changes_rpc);
+
+        if (status.ok() && !change_resp.has_error()) {
+          // Process the records here.
+          for (auto record : change_resp.cdc_sdk_proto_records()) {
+            if (IsDMLRecord(record)) {
+              ++total_record_count;
+            }
+
+            if (record.row_message().op() != RowMessage::DDL) {
+              records[tablet_ids[i]].push_back(record);
+            }
+
+            if (explicit_checkpointing_enabled) {
+              explicit_cp.set_term(record.from_op_id().term());
+              explicit_cp.set_index(record.from_op_id().index());
+              explicit_cp.set_key(record.from_op_id().write_id_key());
+              explicit_cp.set_write_id(record.from_op_id().write_id());
+              explicit_cp.set_snapshot_time(record.row_message().commit_time() - 1);
+            }
+          }
+
+          LOG(INFO) << "Received records for tablet " << tablet_ids[i] << ": "
+                    << change_resp.cdc_sdk_proto_records_size() << " with response checkpoint "
+                    << change_resp.cdc_sdk_checkpoint().term() << ":"
+                    << change_resp.cdc_sdk_checkpoint().index();
+
+          tablet_to_checkpoint[tablet_ids[i]] = change_resp.cdc_sdk_checkpoint();
+        } else {
+          status = StatusFromPB(change_resp.error().status());
+          if (status.IsTabletSplit()) {
+            LOG(INFO) << "Got a tablet split on tablet " << tablet_ids[i]
+                      << ", fetching new tablets";
+
+            auto get_tablets_resp = VERIFY_RESULT(
+                GetTabletListToPollForCDC(stream_id, table.table_id(), tablet_ids[i]));
+
+            VERIFY_EQ(get_tablets_resp.tablet_checkpoint_pairs_size(), 2);
+
+            // Store the opIds for the children tablets.
+            for (int j = 0; j < get_tablets_resp.tablet_checkpoint_pairs_size(); ++j) {
+              auto pair = get_tablets_resp.tablet_checkpoint_pairs(j);
+              tablet_to_checkpoint[pair.tablet_locations().tablet_id()] = pair.cdc_sdk_checkpoint();
+              explicit_checkpoints[pair.tablet_locations().tablet_id()] = pair.cdc_sdk_checkpoint();
+
+              tablet_ids.push_back(pair.tablet_locations().tablet_id());
+
+              LOG(INFO) << "Assigned from_op_id " << pair.cdc_sdk_checkpoint().term() << ":"
+                        << pair.cdc_sdk_checkpoint().index() << " to child "
+                        << pair.tablet_locations().tablet_id();
+            }
+
+            tablet_ids.erase(find(tablet_ids.begin(), tablet_ids.end(), tablet_ids[i]));
+
+            break;
+          } else {
+            RETURN_NOT_OK(status);
+          }
+        }
+      }
+
+      LOG(INFO) << "Total records consumed so far: " << total_record_count;
+
+      return total_record_count >= expected_total_records;
+    },
+    MonoDelta::FromSeconds(300),
+    "Timed out while fetching the changes"));
+
+    return total_record_count;
+  }
+
   Result<GetChangesResponsePB> CDCSDKYsqlTest::GetChangesFromCDCWithoutRetry(
       const xrepl::StreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
@@ -1427,6 +1841,114 @@ namespace cdc {
     return resp;
   }
 
+  Result<uint64_t> FindLSNForSendingFeedback(GetConsistentChangesResponsePB& change_resp) {
+    bool found_commit = false;
+    uint64_t commit_lsn;
+    if (change_resp.cdc_sdk_proto_records_size() > 0) {
+      for (const auto& record : change_resp.cdc_sdk_proto_records()) {
+        if (record.row_message().op() == RowMessage_Op_COMMIT) {
+          found_commit = true;
+          commit_lsn = record.row_message().pg_lsn();
+        }
+      }
+    }
+
+    if (!found_commit) {
+      LOG(INFO) << "Couldnt find a commit lsn for sending feedback";
+      return STATUS_FORMAT(NotFound, "Couldnt find a commit lsn for sending feedback");
+    }
+
+    return commit_lsn;
+  }
+
+  Result<CDCSDKYsqlTest::GetAllPendingChangesResponse>
+  CDCSDKYsqlTest::GetAllPendingTxnsFromVirtualWAL(
+      const xrepl::StreamId& stream_id, std::vector<TableId> table_ids, int expected_dml_records,
+      bool init_virtual_wal, const uint64_t session_id, bool allow_sending_feedback) {
+    // We will keep on consuming changes until we get the entire txn i.e COMMIT record of the
+    // last txn. This indicates that even though we might have received the expecpted DML
+    // records, we might still continue calling GetConsistentChanges until we receive the
+    // COMMIT record.
+
+    GetAllPendingChangesResponse resp;
+    if (init_virtual_wal) {
+      Status s = InitVirtualWAL(stream_id, table_ids, session_id);
+      if (!s.ok()) {
+        LOG(INFO) << "Error while trying to initialize virtual WAL";
+        RETURN_NOT_OK(s);
+      }
+    }
+
+    // The count array stores counts of DDL, INSERT, UPDATE, DELETE, READ, TRUNCATE, BEGIN, COMMIT
+    // in that order.
+    int count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int begin_records = 0;
+    int commit_records = 0;
+    int dml_records = 0;
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          GetConsistentChangesResponsePB change_resp;
+          auto get_changes_result = GetConsistentChangesFromCDC(stream_id, table_ids, session_id);
+
+          if (get_changes_result.ok()) {
+            change_resp = *get_changes_result;
+          } else {
+            LOG(ERROR) << "Encountered error while calling GetConsistentChanges on stream: "
+                       << stream_id << ", status: " << get_changes_result.status();
+          }
+
+          for (int i = 0; i < change_resp.cdc_sdk_proto_records_size(); i++) {
+            resp.records.push_back(change_resp.cdc_sdk_proto_records(i));
+            UpdateRecordCount(change_resp.cdc_sdk_proto_records(i), count);
+          }
+
+          begin_records = count[6];
+          commit_records = count[7];
+          dml_records =
+              count[1] + count[2] + count[3] + count[5];  // INSERT + UPDATE + DELETE + TRUNCATE
+          LOG(INFO) << "Total Received records for stream " << resp.records.size();
+          uint64_t restart_lsn = 0;
+          uint64_t confirmed_flush_lsn = 0;
+          bool send_feedback = false;
+
+          if (allow_sending_feedback) {
+            auto result = FindLSNForSendingFeedback(change_resp);
+            if (result.ok()) {
+              send_feedback = true;
+              confirmed_flush_lsn = *result;
+              restart_lsn = *result + 1;
+            }
+
+            if (send_feedback) {
+              LOG(INFO) << "Sending feedback for stream " << stream_id
+                        << " with restart_lsn: " << restart_lsn
+                        << " and confirmed_flush_lsn: " << confirmed_flush_lsn;
+              auto result =
+                  UpdateAndPersistLSN(stream_id, confirmed_flush_lsn, restart_lsn, session_id);
+              if (!result.ok()) {
+                LOG(WARNING) << "UpdateRestartLSN failed: " << result;
+              }
+            }
+          }
+
+          if (dml_records < expected_dml_records || commit_records < begin_records) {
+            return false;
+          }
+
+          return true;
+        },
+        MonoDelta::FromSeconds(300), "Didnt receive expected records within time",
+        MonoDelta::FromMilliseconds(kDefaultInitialWaitMs), 1));
+
+    LOG(INFO) << "Record count array: ";
+    for (int i = 0; i < 8; i++) {
+      LOG(INFO) << "Count[" << i << "] = " << count[i];
+      resp.record_count[i] = count[i];
+    }
+
+    return resp;
+  }
+
   CDCSDKYsqlTest::GetAllPendingChangesResponse CDCSDKYsqlTest::GetAllPendingChangesFromCdc(
       const xrepl::StreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
@@ -1475,15 +1997,18 @@ namespace cdc {
   Result<GetChangesResponsePB> CDCSDKYsqlTest::GetChangesFromCDCWithExplictCheckpoint(
       const xrepl::StreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
-      const CDCSDKCheckpointPB* cp,
+      const CDCSDKCheckpointPB* from_op_id,
+      const CDCSDKCheckpointPB* explicit_checkpoint,
+      const TableId& colocated_table_id,
       int tablet_idx) {
     GetChangesRequestPB change_req;
     GetChangesResponsePB change_resp;
 
-    if (cp == nullptr) {
+    if (from_op_id == nullptr) {
       PrepareChangeRequest(&change_req, stream_id, tablets, tablet_idx);
     } else {
-      PrepareChangeRequestWithExplicitCheckpoint(&change_req, stream_id, tablets, *cp, tablet_idx);
+      PrepareChangeRequestWithExplicitCheckpoint(&change_req, stream_id, tablets,
+        from_op_id, explicit_checkpoint, colocated_table_id, tablet_idx);
     }
 
     // Retry only on LeaderNotReadyToServe or NotFound errors
@@ -1588,6 +2113,7 @@ namespace cdc {
       const uint32_t num_tservers,
       const bool set_flag_to_a_smaller_value,
       const uint32_t cdc_intent_retention_ms,
+      CDCCheckpointType checkpoint_type,
       const bool extend_expiration) {
     if (set_flag_to_a_smaller_value) {
       ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_intent_retention_ms) = cdc_intent_retention_ms;
@@ -1604,7 +2130,7 @@ namespace cdc {
         test_client()->GetTablets(table, 0, &tablets, /* partition_list_version = */ nullptr));
 
     TabletId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
-    xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(CDCCheckpointType::IMPLICIT));
+    xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStreamBasedOnCheckpointType(checkpoint_type));
     auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
     ASSERT_FALSE(resp.has_error());
 
@@ -1624,37 +2150,33 @@ namespace cdc {
     }
 
     ASSERT_OK(WriteRowsHelper(1, 2, &test_cluster_, true));
+    ASSERT_OK(WaitForPostApplyMetadataWritten(1 /* expected_num_transactions */));
+    ASSERT_OK(FlushTable(table.table_id()));
+
     // Sleep for 60s for the background thread to update the consumer op_id so that garbage
     // collection can happen.
     vector<int64> intent_counts(num_tservers, -1);
     ASSERT_OK(WaitFor(
         [this, &num_tservers, &set_flag_to_a_smaller_value, &extend_expiration, &intent_counts,
-         &stream_id, &tablets]() -> Result<bool> {
-          uint32_t i = 0;
-          while (i < num_tservers) {
+         &stream_id, &tablets, &change_resp]() -> Result<bool> {
+          for (uint32_t i = 0; i < num_tservers; ++i) {
             if (extend_expiration) {
               // Call GetChanges once to set the initial value in the cdc_state table.
-              auto result = GetChangesFromCDC(stream_id, tablets);
-              if (!result.ok()) {
+              auto change_resp_2 = VERIFY_RESULT(GetChangesFromCDC(
+                  stream_id, tablets, &change_resp.cdc_sdk_checkpoint()));
+              if (change_resp_2.has_error()) {
                 return false;
               }
-              yb::cdc::GetChangesResponsePB change_resp = *result;
-              if (change_resp.has_error()) {
-                return false;
-              }
+              change_resp = change_resp_2;
             }
 
-            auto status = GetIntentCounts(i, &intent_counts[i]);
-            if (!status.ok()) {
-              continue;
-            }
+            RETURN_NOT_OK(GetIntentCounts(i, &intent_counts[i]));
 
             if (set_flag_to_a_smaller_value && !extend_expiration) {
               if (intent_counts[i] != 0) {
-                continue;
+                return false;
               }
             }
-            i++;
           }
           return true;
         },
@@ -1671,13 +2193,14 @@ namespace cdc {
     // After time expired insert few more records
     if (set_flag_to_a_smaller_value && extend_expiration) {
       ASSERT_OK(WriteRowsHelper(10, 20, &test_cluster_, true));
-      ASSERT_OK(test_client()->FlushTables(
+      ASSERT_OK(WaitForFlushTables(
           {table.table_id()}, /* add_indexes = */ false,
           /* timeout_secs = */ 30, /* is_compaction = */ false));
 
       SleepFor(MonoDelta::FromMilliseconds(100));
 
-      change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+      change_resp =
+          ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &change_resp.cdc_sdk_checkpoint()));
       uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
       uint32_t insert_count = 0;
       for (uint32_t idx = 0; idx < record_size; idx++) {
@@ -1691,15 +2214,15 @@ namespace cdc {
     }
   }
 
-  void CDCSDKYsqlTest::TestSetCDCCheckpoint(const uint32_t num_tservers, bool initial_checkpoint) {
-    ASSERT_OK(SetUpWithParams(num_tservers, 1, false));
+  void CDCSDKYsqlTest::TestSetCDCCheckpoint(CDCCheckpointType checkpoint_type) {
+    ASSERT_OK(SetUpWithParams(1, 1, false));
     auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName));
     google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
     ASSERT_OK(
         test_client()->GetTablets(table, 0, &tablets, /* partition_list_version = */ nullptr));
 
     TabletId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
-    xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(CDCCheckpointType::IMPLICIT));
+    auto stream_id = ASSERT_RESULT(CreateDBStreamBasedOnCheckpointType(checkpoint_type));
     auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
     ASSERT_FALSE(resp.has_error());
     auto checkpoints = ASSERT_RESULT(GetCDCCheckpoint(stream_id, tablets));
@@ -1802,6 +2325,27 @@ namespace cdc {
     return get_resp;
   }
 
+  void CDCSDKYsqlTest::VerifyTablesInStreamMetadata(
+      const xrepl::StreamId& stream_id, const std::unordered_set<std::string>& expected_table_ids,
+      const std::string& timeout_msg) {
+    ASSERT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          auto get_resp = GetDBStreamInfo(stream_id);
+          if (get_resp.ok() && !get_resp->has_error()) {
+            const uint64_t table_info_size = get_resp->table_info_size();
+            if (table_info_size == expected_table_ids.size()) {
+              std::unordered_set<std::string> table_ids;
+              for (auto entry : get_resp->table_info()) {
+                table_ids.insert(entry.table_id());
+              }
+              if (expected_table_ids == table_ids) return true;
+            }
+          }
+          return false;
+        },
+        MonoDelta::FromSeconds(60), timeout_msg));
+  }
+
   Status CDCSDKYsqlTest::ChangeLeaderOfTablet(size_t new_leader_index, const TabletId tablet_id) {
     CHECK(!FLAGS_enable_load_balancing);
 
@@ -1816,6 +2360,22 @@ namespace cdc {
         test_cluster()->mini_tablet_server(new_leader_index)->server()->permanent_uuid());
     RETURN_NOT_OK(Subprocess::Call(argv));
 
+    return Status::OK();
+  }
+
+  Status CDCSDKYsqlTest::StepDownLeader(size_t new_leader_index, const TabletId tablet_id) {
+    Status status = yb_admin_client_->SetLoadBalancerEnabled(false);
+    if (!status.ok()) {
+      return status;
+    }
+
+    status = yb_admin_client_->LeaderStepDownWithNewLeader(
+        tablet_id,
+        test_cluster()->mini_tablet_server(new_leader_index)->server()->permanent_uuid());
+    if (!status.ok()) {
+      return status;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(500));
     return Status::OK();
   }
 
@@ -1877,6 +2437,40 @@ namespace cdc {
     argv.push_back("compact_sys_catalog");
     RETURN_NOT_OK(Subprocess::Call(argv));
     return Status::OK();
+  }
+
+  Status CDCSDKYsqlTest::FlushTable(const TableId& table_id) {
+    return WaitForFlushTables(
+        {table_id}, /* add_indexes = */ false, /* timeout_secs = */ 30,
+        /* is_compaction = */ false);
+  }
+
+  Status CDCSDKYsqlTest::WaitForPostApplyMetadataWritten(size_t expected_num_transactions) {
+    if (!GetAtomicFlag(&FLAGS_cdc_write_post_apply_metadata)) {
+      return Status::OK();
+    }
+    size_t num_intents = 0;
+    return WaitFor(
+        [&]() -> Result<bool> {
+          auto peers = ListTabletPeers(test_cluster_.mini_cluster_.get(), ListPeersFilter::kAll);
+          for (const auto &peer : peers) {
+            auto tablet = peer->shared_tablet();
+            auto participant = tablet ? tablet->transaction_participant() : nullptr;
+            if (!participant) {
+              continue;
+            }
+            auto result = VERIFY_RESULT(participant->TEST_CountIntents());
+            LOG(INFO) << "Transactions: " << result.num_transactions
+                      << " Post-apply: " << result.num_post_apply;
+            if (result.num_transactions < expected_num_transactions ||
+                result.num_transactions != result.num_post_apply) {
+              return false;
+            }
+            num_intents += result.num_intents;
+          }
+          return true;
+        },
+        MonoDelta::FromSeconds(30), "Waiting for post apply metadata to be written");
   }
 
   void CDCSDKYsqlTest::GetTabletLeaderAndAnyFollowerIndex(
@@ -2182,7 +2776,7 @@ namespace cdc {
     ASSERT_OK(WriteRowsHelper(
         0 /* start */, 11 /* end */, &test_cluster_, true, 4, kTableName,
         {kValue2ColumnName, kValue3ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
 
@@ -2208,7 +2802,7 @@ namespace cdc {
     ASSERT_OK(WriteRowsHelper(
         11 /* start */, 21 /* end */, &test_cluster_, true, 5, kTableName,
         {kValue2ColumnName, kValue3ColumnName, kValue4ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     change_resp =
@@ -2370,7 +2964,7 @@ namespace cdc {
     ASSERT_OK(WriteRowsHelper(
         1 /* start */, 11 /* end */, &test_cluster_, true, 4, kTableName,
         {kValue2ColumnName, kValue3ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     ASSERT_OK(DropColumn(&test_cluster_, kNamespaceName, kTableName, kValue2ColumnName));
@@ -2395,7 +2989,7 @@ namespace cdc {
     ASSERT_EQ(tablets.size(), num_tablets);
     ASSERT_OK(WriteRowsHelper(
         11 /* start */, 21 /* end */, &test_cluster_, true, 3, kTableName, {kValue3ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     change_resp =
@@ -2505,7 +3099,7 @@ namespace cdc {
     // Insert some records in transaction.
     ASSERT_OK(WriteRowsHelper(
         1 /* start */, 10 /* end */, &test_cluster_, true, 3, kTableName, {kValue2ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     ASSERT_OK(RenameColumn(
@@ -2531,7 +3125,7 @@ namespace cdc {
     ASSERT_EQ(tablets.size(), num_tablets);
     ASSERT_OK(WriteRowsHelper(
         11 /* start */, 21 /* end */, &test_cluster_, true, 3, kTableName, {kValue3ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     change_resp =
@@ -2666,7 +3260,7 @@ namespace cdc {
 
     ASSERT_OK(WriteRowsHelper(1 /* start */, 11 /* end */, &test_cluster_, true));
     // Call Getchanges
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
@@ -2679,14 +3273,14 @@ namespace cdc {
     size_t first_leader_index = -1;
     size_t first_follower_index = -1;
     GetTabletLeaderAndAnyFollowerIndex(tablets, &first_leader_index, &first_follower_index);
+    StartYbAdminClient();
     if (first_leader_index == 0) {
       // We want to avoid the scenario where the first TServer is the leader, since we want to shut
       // the leader TServer down and call GetChanges. GetChanges will be called on the cdc_proxy
       // based on the first TServer's address and we want to avoid the network issues.
-      ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+      ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
     }
-    ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
-    SleepFor(MonoDelta::FromSeconds(10));
+    ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
 
     // Call GetChanges with new LEADER.
     change_resp =
@@ -2698,7 +3292,7 @@ namespace cdc {
     ASSERT_OK(AddColumn(&test_cluster_, kNamespaceName, kTableName, kValue2ColumnName));
     ASSERT_OK(WriteRowsHelper(
         21 /* start */, 31 /* end */, &test_cluster_, true, 3, kTableName, {kValue2ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     change_resp =
@@ -2717,9 +3311,9 @@ namespace cdc {
       // We want to avoid the scenario where the first TServer is the leader, since we want to shut
       // the leader TServer down and call GetChanges. GetChanges will be called on the cdc_proxy
       // based on the first TServer's address and we want to avoid the network issues.
-      ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+      ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
     }
-    ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+    ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
     change_resp =
         ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &change_resp.cdc_sdk_checkpoint()));
     // Validate the columns and insert counts.
@@ -2825,7 +3419,7 @@ namespace cdc {
 
     ASSERT_OK(WriteRowsHelper(1 /* start */, 101 /* end */, &test_cluster_, true));
     // Call Getchanges
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
@@ -2835,7 +3429,7 @@ namespace cdc {
     ASSERT_OK(AddColumn(&test_cluster_, kNamespaceName, kTableName, kValue2ColumnName));
     ASSERT_OK(WriteRowsHelper(
         101 /* start */, 201 /* end */, &test_cluster_, true, 3, kTableName, {kValue2ColumnName}));
-    ASSERT_OK(test_client()->FlushTables(
+    ASSERT_OK(WaitForFlushTables(
         {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
         /* is_compaction = */ false));
     change_resp =
@@ -2844,18 +3438,101 @@ namespace cdc {
     size_t first_leader_index = -1;
     size_t first_follower_index = -1;
     GetTabletLeaderAndAnyFollowerIndex(tablets, &first_leader_index, &first_follower_index);
+    StartYbAdminClient();
     if (first_leader_index == 0) {
       // We want to avoid the scenario where the first TServer is the leader, since we want to shut
       // the leader TServer down and call GetChanges. GetChanges will be called on the cdc_proxy
       // based on the first TServer's address and we want to avoid the network issues.
-      ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+      ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
     }
-    ASSERT_OK(ChangeLeaderOfTablet(first_follower_index, tablets[0].tablet_id()));
+    ASSERT_OK(StepDownLeader(first_follower_index, tablets[0].tablet_id()));
     change_resp =
         ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &change_resp.cdc_sdk_checkpoint()));
     ValidateColumnCounts(change_resp, 2);
   }
 
+  void CDCSDKYsqlTest::WaitForCompaction(YBTableName table) {
+    auto peers = ListTabletPeers(test_cluster(), ListPeersFilter::kLeaders);
+    int count_before_compaction = CountEntriesInDocDB(peers, table.table_id());
+    int count_after_compaction = 0;
+    ASSERT_OK(WaitFor(
+      [&]() {
+        auto result = test_cluster_.mini_cluster_->CompactTablets();
+        if (!result.ok()) {
+          return false;
+        }
+        count_after_compaction = CountEntriesInDocDB(peers, table.table_id());
+        if (count_after_compaction < count_before_compaction) {
+          return true;
+        }
+        return false;
+      },
+      MonoDelta::FromSeconds(60), "Expected compaction did not happen"));
+    LOG(INFO) << "count_before_compaction: " << count_before_compaction
+            << " count_after_compaction: " << count_after_compaction;
+  }
+
+  void CDCSDKYsqlTest::VerifySnapshotOnColocatedTables(
+      xrepl::StreamId stream_id,
+      google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets,
+      const CDCSDKCheckpointPB& snapshot_bootstrap_checkpoint, const TableId& req_table_id,
+      const TableName& table_name, int64_t snapshot_records_per_table) {
+    bool first_call = true;
+    GetChangesResponsePB next_change_resp;
+    GetChangesResponsePB change_resp;
+    uint64 expected_snapshot_time;
+    int64_t seen_snapshot_records = 0;
+    CDCSDKCheckpointPB explicit_checkpoint;
+
+    while (true) {
+      if (first_call) {
+        next_change_resp = ASSERT_RESULT(GetChangesFromCDCWithExplictCheckpoint(
+            stream_id, tablets, &snapshot_bootstrap_checkpoint, &explicit_checkpoint,
+            req_table_id));
+      } else {
+        next_change_resp = ASSERT_RESULT(GetChangesFromCDCWithExplictCheckpoint(
+            stream_id, tablets, &change_resp.cdc_sdk_checkpoint(), &explicit_checkpoint,
+            req_table_id));
+      }
+
+      // count READ records
+      for (const auto& record : next_change_resp.cdc_sdk_proto_records()) {
+        if (record.row_message().op() == RowMessage::READ) {
+          seen_snapshot_records += 1;
+          ASSERT_EQ(record.row_message().table(), table_name);
+        }
+      }
+
+      // Get the checkpoint from cdc_state table
+      auto resp =
+          ASSERT_RESULT(GetCDCSnapshotCheckpoint(stream_id, tablets[0].tablet_id(), req_table_id));
+      ASSERT_GE(resp.snapshot_time(), 0);
+
+      if (first_call) {
+        ASSERT_EQ(resp.checkpoint().op_id().term(), snapshot_bootstrap_checkpoint.term());
+        ASSERT_EQ(resp.checkpoint().op_id().index(), snapshot_bootstrap_checkpoint.index());
+        ASSERT_EQ(resp.snapshot_key(), "");
+        expected_snapshot_time = resp.snapshot_time();
+        first_call = false;
+      } else {
+        ASSERT_EQ(resp.checkpoint().op_id().term(), change_resp.cdc_sdk_checkpoint().term());
+        ASSERT_EQ(resp.checkpoint().op_id().index(), change_resp.cdc_sdk_checkpoint().index());
+        ASSERT_EQ(resp.snapshot_key(), change_resp.cdc_sdk_checkpoint().key());
+        ASSERT_EQ(resp.snapshot_time(), expected_snapshot_time);
+      }
+
+      change_resp = next_change_resp;
+      explicit_checkpoint = change_resp.cdc_sdk_checkpoint();
+
+      if (change_resp.cdc_sdk_checkpoint().key().empty() &&
+          change_resp.cdc_sdk_checkpoint().write_id() == 0 &&
+          change_resp.cdc_sdk_checkpoint().snapshot_time() == 0) {
+        ASSERT_EQ(seen_snapshot_records, snapshot_records_per_table);
+        ASSERT_RESULT(UpdateSnapshotDone(stream_id, tablets, req_table_id));
+        break;
+      }
+    }
+  }
 
   Result<std::string> CDCSDKYsqlTest::GetValueFromMap(const QLMapValuePB& map_value,
     const std::string& key) {
@@ -2913,6 +3590,50 @@ namespace cdc {
     return expected_row;
   }
 
+  void CDCSDKYsqlTest::VerifyExplicitCheckpointingOnTablets(
+      const xrepl::StreamId& stream_id,
+      const std::unordered_map<TabletId, CdcStateTableRow>& initial_tablet_checkpoint,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets,
+      const std::unordered_set<TabletId>& expected_tablet_ids_with_progress) {
+    for (const auto& tablet : tablets) {
+      auto result = ASSERT_RESULT(ReadFromCdcStateTable(stream_id, tablet.tablet_id()));
+      ASSERT_GT(result.op_id, initial_tablet_checkpoint.at(tablet.tablet_id()).op_id);
+      if (expected_tablet_ids_with_progress.contains(tablet.tablet_id())) {
+        ASSERT_GT(
+            result.cdc_sdk_safe_time,
+            initial_tablet_checkpoint.at(tablet.tablet_id()).cdc_sdk_safe_time);
+      } else {
+        ASSERT_EQ(
+            result.cdc_sdk_safe_time,
+            initial_tablet_checkpoint.at(tablet.tablet_id()).cdc_sdk_safe_time);
+      }
+    }
+  }
+
+  void CDCSDKYsqlTest::VerifyLastRecordAndProgressOnSlot(
+      const xrepl::StreamId& stream_id, const CDCSDKProtoRecordPB& last_record) {
+    // Last record received from the Virtual WAL should always be a COMMIT record. While sending the
+    // last feedback to the VWAL after receiving the last batch of records, VWAL will use the
+    // last shipped commit record's metadata to update the slot entry in cdc_state table. Hence,
+    // confirmed_flush_lsn & restart_lsn will be same and they'll be equal to last shipped commit
+    // record' lsn.
+    ASSERT_EQ(last_record.row_message().op(), RowMessage::Op::RowMessage_Op_COMMIT);
+    auto commit_record_lsn = last_record.row_message().pg_lsn();
+    auto commit_record_txn_id = last_record.row_message().pg_transaction_id();
+    auto commit_record_commit_time = last_record.row_message().commit_time();
+
+    CDCStateTable cdc_state_table(test_client());
+    auto slot_entry = ASSERT_RESULT(cdc_state_table.TryFetchEntry(
+        {kCDCSDKSlotEntryTabletId, stream_id},
+        CDCStateTableEntrySelector().IncludeData().IncludeCDCSDKSafeTime()));
+    ASSERT_TRUE(slot_entry.has_value());
+    ASSERT_EQ(slot_entry->confirmed_flush_lsn, commit_record_lsn);
+    ASSERT_EQ(slot_entry->restart_lsn, commit_record_lsn);
+    ASSERT_EQ(slot_entry->xmin, commit_record_txn_id);
+    ASSERT_EQ(slot_entry->record_id_commit_time, commit_record_commit_time);
+    ASSERT_EQ(slot_entry->cdc_sdk_safe_time, commit_record_commit_time);
+  }
+
   void CDCSDKYsqlTest::UpdateRecordCount(const CDCSDKProtoRecordPB& record, int* record_count) {
     switch (record.row_message().op()) {
       case RowMessage::DDL: {
@@ -2942,6 +3663,85 @@ namespace cdc {
       default:
         ASSERT_FALSE(true);
         break;
+    }
+  }
+
+  void CDCSDKYsqlTest::CheckRecordCount(
+      GetAllPendingChangesResponse resp, int expected_dml_records) {
+    // The record count array in GetAllPendingChangesResponse stores counts of DDL, INSERT, UPDATE,
+    // DELETE, READ, TRUNCATE, BEGIN, COMMIT in that order.
+    int dml_records =
+        resp.record_count[1] + resp.record_count[2] + resp.record_count[3] + resp.record_count[5];
+    ASSERT_EQ(dml_records, expected_dml_records);
+
+    // last record received should be a COMMIT.
+    ASSERT_EQ(resp.records.back().row_message().op(), RowMessage::COMMIT);
+
+    // Number of BEGIN & COMMIT should be equal to the txn_id of last received record (i.e COMMIT)
+    // - 1 since transaction generator starts from 2, so first record will have txn_id as 2.
+    auto last_txn_id = resp.records.back().row_message().pg_transaction_id() - 1;
+    int begin_records = resp.record_count[6];
+    int commit_records = resp.record_count[7];
+    ASSERT_EQ(begin_records, last_txn_id);
+    ASSERT_EQ(commit_records, last_txn_id);
+  }
+
+  void CDCSDKYsqlTest::CheckRecordsConsistencyWithWriteId(
+      const std::vector<CDCSDKProtoRecordPB>& records) {
+    uint64_t prev_commit_time = 0;
+    uint64_t prev_record_time = 0;
+    uint32_t prev_write_id = 0;
+    uint64_t prev_lsn = 0;
+    uint64_t prev_txn_id = 0;
+    bool in_transaction = false;
+    bool first_record_in_transaction = false;
+    for (auto& record : records) {
+      if (record.row_message().op() == RowMessage::BEGIN) {
+        in_transaction = true;
+        first_record_in_transaction = true;
+        // BEGIN record should have strictly > commit_time than prev record' commit_time. Same
+        // follows for PG txn_id.
+        ASSERT_GT(record.row_message().commit_time(), prev_commit_time);
+        ASSERT_GT(record.row_message().pg_lsn(), prev_lsn);
+        ASSERT_GT(record.row_message().pg_transaction_id(), prev_txn_id);
+        prev_commit_time = record.row_message().commit_time();
+        prev_lsn = record.row_message().pg_lsn();
+        prev_txn_id = record.row_message().pg_transaction_id();
+      }
+
+      if (record.row_message().op() == RowMessage::COMMIT) {
+        ASSERT_TRUE(in_transaction);
+        in_transaction = false;
+        ASSERT_EQ(record.row_message().commit_time(), prev_commit_time);
+        ASSERT_GT(record.row_message().pg_lsn(), prev_lsn);
+        // PG txn_id should be same as the BEGIN record of the current txn.
+        ASSERT_EQ(record.row_message().pg_transaction_id(), prev_txn_id);
+        prev_commit_time = record.row_message().commit_time();
+        prev_lsn = record.row_message().pg_lsn();
+      }
+
+      if (record.row_message().op() == RowMessage::INSERT ||
+          record.row_message().op() == RowMessage::UPDATE ||
+          record.row_message().op() == RowMessage::DELETE) {
+        ASSERT_TRUE(in_transaction);
+        ASSERT_EQ(record.row_message().commit_time(), prev_commit_time);
+        ASSERT_GT(record.row_message().pg_lsn(), prev_lsn);
+        // PG txn_id should be same as the BEGIN record of the current txn.
+        ASSERT_EQ(record.row_message().pg_transaction_id(), prev_txn_id);
+        prev_commit_time = record.row_message().commit_time();
+        prev_lsn = record.row_message().pg_lsn();
+
+        if (!first_record_in_transaction) {
+          ASSERT_GE(record.row_message().record_time(), prev_record_time);
+          if (record.row_message().record_time() == prev_record_time) {
+            ASSERT_GE(record.cdc_sdk_op_id().write_id(), prev_write_id);
+          }
+        }
+
+        first_record_in_transaction = false;
+        prev_record_time = record.row_message().record_time();
+        prev_write_id = record.cdc_sdk_op_id().write_id();
+      }
     }
   }
 
@@ -2984,6 +3784,7 @@ namespace cdc {
 
   void CDCSDKYsqlTest::GetRecordsAndSplitCount(
       const xrepl::StreamId& stream_id, const TabletId& tablet_id, const TableId& table_id,
+      CDCCheckpointType checkpoint_type,
       int* record_count, int* total_records, int* total_splits) {
     std::vector<pair<TabletId, CDCSDKCheckpointPB>> tablets;
     tablets.push_back({tablet_id, {}});
@@ -3011,7 +3812,9 @@ namespace cdc {
             ASSERT_RESULT(GetTabletListToPollForCDC(stream_id, table_id, tablet_id));
         for (const auto& tablet_checkpoint_pair : get_tablets_resp.tablet_checkpoint_pairs()) {
           auto new_tablet = tablet_checkpoint_pair.tablet_locations();
-          auto new_checkpoint = tablet_checkpoint_pair.cdc_sdk_checkpoint();
+          auto new_checkpoint = (checkpoint_type == CDCCheckpointType::EXPLICIT)
+                                    ? change_resp.cdc_sdk_checkpoint()
+                                    : tablet_checkpoint_pair.cdc_sdk_checkpoint();
           tablets.push_back({new_tablet.tablet_id(), new_checkpoint});
         }
       }
@@ -3021,19 +3824,22 @@ namespace cdc {
   void CDCSDKYsqlTest::PerformSingleAndMultiShardInserts(
       const int& num_batches, const int& inserts_per_batch, int apply_update_latency,
       const int& start_index) {
+    auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(kNamespaceName));
     for (int i = 0; i < num_batches; i++) {
       int multi_shard_inserts = inserts_per_batch / 2;
       int curr_start_id = start_index + i * inserts_per_batch;
 
-      ANNOTATE_UNPROTECTED_WRITE(
-          FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms) = apply_update_latency;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms) =
+          apply_update_latency;
       ASSERT_OK(WriteRowsHelper(
-          curr_start_id, curr_start_id + multi_shard_inserts, &test_cluster_, true));
+          curr_start_id, curr_start_id + multi_shard_inserts, &test_cluster_, true, 2, kTableName,
+          {}, true, &conn));
 
-      ANNOTATE_UNPROTECTED_WRITE(
-          FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms) = 0;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_txn_participant_inject_latency_on_apply_update_txn_ms) =
+          0;
       ASSERT_OK(WriteRows(
-          curr_start_id + multi_shard_inserts, curr_start_id + inserts_per_batch, &test_cluster_));
+          curr_start_id + multi_shard_inserts, curr_start_id + inserts_per_batch, &test_cluster_,
+          {}, &conn));
     }
   }
 
@@ -3092,7 +3898,7 @@ namespace cdc {
       for (const auto& tablet_peer : test_cluster()->GetTabletPeers(i)) {
         if (tablet_peer->tablet_id() == tablet_id) {
           ASSERT_OK(WaitFor(
-              [&]() -> bool { return tablet_peer->get_cdc_sdk_safe_time() == expected_safe_time; },
+              [&]() -> bool { return tablet_peer->get_cdc_sdk_safe_time() <= expected_safe_time; },
               MonoDelta::FromSeconds(60), "Safe_time is not as expected."));
         }
       }
@@ -3102,7 +3908,8 @@ namespace cdc {
   Status CDCSDKYsqlTest::WaitForGetChangesToFetchRecords(
       GetChangesResponsePB* get_changes_resp, const xrepl::StreamId& stream_id,
       const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
-      const int& expected_count, const CDCSDKCheckpointPB* cp, const int& tablet_idx,
+      const int& expected_count, bool is_explicit_checkpoint,
+      const CDCSDKCheckpointPB* cp, const int& tablet_idx,
       const int64& safe_hybrid_time, const int& wal_segment_index, const double& timeout_secs) {
     int actual_count = 0;
     return WaitFor(
@@ -3119,16 +3926,300 @@ namespace cdc {
               }
             }
           }
-          return actual_count == expected_count;
+          LOG_WITH_FUNC(INFO) << "Actual Count = " << actual_count
+                              << ", Expected count = " << expected_count;
+
+          bool result = actual_count == expected_count;
+          // Reset the count back to zero for explicit checkpoint since we are going to receive
+          // these records again as we are not forwarding the checkpoint in the next GetChanges
+          // call based on the rows received.
+          if (is_explicit_checkpoint) {
+            actual_count = 0;
+          }
+          return result;
         },
         MonoDelta::FromSeconds(timeout_secs),
         "Waiting for GetChanges to fetch: " + std::to_string(expected_count) + " records");
   }
 
-  Status CDCSDKYsqlTest::XreplValidateSplitCandidateTable(const TableId& table_id) {
+  Status CDCSDKYsqlTest::WaitForGetChangesToFetchRecordsAcrossTablets(
+      const xrepl::StreamId& stream_id,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const int& expected_count, bool is_explicit_checkpoint, const CDCSDKCheckpointPB* cp,
+      const int64& safe_hybrid_time, const int& wal_segment_index, const double& timeout_secs) {
+    int actual_count = 0;
+    return WaitFor(
+        [&]() -> Result<bool> {
+          // Call GetChanges for each tablet.
+          for (int tablet_idx = 0; tablet_idx < tablets.size(); tablet_idx++) {
+            auto get_changes_resp_result = GetChangesFromCDC(
+              stream_id, tablets, cp, tablet_idx, safe_hybrid_time, wal_segment_index);
+            if (get_changes_resp_result.ok()) {
+              for (const auto& record : get_changes_resp_result->cdc_sdk_proto_records()) {
+                if (record.row_message().op() == RowMessage::INSERT ||
+                    record.row_message().op() == RowMessage::UPDATE ||
+                    record.row_message().op() == RowMessage::DELETE) {
+                  actual_count += 1;
+                }
+              }
+            }
+          }
+
+          LOG_WITH_FUNC(INFO) << "Actual Count = " << actual_count
+                              << ", Expected count = " << expected_count;
+
+          bool result = actual_count == expected_count;
+
+          // Reset the count back to zero for explicit checkpoint since we are going to receive
+          // these records again as we are not forwarding the checkpoint in the next GetChanges
+          // call based on the rows received.
+          if (is_explicit_checkpoint) {
+            actual_count = 0;
+          }
+          return result;
+        },
+        MonoDelta::FromSeconds(timeout_secs),
+        "Waiting for GetChanges to fetch: " + std::to_string(expected_count) + " records");
+  }
+
+  Status CDCSDKYsqlTest::WaitForFlushTables(
+      const std::vector<TableId>& table_ids, bool add_indexes, int timeout_secs,
+      bool is_compaction) {
+    RETURN_NOT_OK(WaitFor(
+        [&]() -> Result<bool> {
+          auto status = test_client()->FlushTables(
+              table_ids, /* add_indexes = */ add_indexes,
+              /* timeout_secs = */ timeout_secs, /* is_compaction = */ is_compaction);
+          if (!status.ok()) {
+            if (status.IsInternalError()) {
+              return false;
+            } else {
+              RETURN_NOT_OK(status);
+            }
+          }
+          return true;
+        },
+        MonoDelta::FromSeconds(timeout_secs), "Waiting for flush operation to complete"));
+    return Status::OK();
+  }
+
+  Status CDCSDKYsqlTest::XReplValidateSplitCandidateTable(const TableId& table_id) {
     auto& cm = test_cluster_.mini_cluster_->mini_master()->catalog_manager_impl();
-    auto table = cm.GetTableInfo(table_id);
-    return cm.XreplValidateSplitCandidateTable(*table);
+    return cm.XReplValidateSplitCandidateTable(table_id);
+  }
+
+  void CDCSDKYsqlTest::LogRetentionBarrierAndRelatedDetails(
+      const GetCheckpointResponsePB& checkpoint_result,
+      const tablet::TabletPeerPtr& tablet_peer) {
+
+    LOG(INFO) << "Snapshot Time : " << checkpoint_result.snapshot_time();
+    LOG(INFO) << "History cutoff: " << tablet_peer->get_cdc_sdk_safe_time();
+    LOG(INFO) << "Snapshot Safe Opid: " <<  checkpoint_result.checkpoint().op_id()
+              << ", WAL index protected from: " << tablet_peer->get_cdc_min_replicated_index()
+              << ", Intents protected from: " << tablet_peer->cdc_sdk_min_checkpoint_op_id();
+  }
+
+  void CDCSDKYsqlTest::LogRetentionBarrierDetails(
+      const tablet::TabletPeerPtr& tablet_peer) {
+
+    LOG(INFO) << tablet_peer->LogPrefix()
+              << " History cutoff: " << tablet_peer->get_cdc_sdk_safe_time()
+              << ", WAL index protected from: " << tablet_peer->get_cdc_min_replicated_index()
+              << ", Intents protected from: " << tablet_peer->cdc_sdk_min_checkpoint_op_id();
+  }
+
+  void CDCSDKYsqlTest::ConsumeSnapshotAndVerifyRecords(
+      const xrepl::StreamId& stream_id,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const CDCSDKCheckpointPB& cp_resp,
+      const CDCSDKYsqlTest::ExpectedRecord* expected_records,
+      const uint32_t* expected_count,
+      uint32_t* count) {
+
+    GetChangesResponsePB change_resp_updated =
+    ASSERT_RESULT(UpdateCheckpoint(stream_id, tablets, cp_resp));
+
+    uint32_t record_size = change_resp_updated.cdc_sdk_proto_records_size();
+    for (uint32_t i = 0; i < record_size; ++i) {
+      const CDCSDKProtoRecordPB record = change_resp_updated.cdc_sdk_proto_records(i);
+      CheckRecord(record, expected_records[i], count);
+    }
+    LOG(INFO) << "Got " << count[4] << " read record and " << count[0] << " ddl record";
+    CheckCount(expected_count, count);
+  }
+
+  Result<uint32_t> CDCSDKYsqlTest::ConsumeSnapshotAndVerifyCounts(
+      const xrepl::StreamId& stream_id,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const CDCSDKCheckpointPB& cp_resp,
+      GetChangesResponsePB* change_resp_after_snapshot) {
+
+    uint32_t reads_snapshot = 0;
+    bool end_snapshot = false;
+    bool first_read = true;
+    GetChangesResponsePB change_resp;
+    GetChangesResponsePB change_resp_updated;
+
+    while (true) {
+      if (first_read) {
+        change_resp_updated = VERIFY_RESULT(UpdateCheckpoint(stream_id, tablets, cp_resp));
+        first_read = false;
+      } else {
+        change_resp_updated = VERIFY_RESULT(UpdateCheckpoint(stream_id, tablets, &change_resp));
+      }
+
+      uint32_t record_size = change_resp_updated.cdc_sdk_proto_records_size();
+      uint32_t read_count = 0;
+      for (uint32_t i = 0; i < record_size; ++i) {
+        const CDCSDKProtoRecordPB record = change_resp_updated.cdc_sdk_proto_records(i);
+        if (record.row_message().op() == RowMessage::READ) {
+          read_count++;
+        } else if (record.row_message().op() == RowMessage::INSERT) {
+          end_snapshot = true;
+          break;
+        }
+      }
+      if (end_snapshot) {
+        break;
+      }
+      reads_snapshot += read_count;
+      change_resp = change_resp_updated;
+    }
+
+    *change_resp_after_snapshot = change_resp;
+    return reads_snapshot;
+  }
+
+  Result<uint32_t> CDCSDKYsqlTest::ConsumeInsertsAndVerifyCounts(
+      const xrepl::StreamId& stream_id,
+      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
+      const GetChangesResponsePB& change_resp_after_snapshot) {
+
+    uint32_t inserts_snapshot = 0;
+    GetChangesResponsePB change_resp = change_resp_after_snapshot;
+
+    while (true) {
+      GetChangesResponsePB change_resp1 =
+          VERIFY_RESULT(UpdateCheckpoint(stream_id, tablets, &change_resp));
+      uint32_t record_size_after_snapshot = change_resp1.cdc_sdk_proto_records_size();
+      if (record_size_after_snapshot == 0) {
+        break;
+      }
+      uint32_t insert_count = 0;
+      for (uint32_t i = 0; i < record_size_after_snapshot; ++i) {
+        const CDCSDKProtoRecordPB record = change_resp1.cdc_sdk_proto_records(i);
+        if (record.row_message().op() == RowMessage::INSERT) {
+          insert_count++;
+        }
+      }
+      inserts_snapshot += insert_count;
+      change_resp = change_resp1;
+    }
+
+    return inserts_snapshot;
+  }
+
+  void CDCSDKYsqlTest::ConsumeSnapshotAndPerformDML(
+      xrepl::StreamId stream_id, YBTableName table,
+      google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets,
+      CDCSDKCheckpointPB checkpoint, GetChangesResponsePB* change_resp) {
+    auto peers = ListTabletPeers(test_cluster(), ListPeersFilter::kLeaders);
+    uint32_t reads_snapshot = 0;
+    bool do_update = true;
+    bool first_read = true;
+    // GetChangesResponsePB change_resp;
+    GetChangesResponsePB change_resp_updated;
+    CDCSDKCheckpointPB explicit_checkpoint;
+    vector<int> excepted_result(2);
+    vector<int> actual_result(2);
+    while (true) {
+      if (do_update) {
+        ASSERT_OK(UpdateRows(100, 1001, &test_cluster_));
+        ASSERT_OK(DeleteRows(1, &test_cluster_));
+        ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+        ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
+        do_update = false;
+      }
+      if (first_read) {
+        change_resp_updated = ASSERT_RESULT(GetChangesFromCDCWithExplictCheckpoint(
+            stream_id, tablets, &checkpoint, &explicit_checkpoint));
+        first_read = false;
+        // No changes in DocDB entries should be seen because retention barriers are held by
+        // snapshot.
+        auto count_before_compaction = CountEntriesInDocDB(peers, table.table_id());
+        ASSERT_OK(test_cluster_.mini_cluster_->CompactTablets());
+        auto count_after_compaction = CountEntriesInDocDB(peers, table.table_id());
+        ASSERT_EQ(count_before_compaction, count_after_compaction);
+      } else {
+        change_resp_updated = ASSERT_RESULT(GetChangesFromCDCWithExplictCheckpoint(
+            stream_id, tablets, &change_resp->cdc_sdk_checkpoint(), &explicit_checkpoint));
+      }
+      uint32_t record_size = change_resp_updated.cdc_sdk_proto_records_size();
+      uint32_t read_count = 0;
+      for (uint32_t i = 0; i < record_size; ++i) {
+        const CDCSDKProtoRecordPB record = change_resp_updated.cdc_sdk_proto_records(i);
+        std::stringstream s;
+
+        if (record.row_message().op() == RowMessage::READ) {
+          for (int jdx = 0; jdx < record.row_message().new_tuple_size(); jdx++) {
+            s << " " << record.row_message().new_tuple(jdx).datum_int32();
+            if (record.row_message().new_tuple(jdx).column_name() == kKeyColumnName) {
+              actual_result[0] = record.row_message().new_tuple(jdx).datum_int32();
+            } else if (record.row_message().new_tuple(jdx).column_name() == kValueColumnName) {
+              actual_result[1] = record.row_message().new_tuple(jdx).datum_int32();
+            }
+          }
+          LOG(INFO) << "row: " << i << " : " << s.str();
+          // we should only get row values w.r.t snapshot, not changed values during snapshot.
+          if (actual_result[0] == 100) {
+            excepted_result[0] = 100;
+            excepted_result[1] = 101;
+            ASSERT_EQ(actual_result, excepted_result);
+          } else if (actual_result[0] == 1) {
+            excepted_result[0] = 1;
+            excepted_result[1] = 2;
+            ASSERT_EQ(actual_result, excepted_result);
+          }
+          read_count++;
+        }
+      }
+      reads_snapshot += read_count;
+      change_resp = &change_resp_updated;
+      explicit_checkpoint = change_resp->cdc_sdk_checkpoint();
+
+      // received snapshot complete marker
+      if (change_resp->cdc_sdk_checkpoint().has_snapshot_time() &&
+          change_resp->cdc_sdk_checkpoint().snapshot_time() == 0 &&
+          change_resp->cdc_sdk_checkpoint().has_key() &&
+          change_resp->cdc_sdk_checkpoint().key() == "" &&
+          change_resp->cdc_sdk_checkpoint().has_write_id() &&
+          change_resp->cdc_sdk_checkpoint().write_id() == 0) {
+        ASSERT_RESULT(UpdateSnapshotDone(stream_id, tablets));
+        break;
+      }
+    }
+    ASSERT_EQ(reads_snapshot, 100);
+  }
+
+  void CDCSDKYsqlTest::VerifyTableIdAndPkInCDCRecords(
+      GetChangesResponsePB* resp, std::unordered_set<std::string>* record_primary_key,
+      std::unordered_set<std::string>* record_table_id) {
+    for (int i = 0; i < resp->cdc_sdk_proto_records_size(); i++) {
+      auto record = resp->cdc_sdk_proto_records(i);
+      if (IsDMLRecord(record)) {
+        ASSERT_TRUE(record.row_message().has_table_id());
+        ASSERT_TRUE(record.row_message().has_primary_key());
+        record_table_id->insert(record.row_message().table_id());
+        record_primary_key->insert(record.row_message().primary_key());
+      } else if (record.row_message().op() == RowMessage_Op_DDL) {
+        ASSERT_TRUE(record.row_message().has_table_id());
+        ASSERT_FALSE(record.row_message().has_primary_key());
+        record_table_id->insert(record.row_message().table_id());
+      } else {
+        ASSERT_FALSE(record.row_message().has_table_id());
+        ASSERT_FALSE(record.row_message().has_primary_key());
+      }
+    }
   }
 
 } // namespace cdc

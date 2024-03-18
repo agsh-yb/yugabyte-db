@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.ValidatingFormFactory;
 import com.yugabyte.yw.common.backuprestore.BackupHelper;
+import com.yugabyte.yw.common.operator.utils.OperatorUtils;
 import com.yugabyte.yw.forms.BackupRequestParams;
 import com.yugabyte.yw.forms.DeleteBackupParams;
 import com.yugabyte.yw.forms.DeleteBackupParams.DeleteBackupInfo;
@@ -21,7 +22,6 @@ import io.yugabyte.operator.v1alpha1.BackupStatus;
 import io.yugabyte.operator.v1alpha1.StorageConfig;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import play.libs.Json;
@@ -36,6 +36,7 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
   private final ValidatingFormFactory formFactory;
   private final String namespace;
   private final SharedIndexInformer<StorageConfig> scInformer;
+  private final OperatorUtils operatorUtils;
 
   public BackupReconciler(
       SharedIndexInformer<Backup> backupInformer,
@@ -43,7 +44,8 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
       BackupHelper backupHelper,
       ValidatingFormFactory formFactory,
       String namespace,
-      SharedIndexInformer<StorageConfig> scInformer) {
+      SharedIndexInformer<StorageConfig> scInformer,
+      OperatorUtils operatorUtils) {
     this.resourceClient = resourceClient;
     this.informer = backupInformer;
     this.lister = new Lister<>(informer.getIndexer());
@@ -51,6 +53,7 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
     this.formFactory = formFactory;
     this.namespace = namespace;
     this.scInformer = scInformer;
+    this.operatorUtils = operatorUtils;
   }
 
   private void updateStatus(Backup backup, String taskUUID, String backupUUID, String message) {
@@ -71,15 +74,6 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
     resourceClient.inNamespace(namespace).resource(backup).replaceStatus();
   }
 
-  public UUID getUniverseUUIDFromName(Long customerId, String universeName) {
-    Optional<Universe> universe = Universe.maybeGetUniverseByName(customerId, universeName);
-    UUID universeUUID;
-    if (universe.isPresent()) {
-      return universe.get().getUniverseUUID();
-    }
-    return null;
-  }
-
   public UUID getStorageConfigUUIDFromName(String scName) {
 
     Lister<StorageConfig> scLister = new Lister<>(this.scInformer.getIndexer());
@@ -93,20 +87,32 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
     return null;
   }
 
-  public BackupRequestParams getBackupTaskParamsFromCr(Backup backup) {
+  public BackupRequestParams getBackupTaskParamsFromCr(Backup backup) throws Exception {
     // Convert the Java object to JsonNode
     ObjectMapper objectMapper = new ObjectMapper();
     JsonNode crJsonNode = objectMapper.valueToTree(backup.getSpec());
-    List<Customer> custList = Customer.getAll();
-    Customer cust = custList.get(0);
+    Customer cust;
+    try {
+      cust = operatorUtils.getOperatorCustomer();
+    } catch (Exception e) {
+      log.error("Got Exception in getting customer {}", e);
+      return null;
+    }
 
     log.info("CRSPECJSON {}", crJsonNode);
 
-    UUID universeUUID = getUniverseUUIDFromName(cust.getId(), backup.getSpec().getUniverse());
+    Universe universe =
+        operatorUtils.getUniverseFromNameAndNamespace(
+            cust.getId(), backup.getSpec().getUniverse(), backup.getMetadata().getNamespace());
+    if (universe == null) {
+      throw new Exception("No universe found with name " + backup.getSpec().getUniverse());
+    }
+    UUID universeUUID = universe.getUniverseUUID();
     UUID storageConfigUUID = getStorageConfigUUIDFromName(backup.getSpec().getStorageConfig());
 
     ((ObjectNode) crJsonNode).put("universeUUID", universeUUID.toString());
     ((ObjectNode) crJsonNode).put("storageConfigUUID", storageConfigUUID.toString());
+    ((ObjectNode) crJsonNode).put("expiryTimeUnit", "MILLISECONDS");
 
     return formFactory.getFormDataOrBadRequest(crJsonNode, BackupRequestParams.class);
   }
@@ -121,10 +127,20 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
           KubernetesResourceDetails.fromResource(backup));
     } catch (Exception e) {
       log.error("Got Exception in converting to backup params {}", e);
+      return;
     }
-    List<Customer> custList = Customer.getAll();
-    Customer cust = custList.get(0);
-    UUID customerUUID = cust.getUuid();
+
+    Customer cust;
+    UUID customerUUID;
+    try {
+      cust = operatorUtils.getOperatorCustomer();
+      customerUUID = cust.getUuid();
+    } catch (Exception e) {
+      log.error("Got Exception in getting customer {}", e);
+      updateStatus(backup, "", "", "Failed in scheduling backup task" + e.getMessage());
+      return;
+    }
+
     log.info("BackupRequestParams {}", backupRequestParams);
     log.info("Starting backup task..");
     UUID taskUUID = null;
@@ -192,9 +208,15 @@ public class BackupReconciler implements ResourceEventHandler<Backup>, Runnable 
     dbp.deleteBackupInfos = new ArrayList<DeleteBackupInfo>();
     dbp.deleteBackupInfos.add(dbi);
     dbp.deleteForcefully = true;
-    List<Customer> custList = Customer.getAll();
-    Customer cust = custList.get(0);
-    UUID customerUUID = cust.getUuid();
+    Customer cust;
+    UUID customerUUID;
+    try {
+      cust = operatorUtils.getOperatorCustomer();
+      customerUUID = cust.getUuid();
+    } catch (Exception e) {
+      log.error("Got Exception in getting customer, not scheduling backup {}", e);
+      return;
+    }
     backupHelper.createDeleteBackupTasks(customerUUID, dbp);
   }
 

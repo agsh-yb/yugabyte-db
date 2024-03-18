@@ -842,6 +842,11 @@ typedef struct IndexOptInfo
 	bool		amcanparallel;	/* does AM support parallel scan? */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
 	void		(*amcostestimate) ();	/* AM's cost estimator */
+
+	bool		yb_amhasgetbitmap; /* does AM have yb_amgetbitmap interface? */
+
+	/* Used for YB base scans cost model */
+	int32_t 	yb_cached_ybctid_size;
 } IndexOptInfo;
 
 /*
@@ -1080,8 +1085,6 @@ typedef struct ParamPathInfo
 	double		ppi_rows;		/* estimated number of result tuples */
 	List	   *ppi_clauses;	/* join clauses available from outer rels */
 	Relids		yb_ppi_req_outer_batched; /* outer rels that can be batched */
-	Relids		yb_ppi_req_outer_unbatched; /* outer rels that cannot
-											 * be batched */
 } ParamPathInfo;
 
 
@@ -1175,11 +1178,24 @@ typedef struct Path
 	/* pathkeys is a List of PathKey nodes; see above */
 
 	YbPathInfo	yb_path_info;	/* fields used for YugabyteDB */
+	double		yb_estimated_num_nexts;
+	double		yb_estimated_num_seeks;
+	int			yb_estimated_docdb_result_width;
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */
 #define PATH_REQ_OUTER(path)  \
 	((path)->param_info ? (path)->param_info->ppi_req_outer : (Relids) NULL)
+
+#define YB_PATH_REQ_OUTER_BATCHED(path)  \
+	((path)->param_info ? ((path)->param_info->yb_ppi_req_outer_batched) : \
+	(Relids) NULL)
+
+#define YB_PATH_NEEDS_BATCHED_RELS(path) \
+	!bms_is_empty(YB_PATH_REQ_OUTER_BATCHED(path))
+
+#define YB_PATH_REQ_OUTER_UNBATCHED(path)  \
+	(bms_difference(PATH_REQ_OUTER(path), YB_PATH_REQ_OUTER_BATCHED(path)))
 
 /*----------
  * IndexPath represents an index scan over a single index.
@@ -1229,27 +1245,29 @@ typedef struct Path
  *
  * 'indextotalcost' and 'indexselectivity' are saved in the IndexPath so that
  * we need not recompute them when considering using the same index in a
- * bitmap index/heap scan (see BitmapHeapPath).  The costs of the IndexPath
- * itself represent the costs of an IndexScan or IndexOnlyScan plan type.
+ * bitmap index/heap scan (see BitmapHeapPath / YbBitmapTableScan).  The costs
+ * of the IndexPath itself represent the costs of an IndexScan or IndexOnlyScan
+ * plan type.
  *
  * 'yb_index_path_info' contains info propagated for YugabyteDB.
  *----------
  */
 typedef struct IndexPath
 {
-	Path				path;
-	IndexOptInfo	   *indexinfo;
-	List			   *indexclauses;
-	List			   *indexquals;
-	List			   *indexqualcols;
-	List			   *indexorderbys;
-	List			   *indexorderbycols;
-	ScanDirection		indexscandir;
-	Cost				indextotalcost;
-	Selectivity			indexselectivity;
-	double				estimated_num_nexts;
-	double				estimated_num_seeks;
-	YbIndexPathInfo		yb_index_path_info;	/* fields used for YugabyteDB */
+	Path		path;
+	IndexOptInfo *indexinfo;
+	List	   *indexclauses;
+	List	   *indexquals;
+	List	   *indexqualcols;
+	List	   *indexorderbys;
+	List	   *indexorderbycols;
+	ScanDirection indexscandir;
+	Cost		indextotalcost;
+	Selectivity indexselectivity;
+	double		yb_estimated_num_nexts;
+	double		yb_estimated_num_seeks;
+	int			yb_estimated_docdb_result_width;
+	YbIndexPathInfo yb_index_path_info;	/* fields used for YugabyteDB */
 } IndexPath;
 
 /*
@@ -1276,10 +1294,34 @@ typedef struct BitmapHeapPath
 } BitmapHeapPath;
 
 /*
+ * YbBitmapTablePath represents one or more indexscans that generate YbTID
+ * bitmaps instead of directly accessing the heap, followed by AND/OR
+ * combinations to produce a single bitmap, followed by a table scan that uses
+ * the bitmap. Note that the output is always considered unordered, since it
+ * will come out in physical heap order no matter what the underlying indexes
+ * did.
+ *
+ * The individual indexscans are represented by IndexPath nodes, and any
+ * logic on top of them is represented by a tree of BitmapAndPath and
+ * BitmapOrPath nodes.  Notice that we can use the same IndexPath node both
+ * to represent a regular (or index-only) index scan plan, and as the child
+ * of a YbBitmapTablePath that represents scanning the same index using a
+ * BitmapIndexScan.  The startup_cost and total_cost figures of an IndexPath
+ * always represent the costs to use it as a regular (or index-only)
+ * IndexScan.  The costs of a BitmapIndexScan can be computed using the
+ * IndexPath's indextotalcost and indexselectivity.
+ */
+typedef struct YbBitmapTablePath
+{
+	Path		path;
+	Path	   *bitmapqual;		/* IndexPath, BitmapAndPath, BitmapOrPath */
+} YbBitmapTablePath;
+
+/*
  * BitmapAndPath represents a BitmapAnd plan node; it can only appear as
- * part of the substructure of a BitmapHeapPath.  The Path structure is
- * a bit more heavyweight than we really need for this, but for simplicity
- * we make it a derivative of Path anyway.
+ * part of the substructure of a BitmapHeapPath or YbBitmapTablePath.  The Path
+ * structure is a bit more heavyweight than we really need for this, but for
+ * simplicity we make it a derivative of Path anyway.
  */
 typedef struct BitmapAndPath
 {
@@ -1290,9 +1332,9 @@ typedef struct BitmapAndPath
 
 /*
  * BitmapOrPath represents a BitmapOr plan node; it can only appear as
- * part of the substructure of a BitmapHeapPath.  The Path structure is
- * a bit more heavyweight than we really need for this, but for simplicity
- * we make it a derivative of Path anyway.
+ * part of the substructure of a BitmapHeapPath or YbBitmapTablePath.  The Path
+ * structure is a bit more heavyweight than we really need for this, but for
+ * simplicity we make it a derivative of Path anyway.
  */
 typedef struct BitmapOrPath
 {

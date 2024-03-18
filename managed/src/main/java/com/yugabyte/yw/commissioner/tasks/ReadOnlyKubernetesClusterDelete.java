@@ -11,12 +11,15 @@
 package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor;
 import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.UniverseInProgressException;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.AvailabilityZone;
@@ -29,9 +32,11 @@ import java.util.Map.Entry;
 import java.util.UUID;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 @Slf4j
+@Abortable
+@Retryable
 public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
 
   @Inject
@@ -49,6 +54,17 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
   }
 
   @Override
+  protected void validateUniverseState(Universe universe) {
+    try {
+      super.validateUniverseState(universe);
+    } catch (UniverseInProgressException e) {
+      if (!params().isForceDelete) {
+        throw e;
+      }
+    }
+  }
+
+  @Override
   public void run() {
     try {
       // Update the universe DB with the update to be performed and set the 'updateInProgress' flag
@@ -57,7 +73,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       if (params().isForceDelete) {
         universe = forceLockUniverseForUpdate(-1);
       } else {
-        universe = lockUniverseForUpdate(-1 /* expectedUniverseVersion */);
+        universe = lockAndFreezeUniverseForUpdate(-1, null /* Txn callback */);
       }
 
       List<Cluster> roClusters = universe.getUniverseDetails().getReadOnlyClusters();
@@ -72,6 +88,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       }
 
       preTaskActions();
+      addBasicPrecheckTasks();
 
       // We support only one readonly cluster, so using the first one in the list.
       Cluster cluster = roClusters.get(0);

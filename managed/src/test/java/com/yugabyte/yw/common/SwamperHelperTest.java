@@ -21,8 +21,10 @@ import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.alerts.impl.AlertTemplateService;
 import com.yugabyte.yw.common.config.DummyRuntimeConfigFactoryImpl;
+import com.yugabyte.yw.common.config.ProviderConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.AlertDefinition;
@@ -58,6 +60,7 @@ public class SwamperHelperTest extends FakeDBApplication {
   @Mock Config appConfig;
 
   @Mock RuntimeConfGetter mockConfGetter;
+  private RuntimeConfGetter confGetter;
 
   SwamperHelper swamperHelper;
 
@@ -78,6 +81,7 @@ public class SwamperHelperTest extends FakeDBApplication {
             env,
             mockConfGetter,
             alertTemplateService);
+    confGetter = app.injector().instanceOf(RuntimeConfGetter.class);
   }
 
   @After
@@ -88,20 +92,28 @@ public class SwamperHelperTest extends FakeDBApplication {
 
   @Test
   public void testWriteUniverseTargetNormalJson() {
-    testWriteUniverseTargetJson(MetricCollectionLevel.NORMAL, "metric/targets_normal.json");
+    testWriteUniverseTargetJson(
+        MetricCollectionLevel.NORMAL, "metric/targets_normal.json", "yugabyte.");
   }
 
   @Test
   public void testWriteUniverseTargetFullJson() {
-    testWriteUniverseTargetJson(MetricCollectionLevel.ALL, "metric/targets_all.json");
+    testWriteUniverseTargetJson(MetricCollectionLevel.ALL, "metric/targets_all.json", "yugabyte.");
   }
 
   @Test
   public void testWriteUniverseTargetMinimalJson() {
-    testWriteUniverseTargetJson(MetricCollectionLevel.MINIMAL, "metric/targets_minimal.json");
+    testWriteUniverseTargetJson(
+        MetricCollectionLevel.MINIMAL, "metric/targets_minimal.json", "yugabyte.");
   }
 
-  private void testWriteUniverseTargetJson(MetricCollectionLevel level, String expectedFile) {
+  @Test
+  public void testWriteOtelColJson() {
+    testWriteUniverseTargetJson(MetricCollectionLevel.NORMAL, "metric/targets_otel.json", "otel.");
+  }
+
+  private void testWriteUniverseTargetJson(
+      MetricCollectionLevel level, String expectedFile, String fileNamePrefix) {
     when(appConfig.getString("yb.swamper.targetPath")).thenReturn(SWAMPER_TMP_PATH);
     when(mockConfGetter.getConfForScope(
             any(Universe.class), eq(UniverseConfKeys.metricsCollectionLevel)))
@@ -112,8 +124,16 @@ public class SwamperHelperTest extends FakeDBApplication {
     ui.provider =
         Provider.get(defaultCustomer.getUuid(), Common.CloudType.aws).get(0).getUuid().toString();
     u.getUniverseDetails().upsertPrimaryCluster(ui, null);
+    u =
+        Universe.saveDetails(
+            u.getUniverseUUID(),
+            universe -> {
+              UniverseDefinitionTaskParams taskParams = universe.getUniverseDetails();
+              taskParams.otelCollectorEnabled = true;
+              universe.setUniverseDetails(taskParams);
+            });
 
-    String targetFilePath = SWAMPER_TMP_PATH + "yugabyte." + u.getUniverseUUID() + ".json";
+    String targetFilePath = SWAMPER_TMP_PATH + fileNamePrefix + u.getUniverseUUID() + ".json";
     try {
       swamperHelper.writeUniverseTargetJson(u.getUniverseUUID());
       BufferedReader br = new BufferedReader(new FileReader(targetFilePath));
@@ -122,11 +142,16 @@ public class SwamperHelperTest extends FakeDBApplication {
       while ((line = br.readLine()) != null) {
         sb.append(line);
       }
-
+      int otelMetricsPort =
+          confGetter.getConfForScope(
+              Provider.getOrBadRequest(UUID.fromString(ui.provider)),
+              ProviderConfKeys.otelCollectorMetricsPort);
       ArrayNode targetsJson = (ArrayNode) Json.parse(sb.toString());
       String expectedTargetsTemplate = TestUtils.readResource(expectedFile);
       String expectedTargetsStr =
           expectedTargetsTemplate.replaceAll("UNIVERSE_UUID", u.getUniverseUUID().toString());
+      expectedTargetsStr =
+          expectedTargetsStr.replaceAll("OTEL_PORT", Integer.toString(otelMetricsPort));
       ArrayNode targetsExpectedJson = (ArrayNode) Json.parse(expectedTargetsStr);
 
       List<JsonNode> targets = new ArrayList<>();
@@ -172,15 +197,18 @@ public class SwamperHelperTest extends FakeDBApplication {
     when(appConfig.getString("yb.swamper.targetPath")).thenReturn(SWAMPER_TMP_PATH);
     UUID universeUUID = UUID.randomUUID();
     String yugabyteFilePath = SWAMPER_TMP_PATH + "yugabyte." + universeUUID + ".json";
+    String otelFilePath = SWAMPER_TMP_PATH + "otel." + universeUUID + ".json";
     String nodeFilePath = SWAMPER_TMP_PATH + "node." + universeUUID + ".json";
     try {
       new File(yugabyteFilePath).createNewFile();
+      new File(otelFilePath).createNewFile();
       new File(nodeFilePath).createNewFile();
     } catch (IOException e) {
       assertTrue(false);
     }
     swamperHelper.removeUniverseTargetJson(universeUUID);
     assertFalse(new File(yugabyteFilePath).exists());
+    assertFalse(new File(otelFilePath).exists());
     assertFalse(new File(nodeFilePath).exists());
   }
 

@@ -10,8 +10,10 @@ import DataCenterConfigurationContainer from '../components/config/ConfigProvide
 import { YBErrorIndicator, YBLoading, YBLoadingCircleIcon } from '../components/common/indicators';
 import { api, runtimeConfigQueryKey } from '../redesign/helpers/api';
 import { RuntimeConfigKey } from '../redesign/helpers/constants';
-import { getWrappedChildren, hasNecessaryPerm } from '../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../redesign/features/rbac/UserPermPathMapping';
+import { hasNecessaryPerm } from '../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../redesign/features/rbac/ApiAndUserPermMapping';
+import { getWrappedChildren } from '../redesign/features/rbac/common/validator/ValidatorUtils';
+import { useTranslation } from 'react-i18next';
 
 const DataCenterConfigRedesignComponent = lazy(() =>
   import('../components/configRedesign/DataCenterConfigRedesign').then(
@@ -22,16 +24,17 @@ const DataCenterConfigRedesignComponent = lazy(() =>
 );
 
 export const DataCenterConfiguration = (props: any) => {
+  const { t } = useTranslation();
   const customerUUID = localStorage.getItem('customerId') ?? '';
   const customerRuntimeConfigQuery = useQuery(
     runtimeConfigQueryKey.customerScope(customerUUID),
     () => api.fetchRuntimeConfigs(customerUUID, true)
   );
 
-  const hasViewProviderPerm = hasNecessaryPerm(UserPermissionMap.listProvider);
+  const hasViewProviderPerm = hasNecessaryPerm(ApiPermissionMap.GET_PROVIDERS);
 
   if (!hasViewProviderPerm) {
-    return getWrappedChildren({ minimal: false, overrideStyle: { marginTop: '150px' } });
+    return getWrappedChildren({ overrideStyle: { marginTop: '150px' } });
   }
 
   if (customerRuntimeConfigQuery.isLoading || customerRuntimeConfigQuery.isIdle) {
@@ -39,7 +42,9 @@ export const DataCenterConfiguration = (props: any) => {
   }
   if (customerRuntimeConfigQuery.isError) {
     return (
-      <YBErrorIndicator message="Error fetching runtime configurations for current customer." />
+      <YBErrorIndicator
+        customErrorMessage={t('failedToFetchCustomerRuntimeConfig', { keyPrefix: 'queryError' })}
+      />
     );
   }
   const runtimeConfigEntries = customerRuntimeConfigQuery.data.configEntries ?? [];

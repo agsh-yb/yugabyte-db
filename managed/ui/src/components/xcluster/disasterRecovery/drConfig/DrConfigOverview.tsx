@@ -2,11 +2,13 @@ import { Box, makeStyles, Typography, useTheme } from '@material-ui/core';
 import { useTranslation } from 'react-i18next';
 
 import { DrParticipantCard } from './DrParticipantCard';
-import { ReactComponent as InfoIcon } from '../../../../redesign/assets/info-message.svg';
+import InfoIcon from '../../../../redesign/assets/info-message.svg';
 import { YBTooltip } from '../../../../redesign/components';
 import { DrConfigStateLabel } from '../DrConfigStateLabel';
 import { UniverseXClusterRole } from '../../constants';
 import { ReplicationIcon } from '../../icons/ReplicationIcon';
+import { getXClusterConfig } from '../utils';
+import { EstimatedDataLossLabel } from './EstimatedDataLossLabel';
 
 import { DrConfig } from '../dtos';
 
@@ -51,6 +53,7 @@ export const DrConfigOverview = ({ drConfig }: DrConfigOverviewProps) => {
   const classes = useStyles();
   const theme = useTheme();
 
+  const xClusterConfig = getXClusterConfig(drConfig);
   return (
     <div className={classes.overviewContainer}>
       <Box display="flex" flexDirection="column" gridGap={theme.spacing(2)}>
@@ -60,7 +63,7 @@ export const DrConfigOverview = ({ drConfig }: DrConfigOverviewProps) => {
             <YBTooltip
               title={<Typography variant="body2">{t('property.drStatus.tooltip')}</Typography>}
             >
-              <InfoIcon className={classes.infoIcon} />
+              <img src={InfoIcon} alt={t('infoIcon', { keyPrefix: 'imgAltText' })} />
             </YBTooltip>
           </div>
           <DrConfigStateLabel drConfig={drConfig} />
@@ -73,10 +76,10 @@ export const DrConfigOverview = ({ drConfig }: DrConfigOverviewProps) => {
                 <Typography variant="body2">{t('property.estimatedDataLoss.tooltip')}</Typography>
               }
             >
-              <InfoIcon className={classes.infoIcon} />
+              <img src={InfoIcon} alt={t('infoIcon', { keyPrefix: 'imgAltText' })} />
             </YBTooltip>
           </div>
-          <div>Placeholder ms</div>
+          <EstimatedDataLossLabel drConfigUuid={drConfig.uuid} />
         </Box>
       </Box>
       <Box
@@ -84,12 +87,12 @@ export const DrConfigOverview = ({ drConfig }: DrConfigOverviewProps) => {
         flexWrap="wrap"
         alignItems="center"
         gridGap={theme.spacing(5)}
-        marginTop={3}
+        marginTop={4}
       >
         <div className={classes.drParticipantContainer}>
           <Typography variant="subtitle1">{t('participant.drPrimary')}</Typography>
           <DrParticipantCard
-            xClusterConfig={drConfig.xClusterConfig}
+            xClusterConfig={xClusterConfig}
             universeXClusterRole={UniverseXClusterRole.SOURCE}
           />
         </div>
@@ -97,7 +100,7 @@ export const DrConfigOverview = ({ drConfig }: DrConfigOverviewProps) => {
         <div className={classes.drParticipantContainer}>
           <Typography variant="subtitle1">{t('participant.drReplica')}</Typography>
           <DrParticipantCard
-            xClusterConfig={drConfig.xClusterConfig}
+            xClusterConfig={xClusterConfig}
             universeXClusterRole={UniverseXClusterRole.TARGET}
           />
         </div>

@@ -29,7 +29,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
 
 /** Relates to YBA's PEM trust store */
@@ -171,6 +171,7 @@ public class PemTrustStoreManager implements TrustStoreManager {
     List<Certificate> trustCerts = getCertificates(trustStorePath);
     // Check if such an alias already exists.
     List<Certificate> certToRemove = getX509Certificate(certPath);
+    int certToRemoveCount = certToRemove.size();
     // Iterate through each certificate in certToRemove and check if it's used in any chain
     boolean exists = false;
     Iterator<Certificate> certIterator = certToRemove.iterator();
@@ -179,11 +180,18 @@ public class PemTrustStoreManager implements TrustStoreManager {
       if (isCertificateUsedInOtherChain(cert)) {
         // Certificate is part of a chain, do not remove it
         log.debug("Certificate {} is part of a chain, skipping removal.", certAlias);
+        certToRemoveCount -= 1;
         certIterator.remove();
       } else {
         // Certificate is not part of a chain
         exists = true;
       }
+    }
+
+    if (certToRemoveCount == 0) {
+      log.debug(
+          "Skipping removal of cert from PEM truststore, as the cert is part of other trust chain");
+      return;
     }
 
     if (!exists && !suppressErrors) {

@@ -1,29 +1,32 @@
 import { AxiosError } from 'axios';
 import { SubmitHandler, useForm } from 'react-hook-form';
 import { browserHistory } from 'react-router';
-import { makeStyles, Typography } from '@material-ui/core';
-import { toast } from 'react-toastify';
+import { makeStyles, Typography, useTheme } from '@material-ui/core';
 import { useMutation, useQueryClient } from 'react-query';
 import { Trans, useTranslation } from 'react-i18next';
+import { useSelector } from 'react-redux';
+import { toast } from 'react-toastify';
 
 import { YBModal, YBModalProps, YBTooltip } from '../../../../redesign/components';
 import { api, drConfigQueryKey, EditDrConfigRequest } from '../../../../redesign/helpers/api';
-import { fetchTaskUntilItCompletes } from '../../../../actions/xClusterReplication';
-import { handleServerError } from '../../../../utils/errorHandlingUtils';
-import { ReactComponent as InfoIcon } from '../../../../redesign/assets/info-message.svg';
+import { IStorageConfig as BackupStorageConfig } from '../../../backupv2';
 import {
   ReactSelectStorageConfigField,
   StorageConfigOption
 } from '../../sharedComponents/ReactSelectStorageConfig';
-
+import { handleServerError } from '../../../../utils/errorHandlingUtils';
+import { isActionFrozen } from '../../../../redesign/helpers/utils';
+import { AllowedTasks } from '../../../../redesign/helpers/dtos';
+import { DR_DROPDOWN_SELECT_INPUT_WIDTH_PX } from '../constants';
+import { UNIVERSE_TASKS } from '../../../../redesign/helpers/constants';
 import { DrConfig } from '../dtos';
 
-import toastStyles from '../../../../redesign/styles/toastStyles.module.scss';
+import InfoIcon from '../../../../redesign/assets/info-message.svg';
 
 interface EditConfigModalProps {
   drConfig: DrConfig;
   modalProps: YBModalProps;
-
+  allowedTasks: AllowedTasks;
   redirectUrl?: string;
 }
 
@@ -53,20 +56,34 @@ const MODAL_NAME = 'EditDrConfigModal';
 const TRANSLATION_KEY_PREFIX = 'clusterDetail.disasterRecovery.config.editModal';
 
 /**
- * This modal handles editing the bootstrap parameters of an existing DR config.
+ * This modal handles editing editing:
+ * - Backup storage config used for DR
  */
-export const EditConfigModal = ({ drConfig, modalProps, redirectUrl }: EditConfigModalProps) => {
+export const EditConfigModal = ({
+  drConfig,
+  modalProps,
+  redirectUrl,
+  allowedTasks
+}: EditConfigModalProps) => {
   const classes = useStyles();
   const queryClient = useQueryClient();
-  const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
-  // TODO: Use Existing bootstrap storage config as default.
-  const formMethods = useForm<EditConfigFormValues>();
+  const theme = useTheme();
+  const { t } = useTranslation('translation', {
+    keyPrefix: TRANSLATION_KEY_PREFIX
+  });
+  const storageConfigs: BackupStorageConfig[] = useSelector((reduxState: any) =>
+    reduxState?.customer?.configs?.data?.filter(
+      (storageConfig: BackupStorageConfig) => storageConfig.type === 'STORAGE'
+    )
+  );
 
   const editDrConfigMutation = useMutation(
     (formValues: EditConfigFormValues) => {
       const editDrConfigRequest: EditDrConfigRequest = {
-        bootstrapBackupParams: {
-          storageConfigUUID: formValues.storageConfig.value.uuid
+        bootstrapParams: {
+          backupRequestParams: {
+            storageConfigUUID: formValues.storageConfig.value.uuid
+          }
         }
       };
       return api.editDrConfig(drConfig.uuid, editDrConfigRequest);
@@ -77,50 +94,56 @@ export const EditConfigModal = ({ drConfig, modalProps, redirectUrl }: EditConfi
           queryClient.invalidateQueries(drConfigQueryKey.ALL, { exact: true });
           queryClient.invalidateQueries(drConfigQueryKey.detail(drConfig.uuid));
         };
-        const handleTaskCompletion = (error: boolean) => {
-          if (error) {
-            toast.error(
-              <span className={toastStyles.toastMessage}>
-                <i className="fa fa-exclamation-circle" />
-                <Typography variant="body2" component="span">
-                  {t('error.taskFailure')}
-                </Typography>
-                <a href={`/tasks/${response.taskUUID}`} rel="noopener noreferrer" target="_blank">
-                  {t('viewDetails', { keyPrefix: 'task' })}
-                </a>
-              </span>
-            );
-          } else {
-            toast.success(
-              <Typography variant="body2" component="span">
-                {t('success.taskSuccess')}
-              </Typography>
-            );
-          }
-          invalidateQueries();
-        };
 
         modalProps.onClose();
         if (redirectUrl) {
           browserHistory.push(redirectUrl);
         }
-        fetchTaskUntilItCompletes(response.taskUUID, handleTaskCompletion, invalidateQueries);
+        invalidateQueries();
+        toast.success(
+          <Typography variant="body2" component="span">
+            {t('success.requestSuccess')}
+          </Typography>
+        );
       },
       onError: (error: Error | AxiosError) =>
-        handleServerError(error, { customErrorLabel: t('error.requestFailureLabel') })
+        handleServerError(error, {
+          customErrorLabel: t('error.requestFailureLabel')
+        })
     }
   );
+
+  const formMethods = useForm<EditConfigFormValues>({
+    defaultValues: {}
+  });
+  const modalTitle = t('title');
+  const cancelLabel = t('cancel', { keyPrefix: 'common' });
 
   const onSubmit: SubmitHandler<EditConfigFormValues> = (formValues) => {
     return editDrConfigMutation.mutateAsync(formValues);
   };
 
-  const isFormDisabled = formMethods.formState.isSubmitting;
+  const currentBackupStorageConfig = storageConfigs.find(
+    (storageConfig) =>
+      storageConfig.configUUID === drConfig.bootstrapParams.backupRequestParams.storageConfigUUID
+  );
+  const defaultBackupStorageConfigOption = currentBackupStorageConfig
+    ? {
+        value: {
+          uuid: currentBackupStorageConfig.configUUID,
+          name: currentBackupStorageConfig.name
+        },
+        label: currentBackupStorageConfig.configName
+      }
+    : undefined;
+  const isEditActionFrozen = isActionFrozen(allowedTasks, UNIVERSE_TASKS.EDIT_DR);
+  const isFormDisabled = formMethods.formState.isSubmitting || isEditActionFrozen;
+
   return (
     <YBModal
-      title={t('title')}
+      title={modalTitle}
       submitLabel={t('applyChanges', { keyPrefix: 'common' })}
-      cancelLabel={t('cancel', { keyPrefix: 'common' })}
+      cancelLabel={cancelLabel}
       buttonProps={{ primary: { disabled: isFormDisabled } }}
       isSubmitting={formMethods.formState.isSubmitting}
       onSubmit={formMethods.handleSubmit(onSubmit)}
@@ -129,7 +152,12 @@ export const EditConfigModal = ({ drConfig, modalProps, redirectUrl }: EditConfi
       {...modalProps}
     >
       <div className={classes.formSectionDescription}>
-        <Typography variant="body1">{t('bootstrapConfiguration')}</Typography>
+        <Typography variant="body2">
+          <Trans
+            i18nKey={`${TRANSLATION_KEY_PREFIX}.infoText`}
+            components={{ bold: <b />, paragraph: <p /> }}
+          />
+        </Typography>
       </div>
       <div className={classes.fieldLabel}>
         <Typography variant="body2">{t('backupStorageConfig.label')}</Typography>
@@ -143,7 +171,7 @@ export const EditConfigModal = ({ drConfig, modalProps, redirectUrl }: EditConfi
             </Typography>
           }
         >
-          <InfoIcon className={classes.infoIcon} />
+          <img src={InfoIcon} alt={t('infoIcon', { keyPrefix: 'imgAltText' })} />
         </YBTooltip>
       </div>
       <ReactSelectStorageConfigField
@@ -151,6 +179,9 @@ export const EditConfigModal = ({ drConfig, modalProps, redirectUrl }: EditConfi
         name="storageConfig"
         rules={{ required: t('error.backupStorageConfigRequired') }}
         isDisabled={isFormDisabled}
+        autoSizeMinWidth={DR_DROPDOWN_SELECT_INPUT_WIDTH_PX}
+        maxWidth="100%"
+        defaultValue={defaultBackupStorageConfigOption}
       />
     </YBModal>
   );

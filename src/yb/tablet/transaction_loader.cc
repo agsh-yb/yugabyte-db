@@ -22,6 +22,7 @@
 
 #include "yb/tablet/transaction_status_resolver.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/bitmap.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -87,6 +88,8 @@ class TransactionLoader::Executor {
 
     auto se = ScopeExit([this, &status] {
       loader_.FinishLoad(status);
+      // Destroy this executor object. Must be the last statement before we return from the Execute
+      // function.
       loader_.executor_.reset();
     });
 
@@ -99,12 +102,20 @@ class TransactionLoader::Executor {
     status = LoadTransactions();
   }
 
+  Status CheckForShutdown() {
+    if (loader_.shutdown_requested_.load(std::memory_order_acquire)) {
+      return STATUS(IllegalState, "Shutting down");
+    }
+    return Status::OK();
+  }
+
   Status LoadTransactions() EXCLUDES(loader_.pending_applies_mtx_) {
     size_t loaded_transactions = 0;
     TransactionId id = TransactionId::Nil();
     docdb::AppendTransactionKeyPrefix(id, &current_key_);
     intents_iterator_.Seek(current_key_.AsSlice());
     while (intents_iterator_.Valid()) {
+      RETURN_NOT_OK(CheckForShutdown());
       auto key = intents_iterator_.key();
       if (!key.TryConsumeByte(dockv::KeyEntryTypeAsChar::kTransactionId)) {
         break;
@@ -133,6 +144,7 @@ class TransactionLoader::Executor {
 
     intents_iterator_.Reset();
 
+    RETURN_NOT_OK(CheckForShutdown());
     context().CompleteLoad([this] {
       loader_.state_ = TransactionLoaderState::kLoadCompleted;
     });
@@ -153,7 +165,7 @@ class TransactionLoader::Executor {
       // after that we would check all_loaded_ and exit the loop at line 1.
       std::lock_guard lock(loader_.mutex_);
     }
-    loader_.load_cond_.notify_all();
+    YB_PROFILE(loader_.load_cond_.notify_all());
     LOG_WITH_PREFIX(INFO) << __func__ << " done: loaded " << loaded_transactions << " transactions";
     return Status::OK();
   }
@@ -167,6 +179,7 @@ class TransactionLoader::Executor {
     regular_iterator_.Seek(Slice(seek_buffer.data(), 1));
 
     while (regular_iterator_.Valid()) {
+      RETURN_NOT_OK(CheckForShutdown());
       auto key = regular_iterator_.key();
       if (!key.TryConsumeByte(dockv::KeyEntryTypeAsChar::kTransactionApplyState)) {
         break;
@@ -254,7 +267,7 @@ class TransactionLoader::Executor {
       std::lock_guard lock(loader_.mutex_);
       loader_.last_loaded_ = id;
     }
-    loader_.load_cond_.notify_all();
+    YB_PROFILE(loader_.load_cond_.notify_all());
     return Status::OK();
   }
 
@@ -423,7 +436,12 @@ std::optional<ApplyStateWithCommitHt> TransactionLoader::GetPendingApply(
   return it->second;
 }
 
-void TransactionLoader::Shutdown() {
+void TransactionLoader::StartShutdown() {
+  std::lock_guard lock(mutex_);
+  shutdown_requested_ = true;
+}
+
+void TransactionLoader::CompleteShutdown() {
   if (load_thread_) {
     load_thread_->Join();
   }

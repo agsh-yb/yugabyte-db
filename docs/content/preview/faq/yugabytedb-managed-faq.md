@@ -2,15 +2,15 @@
 title: YugabyteDB Managed FAQ
 linkTitle: YugabyteDB Managed FAQ
 description: YugabyteDB Managed frequently asked questions.
-image: /images/section_icons/index/quick_start.png
 aliases:
   - /preview/yugabyte-cloud/cloud-faq/
 menu:
   preview_faq:
     identifier: yugabytedb-managed-faq
     parent: faq
-    weight: 60
+    weight: 30
 type: docs
+unversioned: true
 rightNav:
   hideH3: true
   hideH4: true
@@ -77,7 +77,7 @@ Yugabyte bills for its services as follows:
 
 - Charges by the minute for your YugabyteDB Managed clusters.
 - Tabulates costs daily.
-- Displays your current monthly costs under **Invoices** on the **Billing** tab.
+- Displays your current monthly costs under **Invoices** on the **Usage & Billing** tab.
 
 For information on YugabyteDB Managed pricing, refer to the [YugabyteDB Managed Standard Price List](https://www.yugabyte.com/yugabyte-cloud-standard-price-list/). For a description of how cluster configurations are costed, refer to [Cluster costs](../../yugabyte-cloud/cloud-admin/cloud-billing-costs/).
 
@@ -134,13 +134,13 @@ During a [maintenance window](../../yugabyte-cloud/cloud-clusters/cloud-maintena
 
 #### Cluster (YugabyteDB) version upgrade
 
-To keep up with the latest bug fixes, improvements, and security fixes, Yugabyte upgrades your cluster database to the [latest version](#what-version-of-yugabytedb-does-my-cluster-run-on).
+To keep up with the latest bug fixes, improvements, and security fixes, Yugabyte upgrades your cluster database to the [latest version](#what-version-of-yugabytedb-does-my-cluster-run-on). The database is upgraded to the latest release in the [release track](#what-version-of-yugabytedb-does-my-cluster-run-on) that was selected when the cluster was created (Innovation or Production for dedicated clusters, or Preview for Sandbox clusters). Sandbox clusters are always in the preview track.
 
-Yugabyte only upgrades clusters during scheduled maintenance windows. Yugabyte notifies you in advance of any upcoming upgrade via email. The email includes the date and time of the maintenance window. An Upcoming Maintenance badge is also displayed on the cluster. You can start the upgrade any time by signing in to YugabyteDB Managed, selecting the cluster, clicking the **Upcoming Maintenance** badge, and clicking **Upgrade Now**. To delay the maintenance, click **Delay to next available window**. To manage maintenance windows, select the cluster [Maintenance tab](../../yugabyte-cloud/cloud-clusters/cloud-maintenance/).
+Yugabyte only upgrades clusters during scheduled maintenance windows. Yugabyte notifies you in advance of any upcoming upgrade via email.
 
-The database is upgraded to the latest release in the [release track](#what-version-of-yugabytedb-does-my-cluster-run-on) that was selected when the cluster was created (Innovation or Production for dedicated clusters, or Preview for Sandbox clusters). Sandbox clusters are always in the preview track.
+Updates to fault-tolerant clusters are done on a rolling basis to avoid any downtime.
 
-Database upgrades of high-availability (multi-node) clusters are done on a rolling basis to avoid any downtime.
+For more information, refer to [Maintenance windows](../../yugabyte-cloud/cloud-clusters/cloud-maintenance/).
 
 ## YugabyteDB
 
@@ -263,7 +263,7 @@ For detailed steps for configuring other popular third party tools, see [Third p
 
 Applications connect to and interact with YugabyteDB using API client libraries (also known as client drivers). Before you can connect an application, you need to install the correct driver and configure it with the required connection parameters. You can also connect to YugabyteDB Managed clusters using smart drivers.
 
-For information on drivers supported by YugabyteDB, refer to [Drivers and ORMs](../../drivers-orms/). For sample applications using popular drivers, refer to [Build an application](../../develop/build-apps/).
+For information on drivers supported by YugabyteDB, refer to [Drivers and ORMs](../../drivers-orms/). For sample applications using popular drivers, refer to [Build an application](../../tutorials/build-apps/).
 
 For information on obtaining the connection parameters for your cluster, refer to [Connect applications](../../yugabyte-cloud/cloud-connect/connect-applications/).
 

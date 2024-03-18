@@ -66,6 +66,7 @@ public class TlsToggleTest extends UpgradeTaskTest {
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.CheckUnderReplicatedTablets,
+          TaskType.CheckNodesAreSafeToTakeDown,
           TaskType.AnsibleConfigureServers,
           TaskType.AnsibleClusterServerCtl,
           TaskType.AnsibleClusterServerCtl,
@@ -73,12 +74,14 @@ public class TlsToggleTest extends UpgradeTaskTest {
           TaskType.WaitForServerReady,
           TaskType.WaitForEncryptionKeyInMemory,
           TaskType.CheckFollowerLag,
-          TaskType.SetNodeState);
+          TaskType.SetNodeState,
+          TaskType.WaitStartingFromTime);
 
   private static final List<TaskType> ROLLING_UPGRADE_TASK_SEQUENCE_TSERVER =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.CheckUnderReplicatedTablets,
+          TaskType.CheckNodesAreSafeToTakeDown,
           TaskType.AnsibleConfigureServers,
           TaskType.ModifyBlackList,
           TaskType.WaitForLeaderBlacklistCompletion,
@@ -89,7 +92,8 @@ public class TlsToggleTest extends UpgradeTaskTest {
           TaskType.WaitForEncryptionKeyInMemory,
           TaskType.ModifyBlackList,
           TaskType.CheckFollowerLag,
-          TaskType.SetNodeState);
+          TaskType.SetNodeState,
+          TaskType.WaitStartingFromTime);
 
   private static final List<TaskType> NON_ROLLING_UPGRADE_TASK_SEQUENCE =
       ImmutableList.of(
@@ -117,12 +121,14 @@ public class TlsToggleTest extends UpgradeTaskTest {
     try {
       when(mockClient.setFlag(any(HostAndPort.class), anyString(), anyString(), anyBoolean()))
           .thenReturn(true);
+      setCheckNodesAreSafeToTakeDown(mockClient);
     } catch (Exception ignored) {
     }
     tlsToggle.setUserTaskUUID(UUID.randomUUID());
 
     setUnderReplicatedTabletsMock();
     setFollowerLagMock();
+    setLeaderlessTabletsMock();
   }
 
   private TaskInfo submitTask(TlsToggleParams requestParams) {
@@ -334,7 +340,7 @@ public class TlsToggleTest extends UpgradeTaskTest {
 
   private Pair<Integer, Integer> getExpectedValues(TlsToggleParams taskParams) {
     int nodeToNodeChange = getNodeToNodeChange(taskParams.enableNodeToNodeEncrypt);
-    int expectedPosition = 2;
+    int expectedPosition = 3;
     int expectedNumberOfInvocations = 0;
 
     if (taskParams.enableNodeToNodeEncrypt || taskParams.enableClientToNodeEncrypt) {
@@ -344,10 +350,10 @@ public class TlsToggleTest extends UpgradeTaskTest {
 
     if (taskParams.upgradeOption == UpgradeOption.ROLLING_UPGRADE) {
       if (nodeToNodeChange != 0) {
-        expectedPosition += 78;
+        expectedPosition += 84;
         expectedNumberOfInvocations += 24;
       } else {
-        expectedPosition += 70;
+        expectedPosition += 76;
         expectedNumberOfInvocations += 18;
       }
     } else {
@@ -494,6 +500,7 @@ public class TlsToggleTest extends UpgradeTaskTest {
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
 
     int position = 0;
+    assertTaskType(subTasksByPosition.get(position++), TaskType.CheckLeaderlessTablets);
     assertTaskType(subTasksByPosition.get(position++), TaskType.FreezeUniverse);
     if (taskParams.enableNodeToNodeEncrypt || taskParams.enableClientToNodeEncrypt) {
       // Cert update tasks will be non rolling

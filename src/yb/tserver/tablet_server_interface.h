@@ -15,6 +15,9 @@
 
 #include <future>
 
+#include "yb/ash/wait_state.h"
+
+#include "yb/cdc/cdc_fwd.h"
 #include "yb/client/client_fwd.h"
 #include "yb/common/common_types.pb.h"
 
@@ -30,6 +33,10 @@
 namespace yb {
 
 class MemTracker;
+
+namespace server {
+class RpcAndWebServerBase;
+}
 
 namespace tserver {
 
@@ -76,6 +83,14 @@ class TabletServerIf : public LocalTabletServer {
   client::YBClient* client() const {
     return client_future().get();
   }
+
+  virtual void SetCQLServer(yb::server::RpcAndWebServerBase* server) = 0;
+
+  virtual rpc::Messenger* GetMessenger(ash::Component component) const = 0;
+
+  virtual std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const = 0;
+
+  virtual void ClearAllMetaCachesOnServer() = 0;
 };
 
 } // namespace tserver

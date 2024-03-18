@@ -25,6 +25,7 @@ import type {
   ClusterNodesResponse,
   ClusterTableListResponse,
   ClusterTabletListResponse,
+  ConnectionsStats,
   GflagsInfo,
   HealthCheckResponse,
   IsLoadBalancerIdle,
@@ -40,6 +41,9 @@ export interface GetClusterActivitiesForQuery {
   status: string;
   database?: string;
 }
+export interface GetClusterAlertsForQuery {
+  node_address: string;
+}
 export interface GetClusterMetricForQuery {
   metrics: string;
   node_name?: string;
@@ -48,6 +52,9 @@ export interface GetClusterMetricForQuery {
   start_time?: number;
   end_time?: number;
   cluster_type?: string;
+}
+export interface GetClusterNodesForQuery {
+  get_all_masters?: boolean;
 }
 export interface GetClusterTablesForQuery {
   api?: GetClusterTablesApiEnum;
@@ -152,6 +159,7 @@ export const useGetClusterActivitiesQuery = <T = ActivitiesResponse, Error = Api
  */
 
 export const getClusterAlertsAxiosRequest = (
+  requestParameters: GetClusterAlertsForQuery,
   customAxiosInstance?: AxiosInstance
 ) => {
   return Axios<AlertsResponse>(
@@ -159,6 +167,7 @@ export const getClusterAlertsAxiosRequest = (
       url: '/alerts',
       method: 'GET',
       params: {
+        node_address: requestParameters['node_address'],
       }
     },
     customAxiosInstance
@@ -166,15 +175,18 @@ export const getClusterAlertsAxiosRequest = (
 };
 
 export const getClusterAlertsQueryKey = (
+  requestParametersQuery: GetClusterAlertsForQuery,
   pageParam = -1,
   version = 1,
 ) => [
   `/v${version}/alerts`,
   pageParam,
+  ...(requestParametersQuery ? [requestParametersQuery] : [])
 ];
 
 
 export const useGetClusterAlertsInfiniteQuery = <T = AlertsResponse, Error = ApiError>(
+  params: GetClusterAlertsForQuery,
   options?: {
     query?: UseInfiniteQueryOptions<AlertsResponse, Error, T>;
     customAxiosInstance?: AxiosInstance;
@@ -182,12 +194,12 @@ export const useGetClusterAlertsInfiniteQuery = <T = AlertsResponse, Error = Api
   pageParam = -1,
   version = 1,
 ) => {
-  const queryKey = getClusterAlertsQueryKey(pageParam, version);
+  const queryKey = getClusterAlertsQueryKey(params, pageParam, version);
   const { query: queryOptions, customAxiosInstance } = options ?? {};
 
   const query = useInfiniteQuery<AlertsResponse, Error, T>(
     queryKey,
-    () => getClusterAlertsAxiosRequest(customAxiosInstance),
+    () => getClusterAlertsAxiosRequest(params, customAxiosInstance),
     queryOptions
   );
 
@@ -198,18 +210,94 @@ export const useGetClusterAlertsInfiniteQuery = <T = AlertsResponse, Error = Api
 };
 
 export const useGetClusterAlertsQuery = <T = AlertsResponse, Error = ApiError>(
+  params: GetClusterAlertsForQuery,
   options?: {
     query?: UseQueryOptions<AlertsResponse, Error, T>;
     customAxiosInstance?: AxiosInstance;
   },
   version = 1,
 ) => {
-  const queryKey = getClusterAlertsQueryKey(version);
+  const queryKey = getClusterAlertsQueryKey(params,  version);
   const { query: queryOptions, customAxiosInstance } = options ?? {};
 
   const query = useQuery<AlertsResponse, Error, T>(
     queryKey,
-    () => getClusterAlertsAxiosRequest(customAxiosInstance),
+    () => getClusterAlertsAxiosRequest(params, customAxiosInstance),
+    queryOptions
+  );
+
+  return {
+    queryKey,
+    ...query
+  };
+};
+
+
+
+/**
+ * Get YSQL connection manager stats for every node of the cluster
+ * Get YSQL connection manager stats for every node of the cluster
+ */
+
+export const getClusterConnectionsAxiosRequest = (
+  customAxiosInstance?: AxiosInstance
+) => {
+  return Axios<ConnectionsStats>(
+    {
+      url: '/connections',
+      method: 'GET',
+      params: {
+      }
+    },
+    customAxiosInstance
+  );
+};
+
+export const getClusterConnectionsQueryKey = (
+  pageParam = -1,
+  version = 1,
+) => [
+  `/v${version}/connections`,
+  pageParam,
+];
+
+
+export const useGetClusterConnectionsInfiniteQuery = <T = ConnectionsStats, Error = ApiError>(
+  options?: {
+    query?: UseInfiniteQueryOptions<ConnectionsStats, Error, T>;
+    customAxiosInstance?: AxiosInstance;
+  },
+  pageParam = -1,
+  version = 1,
+) => {
+  const queryKey = getClusterConnectionsQueryKey(pageParam, version);
+  const { query: queryOptions, customAxiosInstance } = options ?? {};
+
+  const query = useInfiniteQuery<ConnectionsStats, Error, T>(
+    queryKey,
+    () => getClusterConnectionsAxiosRequest(customAxiosInstance),
+    queryOptions
+  );
+
+  return {
+    queryKey,
+    ...query
+  };
+};
+
+export const useGetClusterConnectionsQuery = <T = ConnectionsStats, Error = ApiError>(
+  options?: {
+    query?: UseQueryOptions<ConnectionsStats, Error, T>;
+    customAxiosInstance?: AxiosInstance;
+  },
+  version = 1,
+) => {
+  const queryKey = getClusterConnectionsQueryKey(version);
+  const { query: queryOptions, customAxiosInstance } = options ?? {};
+
+  const query = useQuery<ConnectionsStats, Error, T>(
+    queryKey,
+    () => getClusterConnectionsAxiosRequest(customAxiosInstance),
     queryOptions
   );
 
@@ -389,6 +477,7 @@ export const useGetClusterMetricQuery = <T = MetricResponse, Error = ApiError>(
  */
 
 export const getClusterNodesAxiosRequest = (
+  requestParameters: GetClusterNodesForQuery,
   customAxiosInstance?: AxiosInstance
 ) => {
   return Axios<ClusterNodesResponse>(
@@ -396,6 +485,7 @@ export const getClusterNodesAxiosRequest = (
       url: '/nodes',
       method: 'GET',
       params: {
+        get_all_masters: requestParameters['get_all_masters'],
       }
     },
     customAxiosInstance
@@ -403,15 +493,18 @@ export const getClusterNodesAxiosRequest = (
 };
 
 export const getClusterNodesQueryKey = (
+  requestParametersQuery: GetClusterNodesForQuery,
   pageParam = -1,
   version = 1,
 ) => [
   `/v${version}/nodes`,
   pageParam,
+  ...(requestParametersQuery ? [requestParametersQuery] : [])
 ];
 
 
 export const useGetClusterNodesInfiniteQuery = <T = ClusterNodesResponse, Error = ApiError>(
+  params: GetClusterNodesForQuery,
   options?: {
     query?: UseInfiniteQueryOptions<ClusterNodesResponse, Error, T>;
     customAxiosInstance?: AxiosInstance;
@@ -419,12 +512,12 @@ export const useGetClusterNodesInfiniteQuery = <T = ClusterNodesResponse, Error 
   pageParam = -1,
   version = 1,
 ) => {
-  const queryKey = getClusterNodesQueryKey(pageParam, version);
+  const queryKey = getClusterNodesQueryKey(params, pageParam, version);
   const { query: queryOptions, customAxiosInstance } = options ?? {};
 
   const query = useInfiniteQuery<ClusterNodesResponse, Error, T>(
     queryKey,
-    () => getClusterNodesAxiosRequest(customAxiosInstance),
+    () => getClusterNodesAxiosRequest(params, customAxiosInstance),
     queryOptions
   );
 
@@ -435,18 +528,19 @@ export const useGetClusterNodesInfiniteQuery = <T = ClusterNodesResponse, Error 
 };
 
 export const useGetClusterNodesQuery = <T = ClusterNodesResponse, Error = ApiError>(
+  params: GetClusterNodesForQuery,
   options?: {
     query?: UseQueryOptions<ClusterNodesResponse, Error, T>;
     customAxiosInstance?: AxiosInstance;
   },
   version = 1,
 ) => {
-  const queryKey = getClusterNodesQueryKey(version);
+  const queryKey = getClusterNodesQueryKey(params,  version);
   const { query: queryOptions, customAxiosInstance } = options ?? {};
 
   const query = useQuery<ClusterNodesResponse, Error, T>(
     queryKey,
-    () => getClusterNodesAxiosRequest(customAxiosInstance),
+    () => getClusterNodesAxiosRequest(params, customAxiosInstance),
     queryOptions
   );
 
@@ -840,6 +934,81 @@ export const useGetLiveQueriesQuery = <T = LiveQueryResponseSchema, Error = ApiE
   const query = useQuery<LiveQueryResponseSchema, Error, T>(
     queryKey,
     () => getLiveQueriesAxiosRequest(params, customAxiosInstance),
+    queryOptions
+  );
+
+  return {
+    queryKey,
+    ...query
+  };
+};
+
+
+
+/**
+ * Get the node address for the current node
+ * Get the node address for the current node
+ */
+
+export const getNodeAddressAxiosRequest = (
+  customAxiosInstance?: AxiosInstance
+) => {
+  return Axios<string>(
+    {
+      url: '/node_address',
+      method: 'GET',
+      params: {
+      }
+    },
+    customAxiosInstance
+  );
+};
+
+export const getNodeAddressQueryKey = (
+  pageParam = -1,
+  version = 1,
+) => [
+  `/v${version}/node_address`,
+  pageParam,
+];
+
+
+export const useGetNodeAddressInfiniteQuery = <T = string, Error = ApiError>(
+  options?: {
+    query?: UseInfiniteQueryOptions<string, Error, T>;
+    customAxiosInstance?: AxiosInstance;
+  },
+  pageParam = -1,
+  version = 1,
+) => {
+  const queryKey = getNodeAddressQueryKey(pageParam, version);
+  const { query: queryOptions, customAxiosInstance } = options ?? {};
+
+  const query = useInfiniteQuery<string, Error, T>(
+    queryKey,
+    () => getNodeAddressAxiosRequest(customAxiosInstance),
+    queryOptions
+  );
+
+  return {
+    queryKey,
+    ...query
+  };
+};
+
+export const useGetNodeAddressQuery = <T = string, Error = ApiError>(
+  options?: {
+    query?: UseQueryOptions<string, Error, T>;
+    customAxiosInstance?: AxiosInstance;
+  },
+  version = 1,
+) => {
+  const queryKey = getNodeAddressQueryKey(version);
+  const { query: queryOptions, customAxiosInstance } = options ?? {};
+
+  const query = useQuery<string, Error, T>(
+    queryKey,
+    () => getNodeAddressAxiosRequest(customAxiosInstance),
     queryOptions
   );
 

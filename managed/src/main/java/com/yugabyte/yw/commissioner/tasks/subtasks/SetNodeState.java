@@ -12,7 +12,6 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -21,8 +20,8 @@ import lombok.extern.slf4j.Slf4j;
 public class SetNodeState extends NodeTaskBase {
 
   @Inject
-  protected SetNodeState(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected SetNodeState(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -43,6 +42,10 @@ public class SetNodeState extends NodeTaskBase {
         + ")";
   }
 
+  public static String getStartKey(String nodeName, NodeDetails.NodeState state) {
+    return nodeName + "_" + state + "_started";
+  }
+
   @Override
   public void run() {
     try {
@@ -51,6 +54,7 @@ public class SetNodeState extends NodeTaskBase {
           taskParams().nodeName,
           taskParams().state,
           taskParams().getUniverseUUID());
+      putDateIntoCache(getStartKey(taskParams().nodeName, taskParams().state));
       setNodeState(taskParams().state);
     } catch (Exception e) {
       throw new RuntimeException(e);

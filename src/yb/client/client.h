@@ -46,11 +46,10 @@
 
 #include <gtest/gtest_prod.h>
 
-#include "yb/cdc/cdc_producer.h"
 #include "yb/client/client_fwd.h"
-#include "yb/common/common_fwd.h"
 
 #include "yb/common/clock.h"
+#include "yb/common/common_fwd.h"
 #include "yb/common/common_types.pb.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/pg_types.h"
@@ -66,9 +65,9 @@
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
 
-#include "yb/master/master_fwd.h"
 #include "yb/master/master_client.fwd.h"
 #include "yb/master/master_ddl.fwd.h"
+#include "yb/master/master_fwd.h"
 #include "yb/master/master_replication.fwd.h"
 
 #include "yb/rpc/rpc_fwd.h"
@@ -103,7 +102,13 @@ class LocalTabletServer;
 class TabletServerServiceProxy;
 }
 
+namespace xcluster {
+YB_STRONGLY_TYPED_STRING(ReplicationGroupId);
+}
+
 namespace client {
+
+YB_STRONGLY_TYPED_BOOL(IncludeNonrunningNamespaces);
 
 struct NamespaceInfo {
     master::NamespaceIdentifierPB id;
@@ -335,6 +340,9 @@ class YBClient {
       const std::vector<TableId>& index_ids,
       google::protobuf::RepeatedField<google::protobuf::uint64>* rows_processed_entries);
 
+  Result<master::GetBackfillStatusResponsePB> GetBackfillStatus(
+      const std::vector<std::string_view>& table_ids);
+
   // Delete the specified table.
   // Set 'wait' to true if the call must wait for the table to be fully deleted before returning.
   Status DeleteTable(const YBTableName& table_name, bool wait = true);
@@ -495,9 +503,9 @@ class YBClient {
                                const std::string& role_name);
 
   // List all namespace identifiers.
-  Result<std::vector<NamespaceInfo>> ListNamespaces();
   Result<std::vector<NamespaceInfo>> ListNamespaces(
-      const boost::optional<YQLDatabase>& database_type);
+      IncludeNonrunningNamespaces include_nonrunning = IncludeNonrunningNamespaces::kFalse,
+      std::optional<YQLDatabase> database_type = std::nullopt);
 
   // Get namespace information.
   Status GetNamespaceInfo(const std::string& namespace_id,
@@ -508,9 +516,9 @@ class YBClient {
   // Check if the namespace given by 'namespace_name' or 'namespace_id' exists.
   // Result value is set only on success.
   Result<bool> NamespaceExists(const std::string& namespace_name,
-                               const boost::optional<YQLDatabase>& database_type = boost::none);
+                               const std::optional<YQLDatabase>& database_type = std::nullopt);
   Result<bool> NamespaceIdExists(const std::string& namespace_id,
-                                 const boost::optional<YQLDatabase>& database_type = boost::none);
+                                 const std::optional<YQLDatabase>& database_type = std::nullopt);
 
   Status CreateTablegroup(const std::string& namespace_name,
                           const std::string& namespace_id,
@@ -593,7 +601,11 @@ class YBClient {
 
   Result<xrepl::StreamId> CreateCDCSDKStreamForNamespace(
       const NamespaceId& namespace_id, const std::unordered_map<std::string, std::string>& options,
-      const ReplicationSlotName& replication_slot_name = ReplicationSlotName(""));
+      bool populate_namespace_id_as_table_id = false,
+      const ReplicationSlotName& replication_slot_name = ReplicationSlotName(""),
+      const std::optional<CDCSDKSnapshotOption>& consistent_snapshot_option = std::nullopt,
+      CoarseTimePoint deadline = CoarseTimePoint(),
+      uint64_t *consistent_snapshot_time = nullptr);
 
   // Delete multiple CDC streams.
   Status DeleteCDCStream(
@@ -628,7 +640,12 @@ class YBClient {
       NamespaceId* ns_id,
       std::vector<TableId>* table_ids,
       std::unordered_map<std::string, std::string>* options,
-      cdc::StreamModeTransactional* transactional);
+      cdc::StreamModeTransactional* transactional,
+      std::optional<uint64_t>* consistent_snapshot_time = nullptr,
+      std::optional<CDCSDKSnapshotOption>* consistent_snapshot_option = nullptr,
+      std::optional<uint64_t>* stream_creation_time = nullptr);
+
+  Result<CDCSDKStreamInfo> GetCDCStream(const ReplicationSlotName& replication_slot_name);
 
   void GetCDCStream(
       const xrepl::StreamId& stream_id,
@@ -659,21 +676,35 @@ class YBClient {
       const std::vector<TableName>& table_names,
       BootstrapProducerCallback callback);
 
+  Result<NamespaceId> XClusterAddNamespaceToOutboundReplicationGroup(
+      const xcluster::ReplicationGroupId& replication_group_id,
+      const NamespaceName& namespace_name);
+
+  Status XClusterRemoveNamespaceFromOutboundReplicationGroup(
+      const xcluster::ReplicationGroupId& replication_group_id, const NamespaceId& namespace_id);
+
   // Update consumer pollers after a producer side tablet split.
   Status UpdateConsumerOnProducerSplit(
-      const cdc::ReplicationGroupId& replication_group_id,
-      const xrepl::StreamId& stream_id,
+      const xcluster::ReplicationGroupId& replication_group_id, const xrepl::StreamId& stream_id,
       const master::ProducerSplitTabletInfoPB& split_info);
 
   // Update after a producer DDL change. Returns if caller should wait for a similar Consumer DDL.
   Status UpdateConsumerOnProducerMetadata(
-      const cdc::ReplicationGroupId& replication_group_id,
-      const xrepl::StreamId& stream_id,
-      const tablet::ChangeMetadataRequestPB& meta_info,
-      uint32_t colocation_id,
-      uint32_t producer_schema_version,
-      uint32_t consumer_schema_version,
+      const xcluster::ReplicationGroupId& replication_group_id, const xrepl::StreamId& stream_id,
+      const tablet::ChangeMetadataRequestPB& meta_info, uint32_t colocation_id,
+      uint32_t producer_schema_version, uint32_t consumer_schema_version,
       master::UpdateConsumerOnProducerMetadataResponsePB* resp);
+
+  Status XClusterReportNewAutoFlagConfigVersion(
+      const xcluster::ReplicationGroupId& replication_group_id, uint32 auto_flag_config_version);
+
+  Status AddTablesToUniverseReplication(
+      const xcluster::ReplicationGroupId& replication_group_id, const std::vector<TableId>& tables);
+  Status RemoveTablesFromUniverseReplication(
+      const xcluster::ReplicationGroupId& replication_group_id, const std::vector<TableId>& tables);
+
+  Result<HybridTime> GetXClusterSafeTimeForNamespace(
+      const NamespaceId& namespace_id, const master::XClusterSafeTimeFilter& filter);
 
   void GetTableLocations(
       const TableId& table_id, int32_t max_tablets, RequireTabletsRunning require_tablets_running,
@@ -699,11 +730,15 @@ class YBClient {
   const internal::RemoteTabletServer* GetLocalTabletServer() const;
 
   // List only those tables whose names pass a substring match on 'filter'.
+  // For YSQL tables, ysql_db_filter can be used to filter by the db they
+  // belong to.
   //
   // 'tables' is appended to only on success.
   Result<std::vector<YBTableName>> ListTables(
       const std::string& filter = "",
-      bool exclude_ysql = false);
+      bool exclude_ysql = false,
+      const std::string& ysql_db_filter = "",
+      bool skip_hidden = false);
 
   // List tables in a namespace.
   //
@@ -783,9 +818,9 @@ class YBClient {
     CoarseTimePoint deadline,
     std::vector<std::string>* master_uuids);
 
-  // Check if the table given by 'table_name' exists.
-  // Result value is set only on success.
-  Result<bool> TableExists(const YBTableName& table_name);
+  // Check if the table given by 'table_name' exists. 'skip_hidden' indicates whether to consider
+  // hidden tables. Result value is set only on success.
+  Result<bool> TableExists(const YBTableName& table_name, bool skip_hidden = false);
 
   Result<bool> IsLoadBalanced(uint32_t num_servers);
   Result<bool> IsLoadBalancerIdle();
@@ -821,6 +856,10 @@ class YBClient {
   // This is a fully local operation (no RPCs or blocking).
   std::shared_ptr<YBSession> NewSession(MonoDelta delta);
   std::shared_ptr<YBSession> NewSession(CoarseTimePoint deadline);
+
+  Status AreNodesSafeToTakeDown(
+      std::vector<std::string> tserver_uuids, std::vector<std::string> master_uuids,
+      int follower_lag_bound_ms);
 
   // Return the socket address of the master leader for this client.
   HostPort GetMasterLeaderAddress();
@@ -897,6 +936,8 @@ class YBClient {
   // Provide the completion status of 'txn' to the YB-Master.
   Status ReportYsqlDdlTxnStatus(const TransactionMetadata& txn, bool is_committed);
 
+  Status WaitForDdlVerificationToFinish(const TransactionMetadata& txn);
+
   Result<bool> CheckIfPitrActive();
 
   void LookupTabletByKey(const std::shared_ptr<YBTable>& table,
@@ -921,6 +962,15 @@ class YBClient {
   // Get the AutoFlagConfig from master. Returns std::nullopt if master is runnning on an older
   // version that does not support AutoFlags.
   Result<std::optional<AutoFlagsConfigPB>> GetAutoFlagConfig();
+
+  // Check if the given AutoFlagsConfigPB is compatible with the AutoFlags config of the universe.
+  // Check the description of AutoFlagsUtil::AreAutoFlagsCompatible for more information about what
+  // compatible means.
+  // Returns the result in the bool and the current AutoFlags config version that it was validated
+  // with. Returns nullopt if the master is running on an older version that does not support this
+  // API.
+  Result<std::optional<std::pair<bool, uint32>>> ValidateAutoFlagsConfig(
+      const AutoFlagsConfigPB& config, std::optional<AutoFlagClass> min_flag_class = std::nullopt);
 
   Result<master::StatefulServiceInfoPB> GetStatefulServiceLocation(
       StatefulServiceKind service_kind);
@@ -962,6 +1012,8 @@ class YBClient {
   Result<std::shared_ptr<internal::RemoteTabletServer>> GetRemoteTabletServer(
       const std::string& permanent_uuid);
 
+  void AddMetaCacheInfo(JsonWriter* writer);
+
   void RequestsFinished(const RetryableRequestIdRange& request_id_range);
 
   void Shutdown();
@@ -969,6 +1021,10 @@ class YBClient {
   const std::string& LogPrefix() const;
 
   server::Clock* Clock() const;
+
+  const std::string& client_name() const;
+
+  void ClearAllMetaCachesOnServer();
 
  private:
   class Data;
@@ -991,6 +1047,8 @@ class YBClient {
   friend class internal::TabletInvoker;
   friend class internal::ClientMasterRpcBase;
   friend class PlacementInfoTest;
+  friend class XClusterClient;
+  friend class XClusterRemoteClient;
 
   FRIEND_TEST(ClientTest, TestGetTabletServerBlacklist);
   FRIEND_TEST(ClientTest, TestMasterDown);
@@ -1032,3 +1090,7 @@ Result<TableId> GetTableId(YBClient* client, const YBTableName& table_name);
 
 }  // namespace client
 }  // namespace yb
+
+#undef DECLARE_SYNC_LEADER_MASTER_RPC_IMP
+#undef DECLARE_SYNC_LEADER_MASTER_RPC
+#undef DECLARE_SYNC_LEADER_MASTER_RPCS

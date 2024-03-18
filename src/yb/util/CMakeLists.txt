@@ -82,22 +82,6 @@ ADD_YB_LIBRARY(version_info_proto
   DEPS protobuf
   NONLINK_DEPS ${VERSION_INFO_PROTO_TGTS})
 
-#######################################
-# op_id_proto
-#######################################
-
-YRPC_GENERATE(
-  OP_ID_PROTO_SRCS OP_ID_PROTO_HDRS OP_ID_PROTO_TGTS
-  MESSAGES TRUE
-  SERVICE FALSE
-  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
-  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
-  PROTO_FILES opid.proto)
-ADD_YB_LIBRARY(opid_proto
-  SRCS ${OP_ID_PROTO_SRCS}
-  DEPS protobuf yb_util yrpc
-  NONLINK_DEPS ${OP_ID_PROTO_TGTS})
-
 ############################################################
 # Version stamp
 ############################################################
@@ -213,7 +197,6 @@ set(UTIL_SRCS
   oid_generator.cc
   once.cc
   operation_counter.cc
-  opid.cc
   os-util.cc
   path_util.cc
   pb_util-internal.cc
@@ -222,6 +205,7 @@ set(UTIL_SRCS
   physical_time.cc
   port_picker.cc
   priority_thread_pool.cc
+  prometheus_metric_filter.cc
   pstack_watcher.cc
   random_util.cc
   redis_util.cc
@@ -268,7 +252,9 @@ set(UTIL_SRCS
   version_info.cc
   write_buffer.cc
   yb_partition.cc
+  ysql_binary_runner.cc
   zlib.cc
+  callsite_profiling.cc
   )
 
 set(UTIL_LIBS
@@ -393,6 +379,7 @@ ADD_YB_TEST(os-util-test)
 ADD_YB_TEST(path_util-test)
 ADD_YB_TEST(priority_queue-test)
 ADD_YB_TEST(priority_thread_pool-test)
+ADD_YB_TEST(prometheus_metric_filter-test)
 ADD_YB_TEST(pstack_watcher-test)
 ADD_YB_TEST(random-test)
 ADD_YB_TEST(random_util-test)
@@ -437,6 +424,7 @@ ADD_YB_TEST(fast_varint-test)
 ADD_YB_TEST(shared_mem-test)
 ADD_YB_TEST(operation_counter-test)
 ADD_YB_TEST(write_buffer-test)
+ADD_YB_TEST(scope_exit-test)
 
 #######################################
 # jsonwriter_test_proto

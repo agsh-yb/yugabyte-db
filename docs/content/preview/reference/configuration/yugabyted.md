@@ -2,7 +2,7 @@
 title: yugabyted reference
 headerTitle: yugabyted
 linkTitle: yugabyted
-description: Use yugabyted to run single-node YugabyteDB clusters.
+description: Use yugabyted to deploy YugabyteDB clusters.
 menu:
   preview:
     identifier: yugabyted
@@ -13,7 +13,7 @@ rightNav:
   hideH4: true
 ---
 
-YugabyteDB uses a two-server architecture, with [YB-TServers](../yb-tserver/) managing the data and [YB-Masters](../yb-master/) managing the metadata. However, this can introduce a burden on new users who want to get started right away. To manage YugabyteDB for testing and learning purposes, you can use yugabyted. yugabyted acts as a parent server across the YB-TServer and YB-Masters servers. yugabyted also provides a UI similar to the YugabyteDB Anywhere UI, with a data placement map and metrics dashboard.
+YugabyteDB uses a two-server architecture, with [YB-TServers](../yb-tserver/) managing the data and [YB-Masters](../yb-master/) managing the metadata. However, this can introduce a burden on new users who want to get started right away. To manage YugabyteDB, you can use yugabyted. yugabyted acts as a parent server across the YB-TServer and YB-Masters servers. yugabyted also provides a UI similar to the YugabyteDB Anywhere UI, with a data placement map and metrics dashboard.
 
 {{< youtube id="ah_fPDpZjnc" title="How to Start YugabyteDB on Your Laptop" >}}
 
@@ -21,8 +21,8 @@ The `yugabyted` executable file is located in the YugabyteDB home's `bin` direct
 
 For examples of using yugabyted to deploy single- and multi-node clusters, see [Examples](#examples).
 
-{{<note title="Not recommended for production">}}
-Note that yugabyted is not recommended for production deployments. For production deployments with fully-distributed multi-node clusters, use [`yb-tserver`](../yb-tserver/) and [`yb-master`](../yb-master/) directly. Refer to [Deploy YugabyteDB](../../../deploy).
+{{<note title="Production deployments">}}
+You can use yugabyted for production deployments (v2.18.4 and later). You can also administer [`yb-tserver`](../yb-tserver/) and [`yb-master`](../yb-master/) directly (refer to [Deploy YugabyteDB](../../../deploy/)).
 {{</note>}}
 
 {{% note title="Running on macOS" %}}
@@ -134,13 +134,17 @@ Examples:
 : The directory where yugabyted stores data. Must be an absolute path. Can be configured to a directory different from the one where configurations and logs are stored.
 
 --log_dir *log-directory*
-: The directory to store yugabyted logs. Must be an absolute path. This flag controls where the logs of the YugabyteDB nodes are stored.
+: The directory to store yugabyted logs. Must be an absolute path. This flag controls where the logs of the YugabyteDB nodes are stored. By default, logs are written to `~/var/logs`.
 
 --background *bool*
 : Enable or disable running yugabyted in the background as a daemon. Does not persist on restart. Default: `true`
 
 --cloud_location *cloud-location*
 : Cloud location of the yugabyted node in the format `cloudprovider.region.zone`. This information is used for multi-zone, multi-region, and multi-cloud deployments of YugabyteDB clusters.
+
+{{<tip title="Rack awareness">}}
+For on-premises deployments, consider racks as zones to treat them as fault domains.
+{{</tip>}}
 
 --fault_tolerance *fault_tolerance*
 : Determines the fault tolerance constraint to be applied on the data placement policy of the YugabyteDB cluster. This flag can accept the following values: none, zone, region, cloud.
@@ -207,7 +211,7 @@ Advanced flags can be set by using the configuration file in the `--config` flag
 #### Deprecated flags
 
 --daemon *bool*
-: Enable or disable running yugabyted in the background as a daemon. Does not persist on restart. Default: `true`.
+: Enable or disable running yugabyted in the background as a daemon. Does not persist on restart. Use [--background](#flags) instead. Default: `true`.
 
 --listen *bind-ip*
 : The IP address or localhost name to which yugabyted will listen.
@@ -1007,6 +1011,41 @@ You can set the replication factor of the cluster manually using the `--rf` flag
     --fault_tolerance=region \
     --constraint_value=aws.us-east-1.us-east-1a,aws.us-west-1.us-west-1a,aws.us-central-1.us-central-1a \
     --rf=3
+```
+
+### Create a multi-region cluster in Docker
+
+You can run yugabyted in a Docker container. For more information, see the [Quick Start](/preview/quick-start/docker/).
+
+The following example shows how to create a multi-region cluster. If the `~/yb_docker_data` directory already exists, delete and re-create it.
+
+
+```sh
+rm -rf ~/yb_docker_data
+mkdir ~/yb_docker_data
+
+docker network create yb-network
+
+docker run -d --name yugabytedb-node1 --net yb-network \
+    -p 15433:15433 -p 7001:7000 -p 9001:9000 -p 5433:5433 \
+    -v ~/yb_docker_data/node1:/home/yugabyte/yb_data --restart unless-stopped \
+    yugabytedb/yugabyte:{{< yb-version version="preview" format="build">}} \
+    bin/yugabyted start \
+    --base_dir=/home/yugabyte/yb_data --background=false
+
+docker run -d --name yugabytedb-node2 --net yb-network \
+    -p 15434:15433 -p 7002:7000 -p 9002:9000 -p 5434:5433 \
+    -v ~/yb_docker_data/node2:/home/yugabyte/yb_data --restart unless-stopped \
+    yugabytedb/yugabyte:{{< yb-version version="preview" format="build">}} \
+    bin/yugabyted start --join=yugabytedb-node1 \
+    --base_dir=/home/yugabyte/yb_data --background=false
+
+docker run -d --name yugabytedb-node3 --net yb-network \
+    -p 15435:15433 -p 7003:7000 -p 9003:9000 -p 5435:5433 \
+    -v ~/yb_docker_data/node3:/home/yugabyte/yb_data --restart unless-stopped \
+    yugabytedb/yugabyte:{{< yb-version version="preview" format="build">}} \
+    bin/yugabyted start --join=yugabytedb-node1 \
+    --base_dir=/home/yugabyte/yb_data --background=false
 ```
 
 ### Enable and disable encryption at rest

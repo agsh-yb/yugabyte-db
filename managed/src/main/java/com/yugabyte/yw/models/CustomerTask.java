@@ -6,6 +6,7 @@ import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.google.api.client.util.Strings;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -20,6 +21,11 @@ import io.ebean.annotation.EnumValue;
 import io.ebean.annotation.Transactional;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
 import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.Instant;
@@ -31,13 +37,9 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.GeneratedValue;
-import javax.persistence.GenerationType;
-import javax.persistence.Id;
 import lombok.Getter;
 import lombok.Setter;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -146,6 +148,9 @@ public class CustomerTask extends Model {
     @EnumValue("Hard Reboot")
     HardReboot,
 
+    @EnumValue("Replace")
+    Replace,
+
     @EnumValue("Edit")
     Edit,
 
@@ -175,6 +180,9 @@ public class CustomerTask extends Model {
 
     @EnumValue("KubernetesOverridesUpgrade")
     KubernetesOverridesUpgrade,
+
+    @EnumValue("EditKubernetesUniverse")
+    EditKubernetesUniverse,
 
     @EnumValue("CertsRotate")
     CertsRotate,
@@ -294,6 +302,9 @@ public class CustomerTask extends Model {
     @EnumValue("Failover")
     Failover,
 
+    @EnumValue("Switchover")
+    Switchover,
+
     @EnumValue("PrecheckNode")
     PrecheckNode,
 
@@ -333,6 +344,9 @@ public class CustomerTask extends Model {
     @EnumValue("DisableYbc")
     DisableYbc,
 
+    @EnumValue("UpgradeYbcGFlags")
+    UpgradeYbcGFlags,
+
     @EnumValue("ConfigureDBApis")
     ConfigureDBApis,
 
@@ -346,7 +360,10 @@ public class CustomerTask extends Model {
     ReprovisionNode,
 
     @EnumValue("Install")
-    Install;
+    Install,
+
+    @EnumValue("UpdateProxyConfig")
+    UpdateProxyConfig;
 
     public String toString(boolean completed) {
       switch (this) {
@@ -365,6 +382,8 @@ public class CustomerTask extends Model {
           return completed ? "Removed " : "Removing ";
         case ResizeNode:
           return completed ? "Resized Node " : "Resizing Node ";
+        case Replace:
+          return completed ? "Replaced Node" : "Replacing Node";
         case Resume:
           return completed ? "Resumed " : "Resuming ";
         case Start:
@@ -388,15 +407,17 @@ public class CustomerTask extends Model {
         case SoftwareUpgradeYB:
           return completed ? "Upgraded Software " : "Upgrading Software ";
         case FinalizeUpgrade:
-          return completed ? "Finalized Upgrade" : "Finalizing Upgrade";
+          return completed ? "Finalized Upgrade " : "Finalizing Upgrade ";
         case RollbackUpgrade:
-          return completed ? "Rolled back upgrade" : "Rolling backup upgrade";
+          return completed ? "Rolled back upgrade " : "Rolling back upgrade ";
         case SystemdUpgrade:
           return completed ? "Upgraded to Systemd " : "Upgrading to Systemd ";
         case GFlagsUpgrade:
           return completed ? "Upgraded GFlags " : "Upgrading GFlags ";
         case KubernetesOverridesUpgrade:
           return completed ? "Upgraded Kubernetes Overrides " : "Upgrading Kubernetes Overrides ";
+        case EditKubernetesUniverse:
+          return completed ? "Edited Kubernetes Universe  " : "Editing Kubernetes Universe";
         case CertsRotate:
           return completed ? "Updated Certificates " : "Updating Certificates ";
         case TlsToggle:
@@ -455,7 +476,9 @@ public class CustomerTask extends Model {
         case SyncXClusterConfig:
           return completed ? "Synchronized xcluster config " : "Synchronizing xcluster config ";
         case Failover:
-          return completed ? "Failed over dr confing " : "Failing over dr confing ";
+          return completed ? "Failed over dr config " : "Failing over dr config ";
+        case Switchover:
+          return completed ? "Switched over dr config " : "Switching over dr config ";
         case PrecheckNode:
           return completed ? "Performed preflight check on " : "Performing preflight check on ";
         case Abort:
@@ -490,6 +513,8 @@ public class CustomerTask extends Model {
           return completed ? "Upgraded Ybc" : "Upgrading Ybc";
         case DisableYbc:
           return completed ? "Disabled Ybc" : "Disabling Ybc";
+        case UpgradeYbcGFlags:
+          return completed ? "Upgraded Ybc GFlags" : "Upgrading Ybc GFlags";
         case ConfigureDBApisKubernetes:
         case ConfigureDBApis:
           return completed ? "Configured DB APIs" : "Configuring DB APIs";
@@ -499,6 +524,8 @@ public class CustomerTask extends Model {
           return completed ? "Reprovisioned" : "Reprovisioning";
         case Install:
           return completed ? "Installed" : "Installing";
+        case UpdateProxyConfig:
+          return completed ? "Updated Proxy Config" : "Updating Proxy Config";
         default:
           return null;
       }
@@ -768,10 +795,17 @@ public class CustomerTask extends Model {
       return 0;
     }
     int subTaskSize = rootTaskInfo.getSubTasks().size();
-    // This performs cascade delete.
-    rootTaskInfo.delete();
+    deleteTasks(rootTaskInfo);
     delete();
     return 2 + subTaskSize;
+  }
+
+  @Transactional
+  // This is in a transaction block to not lose the parent task UUID.
+  private void deleteTasks(TaskInfo rootTaskInfo) {
+    rootTaskInfo.delete();
+    // TODO This is needed temporarily if the migration to add the FK constraint is skipped.
+    rootTaskInfo.getSubTasks().stream().forEach(TaskInfo::delete);
   }
 
   public static CustomerTask findByTaskUUID(UUID taskUUID) {
@@ -785,6 +819,31 @@ public class CustomerTask extends Model {
         .eq("customerUUID", customer.getUuid())
         .le("completion_time", cutoffDate)
         .findList();
+  }
+
+  public static Optional<CustomerTask> maybeGetByTargetUUIDTaskTypeTargetType(
+      UUID customerUUID, UUID targetUUID, TaskType taskType, TargetType targetType) {
+    List<CustomerTask> cTaskList =
+        CustomerTask.find
+            .query()
+            .where()
+            .eq("customer_uuid", customerUUID)
+            .eq("type", taskType)
+            .eq("target_type", targetType)
+            .eq("target_uuid", targetUUID)
+            .orderBy("create_time desc")
+            .findList();
+    return CollectionUtils.isEmpty(cTaskList) ? Optional.empty() : Optional.of(cTaskList.get(0));
+  }
+
+  public static Optional<UUID> maybeGetIdenticalIncompleteTaskUUID(
+      UUID customerUUID, UUID targetUUID, TaskType taskType, TargetType targetType) {
+    Optional<CustomerTask> oCustTask =
+        maybeGetByTargetUUIDTaskTypeTargetType(customerUUID, targetUUID, taskType, targetType);
+    if (oCustTask.isPresent() && oCustTask.get().getCompletionTime() == null) {
+      return Optional.of(oCustTask.get().getTaskUUID());
+    }
+    return Optional.empty();
   }
 
   public static List<CustomerTask> findIncompleteByTargetUUID(UUID targetUUID) {
@@ -807,6 +866,7 @@ public class CustomerTask extends Model {
     }
   }
 
+  @JsonIgnore
   public String getNotificationTargetName() {
     if (getType().equals(TaskType.Create) && getTargetType().equals(TargetType.Backup)) {
       return Universe.getOrBadRequest(getTargetUUID()).getName();

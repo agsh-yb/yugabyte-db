@@ -8,12 +8,12 @@ import { toast } from 'react-toastify';
 import { YBPanelItem } from '../../panels';
 import { timeFormatter, successStringFormatter } from '../../../utils/TableFormatters';
 import { YBConfirmModal } from '../../modals';
-
 import {
   hasNecessaryPerm,
   RbacValidator
-} from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
+} from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { SoftwareUpgradeTaskType } from '../../universes/helpers/universeHelpers';
 import './TasksList.scss';
 
 export default class TaskListTable extends Component {
@@ -33,10 +33,7 @@ export default class TaskListTable extends Component {
     }
 
     function typeFormatter(cell, row) {
-      return row.correlationId &&
-        hasNecessaryPerm({
-          ...UserPermissionMap.abortTask
-        }) ? (
+      return row.correlationId && hasNecessaryPerm(ApiPermissionMap.GET_LOGS) ? (
         <Link to={`/logs/?queryRegex=${row.correlationId}&startDate=${row.createTime}`}>
           {row.typeName} {row.target}
         </Link>
@@ -63,12 +60,12 @@ export default class TaskListTable extends Component {
       if (row.status === 'Failure' || row.status === 'Aborted') {
         return <Link to={`/tasks/${row.id}`}>See Details</Link>;
         // eslint-disable-next-line eqeqeq
-      } else if (row.type === 'UpgradeSoftware' && row.details != null) {
+      } else if (row.type === 'UpgradeSoftware' && row.details !== null) {
         return (
           <span>
-            <code>{row.details.ybPrevSoftwareVersion}</code>
+            <code>{row?.details?.versionNumbers?.ybPrevSoftwareVersion}</code>
             {' => '}
-            <code>{row.details.ybSoftwareVersion}</code>
+            <code>{row?.details?.versionNumbers?.ybSoftwareVersion}</code>
           </span>
         );
       } else if (row.status === 'Running' && row.abortable) {
@@ -87,10 +84,7 @@ export default class TaskListTable extends Component {
               Are you sure you want to abort the task?
             </YBConfirmModal>
             <RbacValidator
-              accessRequiredOn={{
-                onResource: 'CUSTOMER_ID',
-                ...UserPermissionMap.abortTask
-              }}
+              accessRequiredOn={{ ...ApiPermissionMap.ABORT_TASK, onResource: row.targetUUID }}
               isControl
             >
               <div className="task-abort-view yb-pending-color" onClick={showTaskAbortModal}>
@@ -99,17 +93,21 @@ export default class TaskListTable extends Component {
             </RbacValidator>
           </>
         );
+      } else if (
+        [
+          SoftwareUpgradeTaskType.SOFTWARE_UPGRADE,
+          SoftwareUpgradeTaskType.ROLLBACK_UPGRADE,
+          SoftwareUpgradeTaskType.FINALIZE_UPGRADE
+        ].includes(row.type)
+      ) {
+        return <Link to={`/tasks/${row.id}`}>See Details</Link>;
       } else {
         return <span />;
       }
     };
     const tableBodyContainer = { marginBottom: '1%', paddingBottom: '1%' };
     return (
-      <RbacValidator
-        accessRequiredOn={{
-          ...UserPermissionMap.readTask
-        }}
-      >
+      <RbacValidator accessRequiredOn={ApiPermissionMap.GET_TASKS_LIST}>
         <YBPanelItem
           header={<h2 className="task-list-header content-title">{title}</h2>}
           body={

@@ -20,33 +20,34 @@ import {
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from 'react-query';
 import { toast } from 'react-toastify';
 import cronstrue from 'cronstrue';
-
+import { useSelector } from 'react-redux';
+import { Link } from 'react-router';
+import { find, keyBy } from 'lodash';
 import { Badge_Types, StatusBadge } from '../../common/badge/StatusBadge';
 import { YBButton, YBToggle } from '../../common/forms/fields';
 import { YBLoading } from '../../common/indicators';
 import { YBConfirmModal } from '../../modals';
+import { ScheduledBackupEmpty } from '../components/BackupEmpty';
+import { fetchTablesInUniverse } from '../../../actions/xClusterReplication';
+import { ybFormatDate } from '../../../redesign/helpers/DateUtils';
+import { ITable } from '../common/IBackup';
+import {
+  RbacValidator,
+  hasNecessaryPerm
+} from '../../../redesign/features/rbac/common/RbacApiPermValidator';
 import {
   deleteBackupSchedule,
   editBackupSchedule,
   getScheduledBackupList
 } from '../common/BackupScheduleAPI';
-import { TableType, TableTypeLabel } from '../../../redesign/helpers/dtos';
-import { IBackupSchedule, IBackupScheduleStatus } from '../common/IBackupSchedule';
-import { BackupCreateModal } from '../components/BackupCreateModal';
-
+import { AllowedTasks, TableType, TableTypeLabel } from '../../../redesign/helpers/dtos';
 import { convertScheduleToFormValues, convertMsecToTimeFrame } from './ScheduledBackupUtils';
-
-import { useSelector } from 'react-redux';
-import { Link } from 'react-router';
-import { find, keyBy } from 'lodash';
-import { ScheduledBackupEmpty } from '../components/BackupEmpty';
-import { fetchTablesInUniverse } from '../../../actions/xClusterReplication';
-import { ybFormatDate } from '../../../redesign/helpers/DateUtils';
-import { ITable } from '../common/IBackup';
-import { RbacValidator, hasNecessaryPerm } from '../../../redesign/features/rbac/common/RbacValidator';
-import { UserPermissionMap } from '../../../redesign/features/rbac/UserPermPathMapping';
-import WarningIcon from '../../users/icons/warning_icon';
+import { IBackupSchedule, IBackupScheduleStatus } from '../common/IBackupSchedule';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { BackupCreateModal } from '../components/BackupCreateModal';
 import './ScheduledBackupList.scss';
+
+import WarningIcon from '../../users/icons/warning_icon';
 
 const wrapTableName = (tablesList: string[] | undefined) => {
   if (!Array.isArray(tablesList) || tablesList.length === 0) {
@@ -75,7 +76,13 @@ const wrapTableName = (tablesList: string[] | undefined) => {
   );
 };
 
-export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) => {
+export const ScheduledBackupList = ({
+  universeUUID,
+  allowedTasks
+}: {
+  universeUUID: string;
+  allowedTasks: AllowedTasks;
+}) => {
   const [page, setPage] = useState(0);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editPolicyData, setEditPolicyData] = useState<Record<string, any> | undefined>(undefined);
@@ -128,7 +135,7 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
 
   const canCreateBackup = hasNecessaryPerm({
     onResource: universeUUID,
-    ...UserPermissionMap.createBackup
+    ...ApiPermissionMap.CREATE_BACKUP_SCHEDULE
   });
 
   if (schedules?.length === 0) {
@@ -148,6 +155,7 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
         />
         <BackupCreateModal
           visible={showCreateModal}
+          allowedTasks={allowedTasks}
           onHide={() => {
             setShowCreateModal(false);
             if (editPolicyData) {
@@ -166,10 +174,11 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
   return (
     <div className="schedule-list-panel">
       <div className="schedule-action">
-        <RbacValidator accessRequiredOn={{
-          onResource: universeUUID,
-          ...UserPermissionMap.createBackup
-        }}
+        <RbacValidator
+          accessRequiredOn={{
+            onResource: universeUUID,
+            ...ApiPermissionMap.CREATE_BACKUP_SCHEDULE
+          }}
           isControl
         >
           <YBButton
@@ -199,6 +208,7 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
         {isFetchingNextPage && <YBLoading />}
         <BackupCreateModal
           visible={showCreateModal}
+          allowedTasks={allowedTasks}
           onHide={() => {
             setShowCreateModal(false);
             if (editPolicyData) {
@@ -284,7 +294,6 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
     });
   }
 
-
   return (
     <div className="schedule-item">
       <Row className="name-and-actions">
@@ -296,7 +305,7 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
           />
           <RbacValidator
             accessRequiredOn={{
-              ...UserPermissionMap.editBackup,
+              ...ApiPermissionMap.MODIFY_SCHEDULE,
               onResource: universeUUID
             }}
             isControl
@@ -350,7 +359,7 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
           >
             <RbacValidator
               accessRequiredOn={{
-                ...UserPermissionMap.editBackup,
+                ...ApiPermissionMap.MODIFY_SCHEDULE,
                 onResource: universeUUID
               }}
               isControl
@@ -369,10 +378,7 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
               </MenuItem>
             </RbacValidator>
             <RbacValidator
-              accessRequiredOn={{
-                ...UserPermissionMap.deleteBackup,
-                onResource: 'CUSTOMER_ID'
-              }}
+              accessRequiredOn={ApiPermissionMap.DELETE_SCHEDULE}
               isControl
               overrideStyle={{
                 display: 'unset'
@@ -439,9 +445,9 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
               <div className="info-val">
                 {schedule.backupInfo?.timeBeforeDelete
                   ? convertMsecToTimeFrame(
-                    schedule.backupInfo.timeBeforeDelete,
-                    schedule.backupInfo.expiryTimeUnit ?? 'DAYS'
-                  )
+                      schedule.backupInfo.timeBeforeDelete,
+                      schedule.backupInfo.expiryTimeUnit ?? 'DAYS'
+                    )
                   : 'Indefinitely'}
               </div>
             </Col>

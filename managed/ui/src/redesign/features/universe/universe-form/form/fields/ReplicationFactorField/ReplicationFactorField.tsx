@@ -11,6 +11,7 @@ import { useFormFieldStyles } from '../../../universeMainStyle';
 interface ReplicationFactorProps {
   disabled?: boolean;
   isPrimary: boolean;
+  isViewMode: boolean;
 }
 
 const useStyles = makeStyles((theme) => ({
@@ -27,7 +28,8 @@ const ASYNC_RF_MAX = 15;
 
 export const ReplicationFactor = ({
   disabled,
-  isPrimary
+  isPrimary,
+  isViewMode
 }: ReplicationFactorProps): ReactElement => {
   const { control, setValue } = useFormContext<UniverseFormData>();
   const { t } = useTranslation();
@@ -46,7 +48,7 @@ export const ReplicationFactor = ({
 
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     //reset field value
-    const fieldValue = (e.target.value as unknown) as number;
+    const fieldValue = parseInt(e.target.value);
 
     if (!fieldValue || fieldValue < ASYNC_RF_MIN) {
       setValue(REPLICATION_FACTOR_FIELD, ASYNC_RF_MIN, { shouldValidate: true });
@@ -58,7 +60,9 @@ export const ReplicationFactor = ({
       toast.error(t('universeForm.cloudConfig.maxRFvalue', { rfValue: ASYNC_RF_MAX }), {
         autoClose: TOAST_AUTO_DISMISS_INTERVAL
       });
-    } else setValue(REPLICATION_FACTOR_FIELD, fieldValue, { shouldValidate: true });
+    } else {
+      setValue(REPLICATION_FACTOR_FIELD, fieldValue, { shouldValidate: true });
+    }
   };
 
   return (
@@ -76,7 +80,7 @@ export const ReplicationFactor = ({
             color={'default'}
             values={PRIMARY_RF}
             selectedNum={value}
-            disabled={disabled}
+            disabled={disabled || isViewMode}
             handleSelect={handleSelect}
           />
         ) : (
@@ -90,6 +94,7 @@ export const ReplicationFactor = ({
                 min: ASYNC_RF_MIN,
                 max: ASYNC_RF_MAX
               }}
+              disabled={isViewMode}
               className={classes.overrideMuiInput}
               onChange={handleChange}
             />
