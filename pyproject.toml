@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ydiff"
+version = "0.1.0"
+description = "Minimal YugabyteDB vs PostgreSQL SQL differential tester"
+authors = [{ name = "ydiff" }]
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1.7",
+    "psycopg[binary]>=3.2.1",
+    "PyYAML>=6.0.2",
+    "sqlparse>=0.5.1",
+    "tabulate>=0.9.0",
+    "tenacity>=8.5.0",
+    "python-dateutil>=2.9.0.post0",
+]
+
+[project.scripts]
+ydiff = "ydiff.cli:main"

@@ -1,3 +1,96 @@
+YSQL vs PostgreSQL differential tester (minimal harness)
+
+Overview
+
+This tool generates randomized SQL schemas, data, and queries, runs them against both YugabyteDB (YSQL) and PostgreSQL, and compares outputs and errors to surface language-layer differences. It writes reproducible failing artifacts with the RNG seed.
+
+Quick start
+
+1) Start databases locally
+
+```bash
+docker compose up -d
+```
+
+This launches PostgreSQL on 5432 and YugabyteDB (YSQL) on 5433.
+
+2) Create a Python virtualenv and install deps
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+3) Copy config and adjust DSNs if needed
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+4) Run N randomized cases (seeded)
+
+```bash
+python -m ydiff run --config config.yaml --cases 200 --seed 123
+```
+
+Artifacts
+
+When a discrepancy is found, an artifact directory is created under `artifacts/` containing:
+
+- query.sql: the SQL that diverged
+- context.json: environment, seed, case index
+- pg_result.json and yb_result.json: normalized results or error info
+- diff.json: details of the mismatch
+
+Reproducing a failure
+
+Re-run the same seed and case:
+
+```bash
+python -m ydiff run --config config.yaml --seed <seed> --cases 1 --case-offset <case_index>
+```
+
+Reducing a failure (experimental)
+
+```bash
+python -m ydiff reduce --input artifacts/<run>/case_<N>/query.sql --config config.yaml
+```
+
+CI usage
+
+- Run a modest number of cases per PR (e.g., 200-500) and upload artifacts as CI attachments.
+- Persist last failing seed and query to ease triage.
+- For nightly runs, bump cases to thousands.
+
+Notes
+
+- The harness normalizes types, row order (no ORDER BY), and float tolerance to reduce false positives.
+- By default, float columns are disabled; enable them if you accept small numeric tolerances.
+- Plan comparison is optional and off by default.
+
+LLM-driven generation
+
+Set your API key in the environment (default `OPENAI_API_KEY`) and fill `llm:` in `config.yaml`. Then run:
+
+```bash
+python -m ydiff llm-run --config config.yaml --cases 50 --seed 123 --queries-per-case 2 --topics joins,aggregates
+```
+
+This asks the LLM to generate SQL queries for each randomized schema. All mismatches are saved under `artifacts/` as in the basic run.
+
+MCP server (for AI agent integration)
+
+Expose ydiff as an MCP stdio server (requires `pip install mcp`):
+
+```bash
+python -m ydiff mcp-server --config config.yaml
+```
+
+Tools provided:
+- `new_case(max_tables?, max_columns?, max_rows?)` -> returns `ddl`, `inserts`, `tables`
+- `run_query(schema_sql, query_sql, timeout_seconds?)` -> returns `{pg, yb, diff}`
+- `generate_queries(schema_sql, table_names, topics?, num_queries?, seed?)` -> `{queries: [...]}`
 <img src="https://cloud.yugabyte.com/logo-big.png" align="center" alt="YugabyteDB" width="50%"/>
 <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=0969fc8d-7684-4250-9cbd-4249c3ebb47b" />
 
