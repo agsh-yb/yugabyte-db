@@ -68,6 +68,29 @@ Notes
 - The harness normalizes types, row order (no ORDER BY), and float tolerance to reduce false positives.
 - By default, float columns are disabled; enable them if you accept small numeric tolerances.
 - Plan comparison is optional and off by default.
+
+LLM-driven generation
+
+Set your API key in the environment (default `OPENAI_API_KEY`) and fill `llm:` in `config.yaml`. Then run:
+
+```bash
+python -m ydiff llm-run --config config.yaml --cases 50 --seed 123 --queries-per-case 2 --topics joins,aggregates
+```
+
+This asks the LLM to generate SQL queries for each randomized schema. All mismatches are saved under `artifacts/` as in the basic run.
+
+MCP server (for AI agent integration)
+
+Expose ydiff as an MCP stdio server (requires `pip install mcp`):
+
+```bash
+python -m ydiff mcp-server --config config.yaml
+```
+
+Tools provided:
+- `new_case(max_tables?, max_columns?, max_rows?)` -> returns `ddl`, `inserts`, `tables`
+- `run_query(schema_sql, query_sql, timeout_seconds?)` -> returns `{pg, yb, diff}`
+- `generate_queries(schema_sql, table_names, topics?, num_queries?, seed?)` -> `{queries: [...]}`
 <img src="https://cloud.yugabyte.com/logo-big.png" align="center" alt="YugabyteDB" width="50%"/>
 
 ---------------------------------------

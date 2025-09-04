@@ -15,3 +15,14 @@ run:
   artifacts_dir: "./artifacts"
   compare_plans: false
   timeout_seconds: 30
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+  base_url: null  # set to OpenAI-compatible endpoint if not using OpenAI
+  temperature: 0.2
+  top_p: 1.0
+  max_output_tokens: 800
+  queries_per_case: 2
+  system_prompt: null

@@ -30,6 +30,7 @@ class Config:
     postgres: DbConfig
     yugabyte: DbConfig
     run: RunConfig
+    llm: Optional["LlmConfig"] = None
 
 
 def load_config(path: Optional[str]) -> Config:
@@ -62,10 +63,40 @@ def load_config(path: Optional[str]) -> Config:
         timeout_seconds=int(os.getenv("RUN_TIMEOUT_SECONDS", run_cfg.get("timeout_seconds", 30))),
     )
 
-    return Config(postgres=DbConfig(dsn=pg_dsn), yugabyte=DbConfig(dsn=yb_dsn), run=run)
+    llm_cfg = _load_llm(cfg.get("llm", {}))
+    return Config(postgres=DbConfig(dsn=pg_dsn), yugabyte=DbConfig(dsn=yb_dsn), run=run, llm=llm_cfg)
 
 
 def _to_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class LlmConfig:
+    provider: str = "openai"
+    model: str = "gpt-4o-mini"
+    api_key_env: str = "OPENAI_API_KEY"
+    base_url: Optional[str] = None
+    temperature: float = 0.2
+    top_p: float = 1.0
+    max_output_tokens: int = 800
+    queries_per_case: int = 2
+    system_prompt: Optional[str] = None
+
+
+def _load_llm(obj: dict) -> Optional[LlmConfig]:
+    if not obj and not any(k.startswith("LLM_") for k in os.environ.keys()):
+        return None
+    return LlmConfig(
+        provider=os.getenv("LLM_PROVIDER", obj.get("provider", "openai")),
+        model=os.getenv("LLM_MODEL", obj.get("model", "gpt-4o-mini")),
+        api_key_env=os.getenv("LLM_API_KEY_ENV", obj.get("api_key_env", "OPENAI_API_KEY")),
+        base_url=os.getenv("LLM_BASE_URL", obj.get("base_url")),
+        temperature=float(os.getenv("LLM_TEMPERATURE", obj.get("temperature", 0.2))),
+        top_p=float(os.getenv("LLM_TOP_P", obj.get("top_p", 1.0))),
+        max_output_tokens=int(os.getenv("LLM_MAX_OUTPUT_TOKENS", obj.get("max_output_tokens", 800))),
+        queries_per_case=int(os.getenv("LLM_QUERIES_PER_CASE", obj.get("queries_per_case", 2))),
+        system_prompt=os.getenv("LLM_SYSTEM_PROMPT", obj.get("system_prompt")),
+    )
