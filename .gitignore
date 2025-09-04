@@ -1,3 +1,15 @@
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.env
+artifacts/
+/*.log
+/.idea/
+/.vscode/
 # Most common in-tree build directory.
 #
 # Note: build output files are not explicitly listed here because they are

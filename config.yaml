@@ -1,0 +1,17 @@
+postgres:
+  dsn: "postgresql://postgres:postgres@localhost:5432/postgres"
+
+yugabyte:
+  dsn: "postgresql://yugabyte:yugabyte@localhost:5433/yugabyte"
+
+run:
+  cases: 200
+  seed: 42
+  max_tables: 3
+  max_columns_per_table: 6
+  max_rows_per_table: 100
+  enable_float: false
+  save_artifacts: true
+  artifacts_dir: "./artifacts"
+  compare_plans: false
+  timeout_seconds: 30
